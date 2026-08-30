@@ -1,0 +1,27 @@
+# Pinned to the versions this pipeline was actually developed and measured on.
+# Loosen deliberately, not by accident: numpy 2.x and transformers 5.x are both
+# breaking-change majors, and the semantic backend reads `id2label` off the
+# checkpoint config, which transformers has moved before.
+
+# --- core, needed for contract / taxonomy / QC / encoding (no GPU) ---
+numpy==2.5.1
+pillow==12.3.0
+opencv-python-headless==5.0.0.93
+
+# --- model backends ---
+# On linux/x86_64 the default PyPI torch wheel already bundles CUDA, so no
+# extra index is needed. For a different CUDA minor, see docker/README.md.
+torch==2.13.0
+torchvision==0.28.0
+transformers==5.16.1
+accelerate==1.14.0
+safetensors==0.8.0
+huggingface-hub==1.29.0
+
+# --- experiments/fig_*.py only; harmless in the runtime image and it makes
+# --- the figures reproducible inside the container instead of only on a laptop
+matplotlib==3.11.1
+scipy==1.18.1
+
+# --- tests ---
+pytest==9.1.1

@@ -1,0 +1,38 @@
+# Input corpus: 264 MB of licensed game footage, mounted at runtime and never
+# part of the source tree.
+handpick29_high_low/
+
+# Upstream CWM, cloned here for reference. It carries its own .git, so adding
+# it would commit a gitlink with no .gitmodules — a directory that clones empty.
+code-world-model/
+
+# Scratch from the exploratory phase, superseded by experiments/.
+_probe/
+
+# Extraction outputs, 62 MB each. Regenerate with `make extract`.
+experiments/cond_c6/
+experiments/cond_real/
+
+# Rendered figures and previews. They are frames of commercial game footage, so
+# they stay out of a public repo for the same reason the corpus does. The
+# measurements they plot are tracked as experiments/*.json; `fig_*.py` redraws
+# them from the corpus.
+experiments/figures/
+
+# Generated. `make gallery` rebuilds it from experiments/figures/, which is
+# tracked precisely so this does not need to be.
+gallery/
+
+# Run artefacts, weights, image tarballs.
+out/
+.hf-cache/
+*.tar.gz
+
+# Local environment.
+.venv/
+.mplcache/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/*.egg-info/
+.DS_Store

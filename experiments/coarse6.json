@@ -1,0 +1,140 @@
+{
+ "per_class_iou": [
+  0.8347418452473122,
+  0.7669373425073419,
+  0.20680784781181363,
+  0.42543587081970347,
+  0.5309497374448355,
+  NaN
+ ],
+ "share": [
+  0.6774296513310185,
+  0.1886306423611111,
+  0.11243828667534722,
+  0.005517894603587963,
+  0.015983525028935186,
+  0.0
+ ],
+ "per_clip": [
+  {
+   "clip": "11_john_marston_seg_0313",
+   "miou": 0.492993817611179,
+   "high_hero": {
+    "tracks": 5,
+    "multi_person_frames": 0.4375,
+    "hero_persistence": 1.0,
+    "hero_area_share": 0.014826388888888889,
+    "hero_jitter": 3.093828297312462,
+    "others_jitter": 14.280172084376558
+   },
+   "low_hero": {
+    "tracks": 7,
+    "multi_person_frames": 1.0,
+    "hero_persistence": 1.0,
+    "hero_area_share": 0.019210069444444443,
+    "hero_jitter": 4.301339265956843,
+    "others_jitter": 10.684134175740759
+   }
+  },
+  {
+   "clip": "26_trevor_seg_0004",
+   "miou": 0.5710103318448827,
+   "high_hero": {
+    "tracks": 1,
+    "multi_person_frames": 0.0,
+    "hero_persistence": 1.0,
+    "hero_area_share": 0.018042534722222222,
+    "hero_jitter": 6.839625098547915,
+    "others_jitter": null
+   },
+   "low_hero": {
+    "tracks": 1,
+    "multi_person_frames": 0.0,
+    "hero_persistence": 1.0,
+    "hero_area_share": 0.023799913194444446,
+    "hero_jitter": 7.760115371252377,
+    "others_jitter": null
+   }
+  },
+  {
+   "clip": "32_trevor_seg_0085",
+   "miou": 0.5290566297400369,
+   "high_hero": {
+    "tracks": 2,
+    "multi_person_frames": 0.0625,
+    "hero_persistence": 1.0,
+    "hero_area_share": 0.013376736111111112,
+    "hero_jitter": 8.642398421316805,
+    "others_jitter": null
+   },
+   "low_hero": {
+    "tracks": 2,
+    "multi_person_frames": 0.0625,
+    "hero_persistence": 1.0,
+    "hero_area_share": 0.013567708333333333,
+    "hero_jitter": 8.25809010207029,
+    "others_jitter": null
+   }
+  },
+  {
+   "clip": "46_franklin_seg_0093",
+   "miou": 0.30261377819180607,
+   "high_hero": {
+    "tracks": 2,
+    "multi_person_frames": 0.0625,
+    "hero_persistence": 1.0,
+    "hero_area_share": 0.018213975694444443,
+    "hero_jitter": 8.657113324730044,
+    "others_jitter": null
+   },
+   "low_hero": {
+    "tracks": 1,
+    "multi_person_frames": 0.0,
+    "hero_persistence": 1.0,
+    "hero_area_share": 0.029244791666666665,
+    "hero_jitter": 7.140323940731053,
+    "others_jitter": null
+   }
+  },
+  {
+   "clip": "02_john_marston_seg_0017",
+   "miou": 0.3846961067641247,
+   "high_hero": {
+    "tracks": 1,
+    "multi_person_frames": 0.0,
+    "hero_persistence": 1.0,
+    "hero_area_share": 0.016473524305555556,
+    "hero_jitter": 2.3525009776409487,
+    "others_jitter": null
+   },
+   "low_hero": {
+    "tracks": 1,
+    "multi_person_frames": 0.0,
+    "hero_persistence": 1.0,
+    "hero_area_share": 0.01935329861111111,
+    "hero_jitter": 2.9000411621243547,
+    "others_jitter": null
+   }
+  },
+  {
+   "clip": "17_michael_seg_0042",
+   "miou": 0.29006555076511836,
+   "high_hero": {
+    "tracks": 1,
+    "multi_person_frames": 0.0,
+    "hero_persistence": 0.875,
+    "hero_area_share": 0.007775607638888889,
+    "hero_jitter": 2.99197359762778,
+    "others_jitter": null
+   },
+   "low_hero": {
+    "tracks": 1,
+    "multi_person_frames": 0.0,
+    "hero_persistence": 1.0,
+    "hero_area_share": 0.02038628472222222,
+    "hero_jitter": 4.508432180166747,
+    "others_jitter": null
+   }
+  }
+ ]
+}

@@ -1,0 +1,80 @@
+# Convenience wrapper so the common runs are one word instead of a long
+# `docker run` line. Everything here is also doable with plain docker; see
+# docker/README.md.
+#
+#   docker compose -f docker/docker-compose.yml build
+#   docker compose -f docker/docker-compose.yml run --rm fetch
+#   docker compose -f docker/docker-compose.yml run --rm extract ...
+#
+# Paths are relative to the repo root because of the `context: ..` below.
+
+x-common: &common
+  # Overridable so a node can run an image pulled from a registry instead of
+  # one built locally: IMAGE=registry.example.com/proxy-extract:0.1.0
+  image: ${IMAGE:-proxy-extract:0.1.0}
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  working_dir: /work
+  # Defaults to root, which is what always works. Everything the container
+  # writes then lands on the host owned by root, which is merely annoying until
+  # you try to delete it; `export DOCKER_UID=$(id -u) DOCKER_GID=$(id -g)`
+  # first to get your own uid instead.
+  user: "${DOCKER_UID:-0}:${DOCKER_GID:-0}"
+  volumes:
+    # Read-only: nothing in the pipeline should ever write into the corpus.
+    # DATA_DIR/OUT_DIR are absolute on a server, where the corpus rarely sits
+    # next to the checkout.
+    - ${DATA_DIR:-../handpick29_high_low}:/work/data:ro
+    - ${OUT_DIR:-../out}:/work/out
+    # A host directory rather than a named volume, and the same default that
+    # run_shards.sh uses. They must agree: `fetch` fills this, and every later
+    # run reads it with HF_HUB_OFFLINE=1, so a mismatch is not a slow path but
+    # an immediate failure on every worker at once.
+    - ${HF_CACHE_DIR:-../.hf-cache}:/cache/huggingface
+  environment:
+    HF_HOME: /cache/huggingface
+    # Set HF_ENDPOINT=https://hf-mirror.com in your shell if the hub is slow.
+    HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
+
+services:
+  # One-off, needs network. Everything after this can run offline.
+  fetch:
+    <<: *common
+    entrypoint: ["python", "/opt/fetch_models.py"]
+    command: ["--set", "default"]
+
+  # Interactive poking around.
+  shell:
+    <<: *common
+    entrypoint: ["/bin/bash"]
+    command: []
+    deploy: &gpu
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # CPU-only, no weights needed: run this first to prove the mounts are right.
+  qc:
+    <<: *common
+    entrypoint: ["proxy-extract"]
+    command: ["camera-qc", "--dataset", "/work/data", "--track", "high", "--report", "/work/out/camera_qc.json"]
+
+  extract:
+    <<: *common
+    entrypoint: ["proxy-extract"]
+    command: ["--help"]
+    environment:
+      HF_HOME: /cache/huggingface
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    deploy: *gpu
+
+  test:
+    <<: *common
+    entrypoint: ["pytest"]
+    # no:cacheprovider because /opt is not writable when running with --user.
+    command: ["/opt/proxy-extract/tests", "-q", "-p", "no:cacheprovider"]
