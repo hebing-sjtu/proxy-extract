@@ -12,7 +12,22 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 
+# These assert things about the checkout — Makefile, compose, CI, the Dockerfile
+# — none of which are copied into the image. Run from an installed copy at
+# /opt/proxy-extract, ROOT resolves to /opt and every one of them fails on a
+# missing file rather than on a real mismatch.
+#
+# Skipping is only safe because CI also runs this suite with the checkout bind
+# mounted, where the guard passes and these do execute. They are what keeps CI,
+# compose and the Makefile from drifting apart, so CI is the one place they must
+# not be quietly skipped.
+needs_checkout = pytest.mark.skipif(
+    not (ROOT / "docker" / "Dockerfile").exists(),
+    reason="packaging invariants describe the repository, not an installed copy",
+)
 
+
+@needs_checkout
 def test_fetch_sets_use_the_same_repo_names_the_backends_do():
     from proxy_extract.depth.depth_anything import INDOOR_CHECKPOINT, OUTDOOR_CHECKPOINT
     from proxy_extract.depth.mapanything import APACHE_CHECKPOINT, DEFAULT_CHECKPOINT
@@ -34,6 +49,7 @@ def test_fetch_sets_use_the_same_repo_names_the_backends_do():
     assert {DEFAULT_CHECKPOINT, APACHE_CHECKPOINT} <= set(module.SETS["mapanything"])
 
 
+@needs_checkout
 def test_the_dockerfile_copies_files_that_exist():
     text = (ROOT / "docker" / "Dockerfile").read_text()
     copied = [
@@ -46,12 +62,14 @@ def test_the_dockerfile_copies_files_that_exist():
         assert (ROOT / relative).exists(), f"Dockerfile copies {relative}, which is not in the repo"
 
 
+@needs_checkout
 def test_compose_services_match_the_runbook_words():
     compose = (ROOT / "docker" / "docker-compose.yml").read_text()
     for service in ("fetch", "qc", "extract", "test", "shell"):
         assert f"{service}:" in compose
 
 
+@needs_checkout
 def test_compose_and_the_shard_runner_read_the_same_weight_cache():
     # `fetch` runs through compose and the shards run through plain docker. If
     # they disagree about where weights land, the shards start with an empty
@@ -65,6 +83,7 @@ def test_compose_and_the_shard_runner_read_the_same_weight_cache():
     assert "hf-cache:/cache/huggingface" not in compose, "named volume is invisible to run_shards.sh"
 
 
+@needs_checkout
 def test_the_image_reference_is_overridable_everywhere_it_appears():
     # A node that pulls from a registry has to be able to say so without
     # editing tracked files.
@@ -77,6 +96,7 @@ def test_the_image_reference_is_overridable_everywhere_it_appears():
     assert "REGISTRY" in makefile and "linux/amd64" in makefile
 
 
+@needs_checkout
 def test_ci_publishes_the_same_thing_the_makefile_describes():
     # CI is the only builder that a node's `docker pull` depends on, so it must
     # not drift from the Makefile humans read: same version, same platform,
@@ -92,6 +112,7 @@ def test_ci_publishes_the_same_thing_the_makefile_describes():
     assert "pytest /opt/proxy-extract/tests" in workflow
 
 
+@needs_checkout
 def test_the_makefile_and_first_run_script_agree_on_the_demo_clip():
     makefile = (ROOT / "Makefile").read_text()
     first = (ROOT / "docker" / "first_run.sh").read_text()

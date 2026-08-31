@@ -76,10 +76,33 @@ jobs:
       - name: Test inside the image
         # The suite needs no GPU and no weights, so it runs here rather than
         # being discovered on a node after a push.
+        #
+        # Twice, deliberately. The bare run is what a user gets from `docker run
+        # IMAGE pytest ...`, where the packaging tests skip: they read the
+        # Makefile, compose and this workflow, none of which are in the image.
+        # The second run bind-mounts the checkout so those tests execute — they
+        # exist to catch CI drifting from the Makefile, so CI is precisely where
+        # skipping them would be worthless.
         run: |
           docker run --rm ${{ steps.ref.outputs.image }} proxy-extract --help
           docker run --rm ${{ steps.ref.outputs.image }} \
             pytest /opt/proxy-extract/tests -q -p no:cacheprovider
+          docker run --rm -v "$PWD:/src" -w /src ${{ steps.ref.outputs.image }} \
+            pytest proxy-extract/tests -q -p no:cacheprovider
+
+      - name: Fail if the packaging tests only ever skip
+        # A guard on the guard: if ROOT stops resolving to the checkout, the
+        # tests above would go green by skipping everything and the drift they
+        # watch for would ship unnoticed.
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src ${{ steps.ref.outputs.image }} \
+            pytest proxy-extract/tests/test_packaging.py -q -p no:cacheprovider \
+            --no-header -rN | tee /tmp/packaging.txt
+          grep -qE '^[0-9]+ passed' /tmp/packaging.txt
+          if grep -qE 'skipped' /tmp/packaging.txt; then
+            echo "packaging tests skipped inside CI; ROOT is not the checkout" >&2
+            exit 1
+          fi
 
       - name: Log in to the registry
         if: github.event_name != 'pull_request'
