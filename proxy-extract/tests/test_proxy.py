@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 
 import numpy as np
 import pytest
@@ -208,3 +209,42 @@ def test_write_videos_needs_a_report(tmp_path):
 
     with pytest.raises(proxy.EncodeError, match="extraction_report"):
         proxy.write_videos(root)
+
+
+def test_an_explicit_ffmpeg_path_beats_whatever_is_on_path(monkeypatch):
+    monkeypatch.setenv("FFMPEG", "/opt/custom/ffmpeg")
+    assert proxy.ffmpeg_binary() == "/opt/custom/ffmpeg"
+
+
+def test_a_system_ffmpeg_is_preferred_over_the_bundled_one(monkeypatch):
+    """The distro build ships more codecs than the vendored static one."""
+    monkeypatch.delenv("FFMPEG", raising=False)
+    monkeypatch.setattr(proxy.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    assert proxy.ffmpeg_binary() == "/usr/bin/ffmpeg"
+
+
+def test_the_bundled_build_is_the_fallback_when_nothing_is_installed(monkeypatch):
+    """This is the no-root path; without it such a node cannot encode at all."""
+    monkeypatch.delenv("FFMPEG", raising=False)
+    monkeypatch.setattr(proxy.shutil, "which", lambda name: None)
+    assert proxy.ffmpeg_binary() == pytest.importorskip("imageio_ffmpeg").get_ffmpeg_exe()
+
+
+def test_a_node_with_no_ffmpeg_at_all_is_told_all_three_ways_out(monkeypatch):
+    monkeypatch.delenv("FFMPEG", raising=False)
+    monkeypatch.setattr(proxy.shutil, "which", lambda name: None)
+    monkeypatch.setitem(sys.modules, "imageio_ffmpeg", None)
+
+    with pytest.raises(proxy.EncodeError) as caught:
+        proxy.ffmpeg_binary()
+    message = str(caught.value)
+    assert "apt install ffmpeg" in message
+    assert "pip install imageio-ffmpeg" in message
+    assert "export FFMPEG=" in message
+
+
+def test_the_resolved_binary_is_what_actually_gets_executed(monkeypatch, tmp_path):
+    """A resolver nothing calls would pass its own tests and change nothing."""
+    monkeypatch.setenv("FFMPEG", "/definitely/not/here/ffmpeg")
+    with pytest.raises(proxy.EncodeError, match="check .FFMPEG"):
+        proxy.open_encoder(tmp_path / "x.mp4", 16, 16, 24.0, kind="depth")

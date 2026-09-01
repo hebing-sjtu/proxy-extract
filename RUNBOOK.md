@@ -54,9 +54,46 @@ cd /path/to/fastvideo_datapipe
 scripts/setup_venv.sh
 ```
 
-它按顺序做四件事：查前置（Python ≥ 3.10、ffmpeg）→ 建 `.venv` → 按
-`requirements.txt` 装死 pin 的依赖 + 以 editable 装 `proxy-extract` → 跑自检并
-打印 torch/CUDA 可见性。torch 那步是大头，约 3 GB。
+它按顺序做四件事：查前置（Python ≥ 3.10）→ 建 `.venv` → 按 `requirements.txt`
+装死 pin 的依赖 + 以 editable 装 `proxy-extract` → 跑自检并打印 ffmpeg 位置和
+torch/CUDA 可见性。torch 那步是大头，约 3 GB。
+
+### ffmpeg 从哪来
+
+交付视频全部经 ffmpeg 写出（OpenCV 的 VideoWriter 要不到无损 RGB）。解析顺序：
+
+```
+$FFMPEG  →  PATH 上的 ffmpeg  →  imageio-ffmpeg 自带的静态构建
+```
+
+第三项在 `requirements.txt` 里，所以**装完 venv 就已经有一个可用的 ffmpeg**，
+节点上没有 root 也不影响交付。系统装的优先，因为发行版构建的编码器更全。
+
+它是核心依赖而不是可选，原因是 ffmpeg 装不进 pip 的其他任何途径：没有它，
+一台管理员拿不到 root 的机器根本没有出路。而且编码测试本身要跑 ffmpeg，
+`EXTRAS=core` 也需要。
+
+要用系统的（编码器更全，需要 root）：
+
+```bash
+apt-get update && apt-get install -y ffmpeg
+```
+
+没有 root 又想要完整发行版构建，用静态包：
+
+```bash
+mkdir -p ~/.local/bin
+curl -L https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o /tmp/ffmpeg.tar.xz
+tar -xf /tmp/ffmpeg.tar.xz -C /tmp
+cp /tmp/ffmpeg-*-static/ffmpeg /tmp/ffmpeg-*-static/ffprobe ~/.local/bin/
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+确认当前用的是哪一个：
+
+```bash
+.venv/bin/python -c "from proxy_extract.proxy import ffmpeg_binary; print(ffmpeg_binary())"
+```
 
 三个可调的环境变量：
 
@@ -264,7 +301,8 @@ make preview CLIP=26_trevor_seg_0004
 
 ```bash
 nvidia-smi                     # 驱动 >= 525，否则 torch 2.13 起不来
-ffmpeg -version                # 每一路交付视频都经它写出
+# 每一路交付视频都经 ffmpeg 写出。问代码而不是问 PATH：venv 自带一个静态构建
+.venv/bin/python -c "from proxy_extract.proxy import ffmpeg_binary; print(ffmpeg_binary())"
 .venv/bin/python -c "import torch; print(torch.cuda.is_available(), torch.cuda.device_count())"
 # 期望：True 8
 ls handpick29_high_low         # 应该有 camera/ high/ low/ manifest.json
@@ -540,7 +578,7 @@ venv 相关的先看这几条：
 | `ModuleNotFoundError: proxy_extract` | 装到了主环境而不是 venv，或没装 | `.venv/bin/python -m pip install --no-deps -e proxy-extract` |
 | `error: need Python >= 3.10` | 系统 `python3` 常常是 3.9 | `PYTHON=/path/to/python3.12 scripts/setup_venv.sh` |
 | `sys.prefix` 不是 venv 路径 | shell 里 activate 了 conda/主环境 | `deactivate`，或直接用 `.venv/bin/python` 全路径调用 |
-| `ffmpeg not found` | 没装 | `apt install ffmpeg`；每一路交付视频都经它写出 |
+| 报错说找不到 ffmpeg | 三条出路都写在报错里 | 见第 2 节「ffmpeg 从哪来」 |
 
 模型和数据相关：
 

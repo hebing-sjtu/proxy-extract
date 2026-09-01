@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -230,6 +232,40 @@ LOSSLESS_CRF = 0
 DEFAULT_COLOR_CRF = 16
 
 
+def ffmpeg_binary() -> str:
+    """Locate the ffmpeg executable.
+
+    `FFMPEG` wins, then PATH, then the static build `imageio-ffmpeg` vendors.
+    The last one is what makes this work on a node without root: ffmpeg is not
+    installable with pip, so an operator who cannot run `apt install` otherwise
+    has no way forward, while `pip install imageio-ffmpeg` puts a usable encoder
+    inside the venv like any other dependency.
+
+    Resolved per call rather than cached, because the fix for a missing binary
+    is usually applied while a long batch is being restarted, and a cached
+    negative result would survive it.
+    """
+    override = os.environ.get("FFMPEG")
+    if override:
+        return override
+
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except (ImportError, RuntimeError):
+        raise EncodeError(
+            "no ffmpeg available, and every delivery video is written through it. Either:\n"
+            "  - install it system-wide:  apt install ffmpeg\n"
+            "  - or into the venv, no root needed:  pip install imageio-ffmpeg\n"
+            "  - or point at an existing build:  export FFMPEG=/path/to/ffmpeg"
+        ) from None
+
+
 def open_encoder(
     path: Path, width: int, height: int, fps: float, *, kind: str, crf: int | None = None
 ) -> _Encoder:
@@ -241,7 +277,7 @@ def open_encoder(
         crf = DEFAULT_COLOR_CRF if kind == "color" else LOSSLESS_CRF
 
     command = [
-        "ffmpeg",
+        ffmpeg_binary(),
         "-hide_banner",
         "-loglevel",
         "error",
@@ -270,7 +306,9 @@ def open_encoder(
             command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
         )
     except FileNotFoundError as exc:
-        raise EncodeError("ffmpeg is not on PATH; it is required to write the delivery videos") from exc
+        # `ffmpeg_binary` already checked PATH, so reaching here means FFMPEG
+        # points somewhere that does not exist.
+        raise EncodeError(f"cannot execute {command[0]!r}; check $FFMPEG") from exc
     return _Encoder(process=process, path=path)
 
 

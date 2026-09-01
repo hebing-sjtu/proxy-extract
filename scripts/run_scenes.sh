@@ -51,7 +51,15 @@ die() { echo "error: $*" >&2; exit 1; }
 
 $PYTHON -c 'import proxy_extract' 2>/dev/null \
   || die "proxy_extract is not importable by '$PYTHON'. Activate the venv, or: pip install -e proxy-extract"
-command -v ffmpeg >/dev/null || die "ffmpeg is not on PATH; every delivery video is written through it"
+# Asked of the code rather than of PATH, because it also accepts $FFMPEG and the
+# static build imageio-ffmpeg vendors; `command -v ffmpeg` would reject a node
+# that is in fact fine.
+$PYTHON -c 'from proxy_extract.proxy import ffmpeg_binary; print(ffmpeg_binary())' >/dev/null 2>&1 \
+  || die "$($PYTHON -c 'from proxy_extract.proxy import ffmpeg_binary
+try:
+    ffmpeg_binary()
+except Exception as error:
+    print(error)' 2>&1)"
 [[ -d "$DATA_DIR" ]] || die "no such data directory: $DATA_DIR"
 
 episodes="$(find "$DATA_DIR" -name video.mp4 -type f 2>/dev/null | wc -l | tr -d ' ')"

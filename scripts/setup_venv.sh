@@ -33,9 +33,11 @@ import sys
 sys.exit(0 if sys.version_info >= (3, 10) else 1)
 PY
 
-command -v ffmpeg >/dev/null \
-  || echo "warning: ffmpeg is not on PATH. Every delivery video is written through it, so
-         'scenes' will fail until it is installed (apt install ffmpeg)." >&2
+# Not fatal here: the venv is still worth building, and on a node without root
+# the fix is a pip install into the venv we are about to make. Reported again
+# after the install, by which time imageio-ffmpeg may have supplied one.
+FFMPEG_MISSING=0
+command -v ffmpeg >/dev/null || FFMPEG_MISSING=1
 
 [[ -f "$here/requirements.txt" ]] || die "no requirements.txt at $here"
 
@@ -78,12 +80,14 @@ echo "=== self-check ==="
 "$py" -m pytest "$here/proxy-extract/tests" -q || die "the test suite does not pass in this venv"
 
 "$py" - <<'PY'
-import shutil
-
 import proxy_extract
+from proxy_extract.proxy import EncodeError, ffmpeg_binary
 
 print(f"proxy_extract    {proxy_extract.__file__}")
-print(f"ffmpeg           {shutil.which('ffmpeg') or 'MISSING'}")
+try:
+    print(f"ffmpeg           {ffmpeg_binary()}")
+except EncodeError as error:
+    print(f"ffmpeg           MISSING\n{error}")
 try:
     import torch
 
@@ -92,6 +96,13 @@ try:
 except ImportError:
     print("torch            not installed (EXTRAS=core)")
 PY
+
+if ((FFMPEG_MISSING)); then
+  echo
+  echo "note: no system ffmpeg was found, so the bundled imageio-ffmpeg build is being" >&2
+  echo "      used instead. That is supported. Install a system one if you want the" >&2
+  echo "      codecs your distro ships." >&2
+fi
 
 cat <<EOF
 

@@ -11,6 +11,10 @@
 numpy==2.5.1
 pillow==12.3.0
 opencv-python-headless==5.0.0.93
+# Static ffmpeg build. The delivery encoders shell out to ffmpeg, which cannot
+# be pip-installed any other way, so this is what lets a venv work on a node
+# where nobody has root. A system ffmpeg on PATH still wins over it.
+imageio-ffmpeg==0.6.0
 
 # --- model backends ---
 # On linux/x86_64 the default PyPI torch wheel already bundles CUDA, so no

@@ -11,6 +11,11 @@ dependencies = [
     "numpy>=1.24",
     "pillow>=10.0",
     "opencv-python-headless>=4.8",
+    # Vendors a static ffmpeg build. Core rather than optional because the
+    # delivery encoders shell out to ffmpeg and the encoding tests exercise
+    # them, and because ffmpeg is not pip-installable any other way: without
+    # this, a node whose operator has no root has no route to a working install.
+    "imageio-ffmpeg>=0.5",
 ]
 
 [project.optional-dependencies]
