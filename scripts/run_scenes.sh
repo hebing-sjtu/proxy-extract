@@ -117,12 +117,19 @@ done
 # checkpoint would otherwise surface once per episode, for every episode.
 echo "checking the backends load (first run also downloads weights)..."
 $PYTHON - "$SEMANTIC" "$DEPTH" <<'PY' || die "the backends could not run; fix the above before launching $N_GPUS workers"
+import os
+import socket
 import sys
 
 import numpy as np
 
 from proxy_extract.depth import get_backend as depth_backend
 from proxy_extract.semantic import get_backend as semantic_backend
+
+# A stalled weight download would otherwise hang here with no output and no GPU
+# activity, which reads as a wedged job rather than a network problem. This is a
+# per-read timeout, so a slow but progressing download still finishes.
+socket.setdefaulttimeout(float(os.environ.get("PREFLIGHT_SOCKET_TIMEOUT", "180")))
 
 semantic, depth = sys.argv[1], sys.argv[2]
 frame = np.zeros((64, 64, 3), dtype=np.uint8)
@@ -137,6 +144,17 @@ except Exception as error:
             "  pip install 'git+https://github.com/facebookresearch/map-anything'\n"
             "or use the backend the default weight set covers:\n"
             "  DEPTH=depth_anything",
+            file=sys.stderr,
+        )
+    elif depth == "mapanything" and isinstance(error, (OSError, socket.timeout)):
+        # Its DINOv2 backbone comes from dl.fbaipublicfiles.com via torch.hub,
+        # which no HF mirror covers, so this is the failure most likely to look
+        # like a wedged job. See RUNBOOK section 7.
+        print(
+            "mapanything pulls its DINOv2 backbone through torch.hub from\n"
+            "dl.fbaipublicfiles.com, which HF_ENDPOINT does not mirror. Pre-populate\n"
+            f"{__import__('torch').hub.get_dir()}/checkpoints from a machine with egress,\n"
+            "or use DEPTH=depth_anything, whose weights are all on the hub.",
             file=sys.stderr,
         )
     raise SystemExit(1)

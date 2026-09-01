@@ -572,6 +572,43 @@ out/cond/high/26_trevor_seg_0004/
 权重是 CC-BY-NC 且在 hub 上是 gated 的，要先 `hf auth login` 并接受条款；商用要用
 `facebook/map-anything-apache`。
 
+**mapanything 还要第三份权重，而 `fetch_models.py` 拿不到它。** MapAnything 的
+DINOv2 主干是走 `torch.hub` 拉的，宿主是 `dl.fbaipublicfiles.com` —— 跟 HF 无关，
+所以 `HF_ENDPOINT` 镜像和 `HF_HUB_OFFLINE=1` 对它都不起作用。国内节点常常连不上
+这个域名，症状是日志停在
+
+```
+Using cache found in ~/.cache/torch/hub/facebookresearch_dinov2_main
+```
+
+然后**不报错、GPU 零占用**。那行说的是仓库代码已缓存，卡住的是紧随其后的 1.2 GB
+权重下载。确认方法：
+
+```bash
+ls -la ~/.cache/torch/hub/checkpoints/            # 空的就是没下下来
+curl -sI --max-time 10 https://dl.fbaipublicfiles.com/dinov2/dinov2_vitl14/dinov2_vitl14_pretrain.pth
+```
+
+两条出路。一是在能出网的机器上跑一次预检，让它把 `torch.hub` 缓存填满，再整个拷到
+节点上 —— 这样不用猜 MapAnything 用的是哪个 DINOv2 变体：
+
+```bash
+# 能出网的机器
+DEPTH=mapanything scripts/run_scenes.sh    # 预检会拉全，然后 Ctrl-C
+rsync -a ~/.cache/torch/ node:~/.cache/torch/
+```
+
+二是直接下（`TORCH_HOME` 没设时就是这个路径），但要先从 traceback 里确认变体：
+
+```bash
+mkdir -p ~/.cache/torch/hub/checkpoints
+curl -L -o ~/.cache/torch/hub/checkpoints/dinov2_vitl14_pretrain.pth \
+  https://dl.fbaipublicfiles.com/dinov2/dinov2_vitl14/dinov2_vitl14_pretrain.pth
+```
+
+`depth_anything` 没有这个问题，它的权重全在 HF 上，镜像覆盖得到。这是它作为默认值的
+又一个理由。
+
 **depth_anything 是逐帧预测的**，帧与帧之间的尺度没有绑定。静态场景问题不大，
 但如果下游对时序深度一致性敏感，`mapanything` 是多帧的、尺度在整段内一致，这是
 它值得装的理由。这个 caveat 会写进每份 report 的 `depth.meta.caveat`。
