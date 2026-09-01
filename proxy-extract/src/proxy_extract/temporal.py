@@ -25,10 +25,35 @@ DEFAULT_RADIUS = 2
 DEFAULT_MIN_RUN = 2
 
 
-def _flow_between(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+def _flow_between(source: np.ndarray, target: np.ndarray, *, downscale: int = 1) -> np.ndarray:
+    """Dense flow from `source` to `target`, optionally solved smaller.
+
+    Farneback is quadratic in pixel count, and at 1280x720 a five-frame window
+    costs four flows per frame, which for a 1800-frame episode dominates
+    everything else on the CPU. Solving at 1/k and scaling the field back up
+    costs k^2 less. Flow fields are smooth over most of the image, so the error
+    concentrates at motion boundaries, which is also where stabilisation matters
+    most - hence a parameter rather than a silent default.
+    """
     import cv2
 
-    return cv2.calcOpticalFlowFarneback(source, target, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+    if downscale < 1:
+        raise ValueError(f"downscale must be >= 1, got {downscale}")
+    if downscale == 1:
+        return cv2.calcOpticalFlowFarneback(source, target, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+
+    height, width = source.shape[:2]
+    small = (max(width // downscale, 16), max(height // downscale, 16))
+    flow = cv2.calcOpticalFlowFarneback(
+        cv2.resize(source, small, interpolation=cv2.INTER_AREA),
+        cv2.resize(target, small, interpolation=cv2.INTER_AREA),
+        None, 0.5, 3, 15, 3, 5, 1.2, 0,
+    )
+    flow = cv2.resize(flow, (width, height), interpolation=cv2.INTER_LINEAR)
+    # Displacements are in pixels, so they scale with the grid they were solved on.
+    flow[..., 0] *= width / small[0]
+    flow[..., 1] *= height / small[1]
+    return flow
 
 
 def _warp(image: np.ndarray, flow: np.ndarray, *, nearest: bool) -> np.ndarray:
@@ -58,13 +83,15 @@ def _gray_stack(frames: list[np.ndarray], shape: tuple[int, int]) -> list[np.nda
     return out
 
 
-def _neighbour_flows(guide: list[np.ndarray], index: int, offsets: range) -> dict[int, np.ndarray]:
+def _neighbour_flows(
+    guide: list[np.ndarray], index: int, offsets: range, *, downscale: int = 1
+) -> dict[int, np.ndarray]:
     flows: dict[int, np.ndarray] = {}
     for offset in offsets:
         other = index + offset
         if offset == 0 or not 0 <= other < len(guide):
             continue
-        flows[other] = _flow_between(guide[index], guide[other])
+        flows[other] = _flow_between(guide[index], guide[other], downscale=downscale)
     return flows
 
 
@@ -86,10 +113,16 @@ def suppress_short_runs(labels: np.ndarray, *, min_run: int = DEFAULT_MIN_RUN) -
     # Run length at every (frame, pixel): how far the current label extends
     # backwards, plus how far it extends forwards. Two sequential passes over
     # the time axis, each vectorised across all pixels.
-    backward = np.ones_like(labels, dtype=np.int32)
+    #
+    # A run cannot be longer than the clip, so the counters only need to hold
+    # `2 * frames` for the sum below. At the 1280x720 delivery size these are
+    # the largest arrays in the process by a wide margin - 3.3 GB each for a
+    # 1800-frame episode - which makes the narrower dtype worth picking.
+    counter = np.int16 if 2 * frames + 1 <= np.iinfo(np.int16).max else np.int32
+    backward = np.ones_like(labels, dtype=counter)
     for t in range(1, frames):
         backward[t] = np.where(labels[t] == labels[t - 1], backward[t - 1] + 1, 1)
-    forward = np.ones_like(labels, dtype=np.int32)
+    forward = np.ones_like(labels, dtype=counter)
     for t in range(frames - 2, -1, -1):
         forward[t] = np.where(labels[t] == labels[t + 1], forward[t + 1] + 1, 1)
     too_short = (backward + forward - 1) < min_run
@@ -109,6 +142,7 @@ def stabilize_labels(
     guide_frames: list[np.ndarray] | None = None,
     radius: int = DEFAULT_RADIUS,
     min_run: int = DEFAULT_MIN_RUN,
+    flow_downscale: int = 1,
 ) -> np.ndarray:
     """Flow-compensated majority vote, then short-run suppression.
 
@@ -133,7 +167,11 @@ def stabilize_labels(
     out = np.empty_like(labels)
     for index in range(len(labels)):
         votes = np.zeros((*shape, NUM_CLASSES), dtype=np.int16)
-        flows = _neighbour_flows(guide, index, offsets) if guide is not None else {}
+        flows = (
+            _neighbour_flows(guide, index, offsets, downscale=flow_downscale)
+            if guide is not None
+            else {}
+        )
         for offset in offsets:
             other = index + offset
             if not 0 <= other < len(labels):
@@ -156,6 +194,7 @@ def stabilize_depth(
     *,
     guide_frames: list[np.ndarray] | None = None,
     radius: int = DEFAULT_RADIUS,
+    flow_downscale: int = 1,
 ) -> np.ndarray:
     """Temporal median over a +/-`radius` window, flow-compensated.
 
@@ -175,7 +214,11 @@ def stabilize_depth(
     offsets = range(-radius, radius + 1)
     out = np.empty_like(depth)
     for index in range(len(depth)):
-        flows = _neighbour_flows(guide, index, offsets) if guide is not None else {}
+        flows = (
+            _neighbour_flows(guide, index, offsets, downscale=flow_downscale)
+            if guide is not None
+            else {}
+        )
         stack = []
         for offset in offsets:
             other = index + offset

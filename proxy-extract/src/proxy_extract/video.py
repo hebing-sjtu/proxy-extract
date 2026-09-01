@@ -8,6 +8,7 @@ preserve the two functions below.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -54,14 +55,44 @@ def read_frames(
     on H.264 without an exact-frame index silently lands on the nearest
     keyframe, which would desynchronise the high/low comparison.
     """
+    frames = [
+        frame
+        for chunk in iter_frames(path, size=size, limit=limit, grayscale=grayscale, chunk=256)
+        for frame in chunk
+    ]
+    if not frames:
+        raise ValueError(f"decoded zero frames from {path}")
+    return frames
+
+
+def iter_frames(
+    path: Path,
+    *,
+    size: tuple[int, int] | None = None,
+    limit: int | None = None,
+    grayscale: bool = False,
+    chunk: int = 128,
+) -> "Iterator[list[np.ndarray]]":
+    """Decode in batches of `chunk` frames, yielding one list at a time.
+
+    Same sequential decode as `read_frames`, but the caller can reduce each
+    batch and drop it. A 1800-frame episode at the 1344x768 work size is 5.4 GB
+    held as one list, and the full-resolution depth and label stacks derived
+    from it are larger still; nothing downstream of the per-frame reduction
+    needs more than one batch resident at a time.
+    """
     import cv2
+
+    if chunk < 1:
+        raise ValueError(f"chunk must be >= 1, got {chunk}")
 
     capture = cv2.VideoCapture(str(path))
     if not capture.isOpened():
         raise FileNotFoundError(f"cannot open video: {path}")
-    frames: list[np.ndarray] = []
+    decoded = 0
+    batch: list[np.ndarray] = []
     try:
-        while limit is None or len(frames) < limit:
+        while limit is None or decoded < limit:
             ok, bgr = capture.read()
             if not ok:
                 break
@@ -71,11 +102,14 @@ def read_frames(
                     bgr, size, interpolation=cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR
                 )
             if grayscale:
-                frames.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY))
+                batch.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY))
             else:
-                frames.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+                batch.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+            decoded += 1
+            if len(batch) == chunk:
+                yield batch
+                batch = []
     finally:
         capture.release()
-    if not frames:
-        raise ValueError(f"decoded zero frames from {path}")
-    return frames
+    if batch:
+        yield batch

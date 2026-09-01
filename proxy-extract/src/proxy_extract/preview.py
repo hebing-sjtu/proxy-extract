@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 
 from .contract import CONDITION_HEIGHT, CONDITION_WIDTH, encode_depth_codes, read_frame
-from .taxonomy import CLASS_NAMES, COARSE6_NAMES
+from .taxonomy import CLASS_NAMES, COARSE6_NAMES, STANDARD11_NAMES
 
 # Distinguishable at a glance and roughly mnemonic: sky blue, water deep blue,
 # terrain brown, road grey, vegetation green, human red.
@@ -39,6 +39,24 @@ COARSE6_COLORS: dict[int, tuple[int, int, int]] = {
     3: (170, 60, 200),
     4: (255, 190, 40),
     5: (230, 40, 40),
+}
+
+# The 11-class standard. road and ground are deliberately close in hue and
+# clearly different in value: they share long borders and are the pair most
+# likely to be confused, so a preview has to make a swap visible without
+# implying the two are unrelated.
+STANDARD11_COLORS: dict[int, tuple[int, int, int]] = {
+    0: (135, 190, 240),
+    1: (230, 40, 40),
+    2: (255, 190, 40),
+    3: (170, 60, 200),
+    4: (150, 150, 158),
+    5: (70, 70, 78),
+    6: (140, 130, 120),
+    7: (60, 160, 60),
+    8: (150, 110, 70),
+    9: (30, 80, 200),
+    10: (0, 190, 190),
 }
 
 
@@ -70,7 +88,8 @@ class Palette:
 
 CWM12 = Palette("cwm12", CLASS_NAMES, CLASS_COLORS)
 COARSE6 = Palette("coarse6", COARSE6_NAMES, COARSE6_COLORS)
-PALETTES = {palette.name: palette for palette in (CWM12, COARSE6)}
+STANDARD11 = Palette("standard11", STANDARD11_NAMES, STANDARD11_COLORS)
+PALETTES = {palette.name: palette for palette in (CWM12, COARSE6, STANDARD11)}
 
 
 def palette_for(condition_root: Path) -> Palette:
@@ -125,6 +144,122 @@ def _legend(width: int, height: int, present: list[int], palette: Palette) -> np
             cv2.FONT_HERSHEY_SIMPLEX, 0.32, (255, 255, 255), 1, cv2.LINE_AA,
         )
     return cv2.cvtColor(strip, cv2.COLOR_BGR2RGB)
+
+
+def _read_video_rgb(path: Path, ordinals: set[int] | None = None) -> list[np.ndarray]:
+    """Decode a delivery video to exact RGB.
+
+    No resizing anywhere on this path: `semantic.mp4` carries class IDs in the
+    blue channel, and interpolating between two IDs invents a third class that
+    nothing downstream can detect.
+    """
+    import cv2
+
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        raise FileNotFoundError(f"cannot open {path}")
+    frames, index = [], 0
+    try:
+        while True:
+            ok, bgr = capture.read()
+            if not ok:
+                break
+            if ordinals is None or index in ordinals:
+                frames.append(bgr[:, :, ::-1].copy())
+            index += 1
+    finally:
+        capture.release()
+    return frames
+
+
+def _label(panel: np.ndarray, text: str) -> np.ndarray:
+    import cv2
+
+    out = np.ascontiguousarray(panel)
+    cv2.rectangle(out, (0, 0), (len(text) * 11 + 10, 24), (0, 0, 0), -1)
+    cv2.putText(out, text, (6, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+    return out
+
+
+def render_scene_preview(
+    scene_dir: Path,
+    out_path: Path,
+    *,
+    frames: int = 6,
+    fps: float = 12.0,
+    width: int = 640,
+) -> Path:
+    """Render a delivered scene into something a reviewer can actually look at.
+
+    The delivery format is deliberately unviewable: `semantic.mp4` puts class
+    IDs 0-10 in the blue channel, so it plays as near-black, and `depth.mp4` is
+    a log-z ramp that reads as flat grey. Without this the only way to judge a
+    720p run is to decode it by hand — which is how a placeholder run once got
+    mistaken for a broken segmenter.
+
+    A `.png` target writes a contact sheet of `frames` samples spread across the
+    episode; anything else writes an MP4 of the same panels. The sheet is the
+    one to use over SSH.
+    """
+    import cv2
+
+    from . import proxy
+
+    scene_dir, out_path = Path(scene_dir), Path(out_path)
+    colour_path = scene_dir / "color.mp4"
+    if not colour_path.exists():
+        raise FileNotFoundError(f"{scene_dir} has no color.mp4; is it a delivered scene?")
+
+    total = int(cv2.VideoCapture(str(colour_path)).get(cv2.CAP_PROP_FRAME_COUNT))
+    sheet = out_path.suffix.lower() == ".png"
+    picks = (
+        set(np.linspace(0, max(total - 1, 0), num=min(frames, max(total, 1)), dtype=int).tolist())
+        if sheet
+        else None
+    )
+
+    colour = _read_video_rgb(colour_path, picks)
+    semantic = _read_video_rgb(scene_dir / "semantic.mp4", picks)
+    depth = _read_video_rgb(scene_dir / "depth.mp4", picks)
+    count = min(len(colour), len(semantic), len(depth))
+    if count == 0:
+        raise ValueError(f"{scene_dir} decoded to no frames")
+
+    palette = PALETTES["standard11"]
+    present: set[int] = set()
+    panels = []
+    for index in range(count):
+        ids = semantic[index][:, :, 2]
+        present.update(np.unique(ids).tolist())
+        metres = proxy.decode_depth_frame(depth[index][:, :, 0])
+        row = np.hstack(
+            [
+                _label(colour[index], "color"),
+                _label(colorize_semantic(ids, palette), "semantic"),
+                _label(colorize_depth(metres), "depth"),
+            ]
+        )
+        height = int(row.shape[0] * (width * 3) / row.shape[1])
+        panels.append(cv2.resize(row, (width * 3, height), interpolation=cv2.INTER_AREA))
+
+    strip = _legend(panels[0].shape[1], 24, sorted(present), palette)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if sheet:
+        image = np.vstack([np.vstack([p, strip]) if p is panels[-1] else p for p in panels])
+        cv2.imwrite(str(out_path), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+        return out_path
+
+    size = (panels[0].shape[1], panels[0].shape[0] + strip.shape[0])
+    writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, size)
+    if not writer.isOpened():
+        raise RuntimeError(f"cannot open a writer for {out_path}")
+    try:
+        for panel in panels:
+            writer.write(cv2.cvtColor(np.vstack([panel, strip]), cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
+    return out_path
 
 
 def render_preview(

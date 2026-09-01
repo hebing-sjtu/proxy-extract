@@ -228,3 +228,68 @@ class TestCameraTrack:
         poses = np.tile(np.eye(4), (5, 1, 1))
         track = camera_io.CameraTrack(cam2world=poses, intrinsics=np.eye(3))
         assert track.subset(np.arange(2)).intrinsics.shape == (3, 3)
+
+
+class TestFlowDownscale:
+    """Solving flow smaller is a compute shortcut, so its cost has to be known.
+
+    Farneback is quadratic in pixel count and a five-frame window needs four
+    flows per frame, which at 1280x720 dominates the CPU budget for a
+    1800-frame episode. These tests pin down that the shortcut is off by
+    default, that it produces a field of the right shape and magnitude, and
+    roughly how much the stabilised labels move because of it.
+    """
+
+    @staticmethod
+    def _panning_clip(frames=12, height=96, width=128, shift=3):
+        rng = np.random.default_rng(7)
+        texture = rng.integers(0, 255, (height, width * 2), dtype=np.uint8)
+        guide, labels = [], []
+        for index in range(frames):
+            offset = index * shift
+            guide.append(texture[:, offset : offset + width].copy())
+            board = np.full((height, width), tx.SKY, dtype=np.uint8)
+            board[:, : width // 2] = tx.TERRAIN
+            # One flickering blob, which is what stabilisation exists to remove.
+            if index % 2:
+                board[20:30, 20:30] = tx.VEGETATION
+            labels.append(board)
+        return np.stack(labels), guide
+
+    def test_downscaled_flow_has_the_full_resolution_shape_and_scale(self):
+        from proxy_extract.temporal import _flow_between
+
+        _, guide = self._panning_clip()
+        full = _flow_between(guide[0], guide[1], downscale=1)
+        small = _flow_between(guide[0], guide[1], downscale=2)
+
+        assert small.shape == full.shape
+        # Both must report a displacement of the same sign and order of
+        # magnitude; a missing rescale would make the small one half as long.
+        assert np.median(np.abs(small[..., 0])) == pytest.approx(
+            np.median(np.abs(full[..., 0])), rel=0.6
+        )
+
+    def test_downscale_one_is_the_unshortcut_path(self):
+        labels, guide = self._panning_clip()
+
+        plain = stabilize_labels(labels, guide_frames=guide, radius=2)
+        explicit = stabilize_labels(labels, guide_frames=guide, radius=2, flow_downscale=1)
+
+        assert np.array_equal(plain, explicit)
+
+    def test_downscaling_flow_barely_moves_the_stabilised_labels(self):
+        labels, guide = self._panning_clip()
+
+        exact = stabilize_labels(labels, guide_frames=guide, radius=2, flow_downscale=1)
+        cheap = stabilize_labels(labels, guide_frames=guide, radius=2, flow_downscale=2)
+
+        disagreement = float((exact != cheap).mean())
+        assert disagreement < 0.05, f"{disagreement:.4f} of pixels changed class"
+
+    def test_a_zero_downscale_is_refused(self):
+        from proxy_extract.temporal import _flow_between
+
+        _, guide = self._panning_clip()
+        with pytest.raises(ValueError, match="downscale must be"):
+            _flow_between(guide[0], guide[1], downscale=0)

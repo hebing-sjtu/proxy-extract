@@ -215,6 +215,157 @@ def to_coarse6(cwm_labels: np.ndarray) -> np.ndarray:
     return lut[np.clip(np.asarray(cwm_labels), 0, NUM_CLASSES - 1)]
 
 
+# ------------------------------------------------ the 11-class gta-web standard
+# The delivered output schema, fixed by DATA_F.md. IDs are that document's, not
+# ours, and must not be renumbered: the engine writes them into the semantic
+# video's blue channel and any downstream reader assumes them.
+#
+# Unlike coarse6 this is not a compromise with what a segmenter can predict —
+# it is what the engine emits. Two of the eleven therefore cannot be reproduced
+# from an image at all; see ROAD_GROUND_IS_FUNCTIONAL below.
+
+S11_SKY = 0
+S11_PLAYER = 1
+S11_PED = 2
+S11_VEHICLE = 3
+S11_BUILDING = 4
+S11_ROAD = 5
+S11_GROUND = 6
+S11_VEGETATION = 7
+S11_TERRAIN = 8
+S11_WATER = 9
+S11_PROP = 10
+
+STANDARD11_NAMES: tuple[str, ...] = (
+    "sky",
+    "player",
+    "ped",
+    "vehicle",
+    "building",
+    "road",
+    "ground",
+    "vegetation",
+    "terrain",
+    "water",
+    "prop",
+)
+
+NUM_STANDARD11 = len(STANDARD11_NAMES)
+
+# The condition files are small integers whichever taxonomy produced them, so a
+# reader has no way to tell them apart after the fact: the name table has to
+# travel with the report.
+NAMES_OF_TAXONOMY: dict[str, tuple[str, ...]] = {
+    "coarse6": COARSE6_NAMES,
+    "standard11": STANDARD11_NAMES,
+    "cwm12": CLASS_NAMES,
+}
+
+# Every person a segmenter finds arrives as one class. Which of them is the
+# protagonist is a framing question, not a labelling one, so `semantic.player`
+# splits it out afterwards — exactly as coarse6 does for hero/npc.
+S11_PERSON_UNSPLIT = S11_PED
+
+# DATA_F.md defines road as *asphalt material only*, with concrete, kerbs,
+# markings and brick paving all falling to ground. That is a fact about the
+# renderer's material names, not about the image: on an RGB frame asphalt and
+# concrete road surface are frequently indistinguishable, and ADE20K's own
+# road/sidewalk boundary is functional (driveable vs walkable) rather than
+# material.
+#
+# So predictions put the driveable surface in `road` and the walkable surface
+# in `ground`, which is a different cut than the engine's. The two sources
+# agree on class *count* and disagree on class *content*, which is the
+# dangerous kind of disagreement — it will not raise anywhere. Anything that
+# mixes engine labels with predicted ones has to know this.
+ROAD_GROUND_IS_FUNCTIONAL = (
+    "predicted road/ground split driveable from walkable surface; the engine "
+    "splits asphalt from every other material. The two are not equivalent."
+)
+
+# Things beat stuff, and the protagonist beats everyone. Same reasoning as
+# PRIORITY above: this is paint order, not importance.
+STANDARD11_PRIORITY: dict[int, int] = {
+    S11_SKY: 0,
+    S11_WATER: 1,
+    S11_TERRAIN: 2,
+    S11_GROUND: 3,
+    S11_ROAD: 4,
+    S11_VEGETATION: 5,
+    S11_BUILDING: 6,
+    S11_PROP: 7,
+    S11_VEHICLE: 8,
+    S11_PED: 9,
+    S11_PLAYER: 10,
+}
+
+ADE20K_TO_STANDARD11: dict[str, int] = {
+    "sky": S11_SKY,
+    "person": S11_PERSON_UNSPLIT,
+    # Anything that carries someone. The engine lumps boats and aircraft in
+    # with cars under id 3, so there is no reason to be finer here.
+    "car": S11_VEHICLE, "bus": S11_VEHICLE, "truck": S11_VEHICLE, "van": S11_VEHICLE,
+    "boat": S11_VEHICLE, "ship": S11_VEHICLE, "airplane": S11_VEHICLE,
+    "minibike": S11_VEHICLE, "bicycle": S11_VEHICLE, "tank": S11_VEHICLE,
+    # A ridden horse is a mount, and the standard has no animal class to put it
+    # in. ADE20K offers a single "animal" label, so this also claims deer, dogs
+    # and birds — accepted because the mount is what the corpus actually
+    # contains at any size, and prop would file a moving agent as static
+    # clutter. Splitting mounts from wildlife needs instance masks, not this
+    # table.
+    "animal": S11_VEHICLE,
+    # Building shells and the parts of them a segmenter names separately.
+    "building": S11_BUILDING, "house": S11_BUILDING, "skyscraper": S11_BUILDING,
+    "hovel": S11_BUILDING, "tower": S11_BUILDING, "bridge": S11_BUILDING,
+    "wall": S11_BUILDING, "ceiling": S11_BUILDING, "windowpane": S11_BUILDING,
+    "door": S11_BUILDING, "column": S11_BUILDING, "awning": S11_BUILDING,
+    "canopy": S11_BUILDING, "booth": S11_BUILDING, "screen door": S11_BUILDING,
+    "grandstand": S11_BUILDING, "stage": S11_BUILDING, "pier": S11_BUILDING,
+    # Driveable surface only — see ROAD_GROUND_IS_FUNCTIONAL.
+    "road": S11_ROAD, "runway": S11_ROAD,
+    # Walkable and other made ground.
+    "sidewalk": S11_GROUND, "path": S11_GROUND, "floor": S11_GROUND,
+    "dirt track": S11_GROUND, "stairs": S11_GROUND, "stairway": S11_GROUND,
+    "step": S11_GROUND,
+    # Grass counts as vegetation here, matching DATA_F.md's "树、草、灌木".
+    "tree": S11_VEGETATION, "plant": S11_VEGETATION, "flower": S11_VEGETATION,
+    "palm": S11_VEGETATION, "grass": S11_VEGETATION, "field": S11_VEGETATION,
+    # Natural ground: the engine's terrain is "山地、岩石、野外地面".
+    "mountain": S11_TERRAIN, "rock": S11_TERRAIN, "hill": S11_TERRAIN,
+    "earth": S11_TERRAIN, "sand": S11_TERRAIN, "land": S11_TERRAIN,
+    "water": S11_WATER, "sea": S11_WATER, "river": S11_WATER, "lake": S11_WATER,
+    "swimming pool": S11_WATER, "waterfall": S11_WATER, "fountain": S11_WATER,
+}
+
+# DATA_F.md makes prop the explicit default ("对不上上面规则时的默认类"), so
+# ADE20K's long tail of furniture and clutter landing there is correct rather
+# than a gap in the table.
+CWM_TO_STANDARD11: dict[int, int] = {
+    VOID_UNKNOWN: S11_PROP,
+    SKY: S11_SKY,
+    WATER: S11_WATER,
+    TERRAIN: S11_TERRAIN,
+    ROAD_PAVED: S11_ROAD,
+    VEGETATION: S11_VEGETATION,
+    BUILDING_STRUCTURE: S11_BUILDING,
+    INFRASTRUCTURE: S11_PROP,
+    HUMAN: S11_PERSON_UNSPLIT,
+    ANIMAL: S11_PED,
+    VEHICLE: S11_VEHICLE,
+    PROP: S11_PROP,
+}
+
+
+def standard11_lut() -> np.ndarray:
+    return build_lut(ADE20K_CLASSES, ADE20K_TO_STANDARD11, default=S11_PROP)
+
+
+def to_standard11(cwm_labels: np.ndarray) -> np.ndarray:
+    """Project 12-class CWM labels onto the 11-class standard."""
+    lut = np.array([CWM_TO_STANDARD11[c] for c in range(NUM_CLASSES)], dtype=np.uint8)
+    return lut[np.clip(np.asarray(cwm_labels), 0, NUM_CLASSES - 1)]
+
+
 # ------------------------------------------------------- open-vocab prompting
 
 

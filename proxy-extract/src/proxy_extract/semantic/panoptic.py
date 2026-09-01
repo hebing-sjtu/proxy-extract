@@ -14,9 +14,11 @@ import numpy as np
 from ..taxonomy import (
     ADE20K_TO_COARSE6,
     ADE20K_TO_CWM,
+    ADE20K_TO_STANDARD11,
     C6_BACKGROUND,
     CITYSCAPES_TO_CWM,
     PROP,
+    S11_PROP,
     VOID_UNKNOWN,
 )
 from .base import SemanticResult, resolve_label_lut
@@ -36,6 +38,10 @@ _PROFILES = {
     # class to land in, it belongs with the vegetation it looks like. Anything
     # unmapped is background, which is what that class is for.
     "coarse6": (ADE20K_CHECKPOINT, ADE20K_TO_COARSE6, C6_BACKGROUND),
+    # The delivered 11-class schema. prop is the standard's own stated default
+    # for anything the rules do not claim, so the fallback is not a compromise
+    # here the way VOID_UNKNOWN is for cityscapes.
+    "standard11": (ADE20K_CHECKPOINT, ADE20K_TO_STANDARD11, S11_PROP),
 }
 
 

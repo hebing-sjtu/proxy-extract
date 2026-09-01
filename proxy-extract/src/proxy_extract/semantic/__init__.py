@@ -9,7 +9,7 @@ __all__ = ["SemanticBackend", "SemanticResult", "resolve_label_lut", "get_backen
 
 def get_backend(name: str, **kwargs) -> SemanticBackend:
     """Resolve a base segmenter by name, importing heavy deps only on use."""
-    if name in {"ade20k", "cityscapes", "coarse6"}:
+    if name in {"ade20k", "cityscapes", "coarse6", "standard11"}:
         from .panoptic import PanopticBackend
 
         return PanopticBackend(profile=name, **kwargs)
