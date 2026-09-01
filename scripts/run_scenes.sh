@@ -23,13 +23,16 @@ set -euo pipefail
 DATA_DIR="${DATA_DIR:-/data/binghe/datasets/ABot-World-Explorer-subset2000/data}"
 OUT_DIR="${OUT_DIR:-/data/binghe/datasets/ABot-seg-long-2000}"
 SEMANTIC="${SEMANTIC:-standard11}"
-# depth_anything, not mapanything: this is the pair `fetch_models.py --set
-# default` actually downloads, and its package ships in requirements.txt.
-# mapanything is the better backend — multi-frame, so its scale is consistent
-# across an episode — but it is not on PyPI and its weights are gated, so having
-# it as the default meant following the runbook exactly could not work. Opt in
-# with DEPTH=mapanything once it is installed; see RUNBOOK section 7.
-DEPTH="${DEPTH:-depth_anything}"
+# depth_anything_v3, because it is the only one of the three that both reports
+# metres and can be obtained on a node whose egress stops at the hub. mapanything
+# fetches its DINOv2 backbone through torch.hub from dl.fbaipublicfiles.com and
+# hangs silently where that is blocked; depth_anything (V2) installs cleanly but
+# sees one frame at a time. DA3 carries its backbone inside its own checkpoint.
+#
+# It is not pip-installable either — see RUNBOOK section 7 for the --no-deps
+# recipe — so DEPTH=depth_anything remains the fallback that needs no extra
+# install. The weights are CC-BY-NC 4.0: research use only.
+DEPTH="${DEPTH:-depth_anything_v3}"
 
 # Default to the repo's own venv, which is the maintained deployment path, and
 # fall back to whatever `python` is on PATH so an activated environment still
@@ -138,7 +141,20 @@ try:
     result = depth_backend(depth).estimate([frame], cameras=None)
 except Exception as error:
     print(f"depth backend '{depth}' failed: {type(error).__name__}: {error}", file=sys.stderr)
-    if isinstance(error, ImportError) and depth == "mapanything":
+    if isinstance(error, ImportError) and depth == "depth_anything_v3":
+        print(
+            "depth-anything-3 is not on PyPI, and its declared pins (numpy<2,\n"
+            "python<=3.13) fight this environment, so install it without them:\n"
+            "  pip install --no-deps --ignore-requires-python \\\n"
+            "      git+https://github.com/ByteDance-Seed/depth-anything-3\n"
+            "  pip install einops omegaconf addict imageio\n"
+            "Then fetch the 6.8 GB checkpoint:\n"
+            "  python scripts/fetch_models.py --set da3\n"
+            "Or fall back to the backend requirements.txt already covers:\n"
+            "  DEPTH=depth_anything",
+            file=sys.stderr,
+        )
+    elif isinstance(error, ImportError) and depth == "mapanything":
         print(
             "mapanything is not on PyPI. Either install it:\n"
             "  pip install 'git+https://github.com/facebookresearch/map-anything'\n"
@@ -185,6 +201,12 @@ EOF
 
 # ---------------------------------------------------------------------- launch
 
+# Space-separated KEY=VALUE, e.g. DEPTH_OPTIONS="window=4 process_res=728".
+depth_options=()
+for option in ${DEPTH_OPTIONS:-}; do
+  depth_options+=(--depth-backend-option "$option")
+done
+
 pids=()
 for ((i = 0; i < N_GPUS; i++)); do
   CUDA_VISIBLE_DEVICES="$i" \
@@ -194,6 +216,7 @@ for ((i = 0; i < N_GPUS; i++)); do
     --out "$OUT_DIR" \
     --semantic-backend "$SEMANTIC" \
     --depth-backend "$DEPTH" \
+    ${depth_options[@]+"${depth_options[@]}"} \
     --shard "$i/$N_GPUS" \
     --resume \
     --keep-going \

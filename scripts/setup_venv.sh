@@ -2,6 +2,7 @@
 # Build the .venv this pipeline runs in, without touching anything else.
 #
 #   scripts/setup_venv.sh              # core + model backends + tests
+#   DA3=1 scripts/setup_venv.sh        # also the default depth backend
 #   VENV=/data/binghe/venvs/proxy scripts/setup_venv.sh
 #   EXTRAS=core scripts/setup_venv.sh  # no torch, for contract/QC/encoding work
 #
@@ -72,6 +73,19 @@ case "$EXTRAS" in
     die "EXTRAS must be 'full' or 'core', got '$EXTRAS'"
     ;;
 esac
+
+# depth-anything-3 is the default depth backend but cannot go in
+# requirements.txt: it is not on PyPI, and it declares numpy<2 and
+# python<=3.13, both of which contradict the pins above. Installed here with
+# resolution switched off, which is safe only because the four packages it
+# actually needs at runtime are named explicitly. Opt-in, since the weights are
+# 6.8 GB and CC-BY-NC; without it, use DEPTH=depth_anything.
+if [[ "${DA3:-0}" == "1" ]]; then
+  echo "installing depth-anything-3 (--no-deps; see RUNBOOK section 7)"
+  "$py" -m pip install --no-deps --ignore-requires-python \
+    "git+https://github.com/ByteDance-Seed/depth-anything-3"
+  "$py" -m pip install einops omegaconf addict imageio
+fi
 
 # ---------------------------------------------------------------------- verify
 

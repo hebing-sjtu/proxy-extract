@@ -16,6 +16,7 @@ import argparse
 import sys
 
 from proxy_extract.depth.depth_anything import INDOOR_CHECKPOINT, OUTDOOR_CHECKPOINT
+from proxy_extract.depth.depth_anything_v3 import METRIC_CHECKPOINT, NESTED_CHECKPOINT
 from proxy_extract.depth.mapanything import APACHE_CHECKPOINT, DEFAULT_CHECKPOINT
 from proxy_extract.semantic.panoptic import ADE20K_CHECKPOINT, CITYSCAPES_CHECKPOINT
 
@@ -29,6 +30,11 @@ SETS: dict[str, tuple[str, ...]] = {
     # Gated on the hub and CC-BY-NC. Fetching needs `huggingface-cli login`
     # after accepting the terms; the -apache mirror is the one to ship with.
     "mapanything": (DEFAULT_CHECKPOINT, APACHE_CHECKPOINT),
+    # 6.8 GB, and CC-BY-NC, so it is deliberately not in `default`. Unlike
+    # mapanything it needs nothing from outside the hub: the DINOv2 backbone
+    # ships inside the checkpoint rather than through torch.hub.
+    "da3": (NESTED_CHECKPOINT,),
+    "da3-apache": (METRIC_CHECKPOINT,),
 }
 
 

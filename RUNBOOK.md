@@ -51,12 +51,16 @@ CWM 的输入格式是写死的，我们只能适配，不能改：
 
 ```bash
 cd /path/to/fastvideo_datapipe
-scripts/setup_venv.sh
+DA3=1 scripts/setup_venv.sh
 ```
 
 它按顺序做四件事：查前置（Python ≥ 3.10）→ 建 `.venv` → 按 `requirements.txt`
 装死 pin 的依赖 + 以 editable 装 `proxy-extract` → 跑自检并打印 ffmpeg 位置和
 torch/CUDA 可见性。torch 那步是大头，约 3 GB。
+
+`DA3=1` 会额外装默认深度后端 `depth_anything_v3`。它没法写进 `requirements.txt`
+（不在 PyPI，且自称要 numpy<2 / python<=3.13，跟上面的 pin 冲突），所以单独一步、
+用 `--no-deps` 装。不加这个开关就得用 `DEPTH=depth_anything` 跑，理由见第 7 节。
 
 ### ffmpeg 从哪来
 
@@ -170,7 +174,7 @@ GPU 节点是 x86_64，而**捆绑 CUDA 的 torch wheel 只有 linux/x86_64 版�
 ```bash
 git clone <repo> && cd fastvideo_datapipe
 make build          # 节点本身就是 amd64，普通 build 就够
-make test           # 期望 348 passed
+make test           # 期望 373 passed
 ```
 
 第一次构建大约 10–20 分钟，绝大部分时间花在下载 torch（约 2.5 GB）。
@@ -324,7 +328,7 @@ handpick29_high_low/
 
 ```bash
 .venv/bin/python -m pytest proxy-extract/tests -q
-# 期望：348 passed
+# 期望：373 passed
 ```
 
 `setup_venv.sh` 结尾已经跑过一次。单独重跑是在改完代码之后。
@@ -552,15 +556,50 @@ out/cond/high/26_trevor_seg_0004/
                     cityscapes  12 类，SegFormer，街景场景更准但没有室内类
                     synthetic   假数据，只用来验证接线
 
---depth-backend     depth_anything  单帧米制深度（当前验证过的）
-                    mapanything     多帧+可吃 GT 相机（更好，但权重受限，见下）
-                    synthetic       假数据
+--depth-backend     depth_anything_v3  DA3 嵌套模型，米制（默认，见下）
+                    depth_anything     DA V2 单帧米制，装完即用的兜底
+                    mapanything        多帧+可吃 GT 相机，但取权重会卡（见下）
+                    synthetic          假数据
 ```
 
-三个必须知道的坑：
+选后端的实际约束不是精度，而是**权重能不能在这台机器上拿到**，以及**它肯不肯声明自己
+是米制**——`scenes` 会拒绝非米制深度，因为交付视频的 log-z 编码需要真实尺度。
 
-**`depth_anything` 是默认值，因为它是装完就能用的那个。** `requirements.txt` 覆盖
-它的依赖（只要 transformers），`fetch_models.py --set default` 拉的也正是它的权重。
+**`depth_anything_v3` 是默认值。** 它是三个里唯一同时满足两个条件的：DINOv2 主干
+烘焙在它自己的 `model.safetensors` 里，所以**只要连得上 HF 就能拿全所有权重**，不像
+mapanything 那样另外走 `torch.hub`；而且它的嵌套 checkpoint 会用自己预测的焦距完成
+换算并置 `is_metric = 1`。
+
+代价有三个，都得先知道：
+
+1. **不在 PyPI，而且它声明的 pin 跟本环境冲突**（`numpy<2`，我们是 2.5.1；
+   `requires-python <=3.13`，我们是 3.14）。直接装会把 numpy 降级、把 torch 拽走，
+   所以必须绕开它的依赖解析：
+
+   ```bash
+   .venv/bin/python -m pip install --no-deps --ignore-requires-python \
+       git+https://github.com/ByteDance-Seed/depth-anything-3
+   .venv/bin/python -m pip install einops omegaconf addict imageio
+   .venv/bin/python scripts/fetch_models.py --set da3      # 6.8 GB
+   ```
+
+   `--no-deps` 会漏掉 `gsplat` / `open3d` / `pycolmap` / `moviepy` / `evo`，那些只服务
+   高斯导出和多视角位姿对齐。后端会在导入前给这两个子模块装上占位实现，占位被真的调用
+   才会报错——单目路径永远不会走到（源码里 `if extrinsics is None: return`）。
+
+2. **权重是 CC BY-NC 4.0**，只能研究用。想要 Apache-2.0 的话只有
+   `DA3METRIC-LARGE`（`--set da3-apache`），但它是 DinoV2+DPT、**没有相机头**：输出是
+   canonical 深度、从不设置 `is_metric`、也给不出换算所需的焦距，所以 `scenes` 会直接
+   拒收。要用它就得由外部补焦距（ABot 的 COLMAP `cameras.txt` 里有像素焦距，且像素
+   焦距不受 COLMAP 尺度不确定性影响）——这条路还没实现。
+
+3. **它不输出天空掩码。** Apache 那个 metric-large 会给 `sky`，嵌套这个给的是 `None`。
+   所以天空只能由语义分支认定，`duv.mp4` 靠 `ids == sky` 仍然正确，但 `depth.mp4` 的
+   0 哨兵拿不到它。这跟 `depth_anything` / `mapanything` 的现状一样，不是新问题。
+
+**`depth_anything`（V2）是不想折腾时的兜底。** `requirements.txt` 覆盖它的依赖（只要
+transformers），`fetch_models.py --set default` 拉的也正是它的权重。它逐帧预测，帧与帧
+之间的尺度没有绑定，这个 caveat 会写进每份 report 的 `depth.meta.caveat`。
 
 **`mapanything` 要单独装，而且不在 PyPI 上。**
 
@@ -574,8 +613,8 @@ out/cond/high/26_trevor_seg_0004/
 
 **mapanything 还要第三份权重，而 `fetch_models.py` 拿不到它。** MapAnything 的
 DINOv2 主干是走 `torch.hub` 拉的，宿主是 `dl.fbaipublicfiles.com` —— 跟 HF 无关，
-所以 `HF_ENDPOINT` 镜像和 `HF_HUB_OFFLINE=1` 对它都不起作用。国内节点常常连不上
-这个域名，症状是日志停在
+所以 `HF_ENDPOINT` 和 `HF_HUB_OFFLINE=1` 对它都不起作用。很多集群的出网白名单只放行
+了 HF / PyPI 这一类，这个域名不在里面（跟节点在哪个国家无关），症状是日志停在
 
 ```
 Using cache found in ~/.cache/torch/hub/facebookresearch_dinov2_main
@@ -606,12 +645,18 @@ curl -L -o ~/.cache/torch/hub/checkpoints/dinov2_vitl14_pretrain.pth \
   https://dl.fbaipublicfiles.com/dinov2/dinov2_vitl14/dinov2_vitl14_pretrain.pth
 ```
 
-`depth_anything` 没有这个问题，它的权重全在 HF 上，镜像覆盖得到。这是它作为默认值的
-又一个理由。
+`depth_anything_v3` 和 `depth_anything` 都没有这个问题，它们的权重全在 HF 上。这正是
+默认值换成 DA3 的理由：mapanything 的多帧一致性确实更好，但取不到权重的后端等于没有。
 
-**depth_anything 是逐帧预测的**，帧与帧之间的尺度没有绑定。静态场景问题不大，
-但如果下游对时序深度一致性敏感，`mapanything` 是多帧的、尺度在整段内一致，这是
-它值得装的理由。这个 caveat 会写进每份 report 的 `depth.meta.caveat`。
+DA3 也支持多帧联合重建（它是 any-view 模型）：
+
+```bash
+--depth-backend-option window=4        # 窗口内的帧当作同一场景的多个视角
+--depth-backend-option process_res=728 # 默认 504；调高更清晰也更慢
+```
+
+`window` 大于 1 时该窗口内的尺度绑定在一起。默认 `window=1`，即逐帧——动态场景下
+多视角假设不成立，所以不默认打开。
 
 `run_scenes.sh` 启动前会**真的把两个后端各跑一次单帧推理**，所以后端装错或权重没拉
 会在几秒内失败，而不是在 2000 条上各失败一次。`--keep-going` 也不再吞 ImportError：
@@ -839,7 +884,7 @@ scripts/run_scenes.sh
   --recursive \
   --out /data/binghe/datasets/abot_scenes \
   --semantic-backend standard11 \
-  --depth-backend depth_anything \
+  --depth-backend depth_anything_v3 \
   --resume --keep-going
 ```
 

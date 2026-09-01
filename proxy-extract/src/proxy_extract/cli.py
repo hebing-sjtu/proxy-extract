@@ -18,7 +18,7 @@ from .pipeline import ExtractionConfig, condition_dir_for, extract_clip, extract
 from .proxy import DEFAULT_COLOR_CRF
 from .qc import score_dataset, score_pair, write_report
 
-DEPTH_BACKENDS = ("mapanything", "depth_anything", "synthetic")
+DEPTH_BACKENDS = ("mapanything", "depth_anything", "depth_anything_v3", "synthetic")
 SEMANTIC_BACKENDS = ("ade20k", "cityscapes", "coarse6", "standard11", "synthetic")
 REFINERS = ("none", "sam3")
 
@@ -109,6 +109,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     scenes.add_argument("--out", type=Path, required=True, help="root to hold seg_long_NNNNNN/")
     scenes.add_argument("--depth-backend", choices=DEPTH_BACKENDS, default="mapanything")
+    scenes.add_argument(
+        "--depth-backend-option", action="append", default=[], metavar="KEY=VALUE",
+        help="pass a keyword to the depth backend's constructor, repeatable; "
+        "e.g. --depth-backend-option window=4 for DA3's multi-view mode",
+    )
     scenes.add_argument("--semantic-backend", choices=SEMANTIC_BACKENDS, default="standard11")
     scenes.add_argument("--refiner", choices=REFINERS, default="none")
     scenes.add_argument(
@@ -301,6 +306,27 @@ def _run_camera_qc(args: argparse.Namespace) -> int:
 VIDEO_SUFFIXES = (".mp4", ".mov", ".mkv", ".webm")
 
 
+def parse_backend_options(pairs: list[str]) -> dict:
+    """Turn `KEY=VALUE` strings into constructor keywords.
+
+    Values are read as Python literals where that works, so `window=4` arrives
+    as an int rather than the string "4", and anything unquoted that is not a
+    literal — a checkpoint name, say — stays a string.
+    """
+    import ast
+
+    options: dict = {}
+    for pair in pairs:
+        key, separator, value = pair.partition("=")
+        if not separator or not key:
+            raise SystemExit(f"backend option {pair!r} is not KEY=VALUE")
+        try:
+            options[key] = ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            options[key] = value
+    return options
+
+
 def resolve_videos(paths: list[Path], *, recursive: bool = False) -> list[Path]:
     """Expand any directories in `--video` into the clips they hold.
 
@@ -405,6 +431,7 @@ def _run_scenes(args: argparse.Namespace) -> int:
 
     config = delivery.DeliveryConfig(
         depth_backend=args.depth_backend,
+        depth_backend_options=parse_backend_options(args.depth_backend_option),
         semantic_backend=args.semantic_backend,
         semantic_refiner=args.refiner,
         chunk_frames=args.chunk_frames,
