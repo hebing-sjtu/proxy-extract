@@ -72,7 +72,7 @@ weights. Since extraction forces `HF_HUB_OFFLINE=1`, a mismatch is not a slow
 path but an immediate failure on every GPU at once, so `run_shards.sh` refuses
 to start when the directory is empty.
 
-`docker/fetch_models.py` fills the cache. Groups, so you do not wait on
+`scripts/fetch_models.py` fills the cache. Groups, so you do not wait on
 gigabytes you will not use:
 
 | `--set` | Repos | Needed for |

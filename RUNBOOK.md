@@ -7,10 +7,14 @@
 
 建议顺序：
 
-1. 有 Docker + NVIDIA 卡：跑 `./docker/first_run.sh`（约 15–30 分钟，首次含构建和拉权重）
-2. 没有卡、只想摸命令：用第 5 节的本地 CPU 跑法
+1. **装 venv：`scripts/setup_venv.sh`**（第 2 节）。这是维护的主路径。
+2. 交付数据：第 12 节 `scenes`，第 13 节验收。
+3. 只想摸不需要模型的部分（合约/分类/QC/编码）：`EXTRAS=core scripts/setup_venv.sh`，纯 CPU。
 
-`make help` 是同一套步骤的单词入口。
+> **为什么是 venv 而不是容器。** 这些节点上已经有一套在用的主环境，而镜像路线要
+> docker daemon、container toolkit 和 root，动的是机器级的东西。venv 只往自己那个
+> 目录里装东西，删掉目录就等于卸干净，是更小的干预。容器路线仍然保留在第 3 节，
+> 两条路装的是**同一个** `requirements.txt`，所以版本不会分叉。
 
 > **仓库里没有图和素材。** `handpick29_high_low/`（语料）和
 > `experiments/figures/`（渲染出来的图和 preview）都不在版本控制里 ——
@@ -43,41 +47,67 @@ CWM 的输入格式是写死的，我们只能适配，不能改：
 
 ---
 
-## 2. 一键跑通（推荐）
-
-前提：有 Docker、有 NVIDIA 驱动（`nvidia-smi` 能打印出卡）、仓库根下有 `handpick29_high_low/`。
+## 2. 装 venv（主路径）
 
 ```bash
 cd /path/to/fastvideo_datapipe
-chmod +x docker/first_run.sh docker/run_shards.sh
-./docker/first_run.sh
+scripts/setup_venv.sh
 ```
 
-它按顺序做五件事：构建镜像 → 自检（应看到 **229 passed**）→ 拉权重 → 相机 QC → 抽一条 clip 并渲 preview。
+它按顺序做四件事：查前置（Python ≥ 3.10、ffmpeg）→ 建 `.venv` → 按
+`requirements.txt` 装死 pin 的依赖 + 以 editable 装 `proxy-extract` → 跑自检并
+打印 torch/CUDA 可见性。torch 那步是大头，约 3 GB。
 
-**这是给「本机就有卡」的场景准备的。** 要在远端服务器上拉镜像跑，看第 3 节。
+三个可调的环境变量：
 
-跑完打开：
+| 变量 | 默认 | 用途 |
+| --- | --- | --- |
+| `VENV` | `./.venv` | 装到别处，例如 `/data/binghe/venvs/proxy` |
+| `PYTHON` | `python3` | 指定解释器。系统 `python3` 常常是 3.9，会被守卫拦下 |
+| `EXTRAS` | `full` | 改成 `core` 则不装 torch，只能跑合约/分类/QC/编码 |
 
-| 文件 | 是什么 |
-| --- | --- |
-| `out/preview.mp4` | 你刚抽出的结果：左深度、右语义、底栏图例 |
-| `out/camera_qc.json` | 29 条 clip 的对极残差 |
-| `out/cond/high/26_trevor_seg_0004/` | 给 CWM 吃的 condition_root |
-
-`preview.mp4` 应当是三行：源画面、暖色为近的深度、6 类色块。颜色对不上先看第 8 节，不要先改代码。
-
-等价的单词写法：`make build test fetch qc extract preview`。
-
-容器默认以 root 写文件。`first_run.sh` 已经设了你的 uid；手打 compose 时先：
+装完不必 activate 也能用，直接拿 venv 里的解释器调：
 
 ```bash
-export DOCKER_UID=$(id -u) DOCKER_GID=$(id -g)
+.venv/bin/python -m proxy_extract --help
 ```
+
+**用 `$VENV/bin/python -m pip` 而不是 `$VENV/bin/pip`。** venv 建好之后被移动或
+拷贝过，`pip` 脚本里的 shebang 就是过期的绝对路径，会报 `bad interpreter`；
+模块形式不看 shebang。脚本内部已经这么做了，手动补装依赖时也照这个来。
+
+### 拉权重
+
+```bash
+.venv/bin/python scripts/fetch_models.py --set default
+```
+
+默认拉推荐配置的两个模型：Mask2Former（语义）和 Depth Anything V2 Metric
+Outdoor（深度）。国内网络慢先 `export HF_ENDPOINT=https://hf-mirror.com`。
+权重位置由 `HF_HOME` 决定，建议显式指到大盘上，例如
+`export HF_HOME=/data/binghe/cache/huggingface`。
+
+`fetch_models.py` 不依赖 docker，容器只是把它拷进镜像复用。
+
+### 冒烟：不用权重跑通整条链路
+
+```bash
+.venv/bin/python -m proxy_extract extract \
+  --video <任意视频>.mp4 --out /tmp/smoke \
+  --semantic-backend synthetic --depth-backend synthetic
+```
+
+`synthetic` 后端只验证接线。**它的输出是伪造的**，看起来跟真产物一模一样，
+别拿它判断质量 —— 详见第 13 节，这个坑已经踩过一次。
 
 ---
 
-## 3. 在服务器节点上部署
+## 3. 容器路线（备选，不是主路径）
+
+> **先看第 2 节。** 当前维护的是 venv：节点上已有在用的主环境，而这一节要动
+> docker daemon、container toolkit 和 root 权限。这一节留着是因为多节点分发和
+> 「环境完全隔离」这两种需求容器确实更合适，但它**没有被真正验证过**（见本节
+> 第一段和第 9 节第 1 条）。两条路装的是同一个 `requirements.txt`。
 
 ### 先说结论：现在还没有可拉的镜像
 
@@ -103,7 +133,7 @@ GPU 节点是 x86_64，而**捆绑 CUDA 的 torch wheel 只有 linux/x86_64 版�
 ```bash
 git clone <repo> && cd fastvideo_datapipe
 make build          # 节点本身就是 amd64，普通 build 就够
-make test           # 期望 229 passed
+make test           # 期望 348 passed
 ```
 
 第一次构建大约 10–20 分钟，绝大部分时间花在下载 torch（约 2.5 GB）。
@@ -226,11 +256,17 @@ make preview CLIP=26_trevor_seg_0004
 
 ## 4. 逐步说明
 
+下面全部用 venv 写法。容器里的等价命令是把 `.venv/bin/python -m proxy_extract`
+换成 `docker compose -f docker/docker-compose.yml run --rm extract`，并把路径换成
+容器内的 `/work/...`。
+
 ### 步骤 0：先确认环境
 
 ```bash
 nvidia-smi                     # 驱动 >= 525，否则 torch 2.13 起不来
-docker --version
+ffmpeg -version                # 每一路交付视频都经它写出
+.venv/bin/python -c "import torch; print(torch.cuda.is_available(), torch.cuda.device_count())"
+# 期望：True 8
 ls handpick29_high_low         # 应该有 camera/ high/ low/ manifest.json
 ```
 
@@ -244,46 +280,38 @@ handpick29_high_low/
 └── manifest.json
 ```
 
-### 步骤 1：构建镜像
+### 步骤 1：自检
+
+不需要 GPU、不需要权重，先确认这个 venv 本身是好的：
 
 ```bash
-docker compose -f docker/docker-compose.yml build
+.venv/bin/python -m pytest proxy-extract/tests -q
+# 期望：348 passed
 ```
 
-镜像内部细节、为什么不用 `nvidia/cuda` 基础镜像、怎么换 CUDA 版本，
-见 [`docker/README.md`](docker/README.md)。
+`setup_venv.sh` 结尾已经跑过一次。单独重跑是在改完代码之后。
 
-**先跑一次不需要 GPU、不需要权重的自检**，确认镜像本身没问题：
-
-```bash
-docker compose -f docker/docker-compose.yml run --rm test
-# 期望：229 passed
-```
-
-再确认卡能被看到：
-
-```bash
-docker run --rm --gpus all proxy-extract:0.1.0 \
-  python -c "import torch; print(torch.cuda.is_available(), torch.cuda.device_count())"
-# 期望：True 8
-```
-
-打印 `False` 的话是宿主机的问题不是镜像的问题，见第 8 节。
+`torch.cuda.is_available()` 打印 `False` 是宿主机/驱动的问题，见第 8 节。
 
 ### 步骤 2：拉权重
 
 ```bash
-docker compose -f docker/docker-compose.yml run --rm fetch
+.venv/bin/python scripts/fetch_models.py --set default
 ```
 
-国内网络慢的话先 `export HF_ENDPOINT=https://hf-mirror.com`，compose 会透传。
+国内网络慢的话先 `export HF_ENDPOINT=https://hf-mirror.com`。
 
 默认拉的是推荐配置需要的两个模型：Mask2Former（语义）和 Depth Anything V2
 Metric Outdoor（深度）。别的组合见 `docker/README.md` 的表。
 
-权重放在宿主机的 `.hf-cache/`（可用 `HF_CACHE_DIR` 改），重建镜像不会丢。拉完之后所有抽取都跑在
-`HF_HUB_OFFLINE=1` 下 —— 这不是洁癖：8 个 worker 同时打 hub 会互相限速，
-批处理跑到一半 hub 抽风会留下一个处理了一半的数据集。
+权重位置由 `HF_HOME` 决定，**显式指到大盘上**，别让它落到家目录：
+
+```bash
+export HF_HOME=/data/binghe/cache/huggingface
+```
+
+拉完之后批处理建议加 `export HF_HUB_OFFLINE=1` —— 这不是洁癖：8 个 worker 同时打
+hub 会互相限速，批处理跑到一半 hub 抽风会留下一个处理了一半的数据集。
 
 ### 步骤 3：挑片（camera-qc）
 
@@ -294,7 +322,8 @@ Metric Outdoor（深度）。别的组合见 `docker/README.md` 的表。
 所以残差大就说明**这一版渲染的几何跟位姿对不上**。
 
 ```bash
-docker compose -f docker/docker-compose.yml run --rm qc
+.venv/bin/python -m proxy_extract camera-qc \
+  --dataset handpick29_high_low --track high --report out/camera_qc.json
 ```
 
 真实输出（29 条 clip 的 high 渲染）：
@@ -327,11 +356,11 @@ docker compose -f docker/docker-compose.yml run --rm qc
 ### 步骤 4：抽一条 clip
 
 ```bash
-docker compose -f docker/docker-compose.yml run --rm extract \
-  extract --video /work/data/high/26_trevor_seg_0004.mp4 \
-          --out /work/out/cond \
-          --semantic-backend coarse6 \
-          --depth-backend depth_anything
+.venv/bin/python -m proxy_extract extract \
+  --video handpick29_high_low/high/26_trevor_seg_0004.mp4 \
+  --out out/cond \
+  --semantic-backend coarse6 \
+  --depth-backend depth_anything
 ```
 
 一行日志：
@@ -349,10 +378,12 @@ docker compose -f docker/docker-compose.yml run --rm extract \
 ### 步骤 5：看结果
 
 ```bash
-docker compose -f docker/docker-compose.yml run --rm extract \
-  preview --condition-root /work/out/cond/high/26_trevor_seg_0004 \
-          --out /work/out/preview.mp4
+.venv/bin/python -m proxy_extract preview \
+  --condition-root out/cond/high/26_trevor_seg_0004 \
+  --out out/preview.mp4
 ```
+
+交付格式（`scenes` 的产物）是另一个命令，见第 13 节的 `scenes-preview`。
 
 preview 会自己从 `extraction_report.json` 里读出用的是 6 类还是 12 类，
 用对应的调色板。**不要**手动把 6 类结果按 12 类的颜色看 —— ID 5 在
@@ -361,8 +392,8 @@ preview 会自己从 `extraction_report.json` 里读出用的是 6 类还是 12 
 ### 步骤 6：校验
 
 ```bash
-docker compose -f docker/docker-compose.yml run --rm extract \
-  validate --condition-root /work/out/cond/high/26_trevor_seg_0004 --expect-frames 124
+.venv/bin/python -m proxy_extract validate \
+  --condition-root out/cond/high/26_trevor_seg_0004 --expect-frames 124
 ```
 
 这一步用的是跟 CWM 加载器同一套检查（字节数、分辨率、深度范围、ID 范围）。
@@ -370,11 +401,21 @@ docker compose -f docker/docker-compose.yml run --rm extract \
 
 ### 步骤 7：多卡批处理
 
+交付场景用 `scripts/run_scenes.sh`（第 12 节），它是 venv 原生的。
+condition_root 的批处理目前只有容器版封装 `docker/run_shards.sh`；venv 下手写：
+
 ```bash
-./docker/run_shards.sh /work/data/high /work/out/cond 8
+for i in $(seq 0 7); do
+  CUDA_VISIBLE_DEVICES=$i .venv/bin/python -m proxy_extract extract \
+    --video handpick29_high_low/high --out out/cond \
+    --semantic-backend coarse6 --depth-backend depth_anything \
+    --shard $i/8 --resume --keep-going \
+    >out/logs/shard-$i.log 2>&1 &
+done
+wait
 ```
 
-每张卡一个容器，`--shard i/8` 把 clip 列表按位置切开互不重叠。日志在
+一张卡一个进程，`--shard i/8` 把 clip 列表按位置切开互不重叠。日志在
 `out/logs/shard-*.log`。
 
 三个标志值得知道它们为什么在：
@@ -393,24 +434,45 @@ docker compose -f docker/docker-compose.yml run --rm extract \
 
 ---
 
-## 5. 不用 Docker 的本地跑法
+## 5. venv 的维护
 
-只想看合约/分类/QC 这些不需要模型的部分，纯 CPU 就够：
+### 只装不需要模型的部分
 
-```bash
-python3 -m venv .venv
-.venv/bin/pip install -e proxy-extract
-.venv/bin/pip install pytest && .venv/bin/python -m pytest proxy-extract/tests -q
-```
-
-想跑真模型再装 `pip install torch transformers accelerate`。
-`synthetic` 后端可以在完全没有权重的情况下跑通整条链路，用来验证接线：
+合约、分类体系、QC、编码这几层都不 import torch（后端是懒加载的），所以纯 CPU
+机器上可以不装那 3 GB：
 
 ```bash
-.venv/bin/python -m proxy_extract extract \
-  --video handpick29_high_low/high/26_trevor_seg_0004.mp4 \
-  --out /tmp/smoke --semantic-backend synthetic --depth-backend synthetic
+EXTRAS=core scripts/setup_venv.sh
 ```
+
+这时 `--depth-backend`/`--semantic-backend` 只有 `synthetic` 可用，其余会在
+调用时报 ImportError，不会在启动时。
+
+### 改完代码之后
+
+`proxy-extract` 是以 editable 装的，改源码不用重装。重装只在这三种情况下需要：
+
+| 情况 | 做什么 |
+| --- | --- |
+| 改了 `pyproject.toml` 的依赖或 entry point | `.venv/bin/python -m pip install --no-deps -e proxy-extract` |
+| 改了 `requirements.txt` 的 pin | `.venv/bin/python -m pip install -r requirements.txt` |
+| venv 被移动或拷贝过 | 重建。里面全是绝对路径，改不干净 |
+
+### 别把它跟主环境混起来
+
+`setup_venv.sh` 建的是不继承 `site-packages` 的干净 venv，这是它的全部意义。
+两个会破坏这一点的动作：
+
+- 在已经 activate 了 conda/主环境的 shell 里 `pip install` 到全局；
+- 用 `$VENV/bin/pip` 而不是 `$VENV/bin/python -m pip`（venv 移动过就会打到别处）。
+
+要确认当前用的到底是哪个解释器：
+
+```bash
+.venv/bin/python -c "import proxy_extract, sys; print(sys.prefix); print(proxy_extract.__file__)"
+```
+
+`sys.prefix` 必须是这个 venv 的路径。不是的话就是装串了。
 
 ---
 
@@ -470,17 +532,30 @@ out/cond/high/26_trevor_seg_0004/
 
 ## 8. 出错了怎么办
 
+venv 相关的先看这几条：
+
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
-| `torch.cuda.is_available()` 是 `False` | 宿主机没装 nvidia-container-toolkit，或装完没重启 docker | 装好后 `systemctl restart docker` |
+| `bad interpreter` / `pip` 找不到 | venv 建好后被移动或拷贝过，`pip` 脚本的 shebang 是过期绝对路径 | 用 `.venv/bin/python -m pip`；venv 移动过就重建 |
+| `ModuleNotFoundError: proxy_extract` | 装到了主环境而不是 venv，或没装 | `.venv/bin/python -m pip install --no-deps -e proxy-extract` |
+| `error: need Python >= 3.10` | 系统 `python3` 常常是 3.9 | `PYTHON=/path/to/python3.12 scripts/setup_venv.sh` |
+| `sys.prefix` 不是 venv 路径 | shell 里 activate 了 conda/主环境 | `deactivate`，或直接用 `.venv/bin/python` 全路径调用 |
+| `ffmpeg not found` | 没装 | `apt install ffmpeg`；每一路交付视频都经它写出 |
+
+模型和数据相关：
+
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| `torch.cuda.is_available()` 是 `False` | 驱动/torch 构建不匹配，或装的是 CPU wheel | 确认 `nvidia-smi` 正常；`requirements.txt` 的 torch 在 linux/x86_64 上自带 CUDA |
 | CUDA 起不来，驱动报版本低 | torch 2.13 要驱动 >= 525 | 升驱动，或按 `docker/README.md` 换 torch+cuXXX |
 | 下权重卡住 / 超时 | hub 网络 | `export HF_ENDPOINT=https://hf-mirror.com` 后重跑 fetch |
 | `OSError: ... preprocessor_config.json` | 权重没拉全就跑了离线模式 | 重跑 fetch，确认 `--set` 覆盖了你用的后端 |
-| `no such video: ...` | 路径是宿主机路径不是容器路径 | 容器里数据在 `/work/data`，不是 `handpick29_high_low` |
+| `no such video: ...` | 路径不对；ABot 那种嵌套目录要加 `--recursive` | 见第 11 节 |
 | `no camera tracks under ...` | `camera/` 目录不在或没有 json | 检查数据集目录结构 |
 | clip 少于 124 帧 | CWM 窗口就是 124 帧 | 这条 clip 用不了，不是 bug |
 | preview 颜色不对 | 手动指定了错的调色板 | 别传，让它自己从 report 读 |
-| 某个 shard 挂了 | 看 `out/logs/shard-N.log` | 修完重跑同一条命令，`--resume` 会补 |
+| 交付的语义看着完全不对 | 很可能用了 `synthetic` 占位后端 | 查 report 的 `deliverable` 字段，见第 13 节 |
+| 某个 shard 挂了 | 看 `<out>/logs/shard-N.log` | 修完重跑同一条命令，`--resume` 会补 |
 
 ---
 
@@ -489,9 +564,9 @@ out/cond/high/26_trevor_seg_0004/
 写在前面，免得当成 bug 去查：
 
 1. **Docker 镜像没被真正构建过，registry 上也没有。** 写这份文档的机器是
-   arm64 且没有 docker daemon。版本 pin 来自一个能跑的本地环境，布局是常规
-   布局，但第一次 `docker build` 请当成需要盯着的事，而且必须构建成
-   `linux/amd64`（第 3 节）。
+   arm64 且没有 docker daemon。第一次 `docker build` 请当成需要盯着的事，
+   而且必须构建成 `linux/amd64`（第 3 节）。**维护的是 venv 路线**（第 2 节），
+   它跟镜像装的是同一个 `requirements.txt`，所以容器路线滞后不影响交付。
 2. **hero/npc 拆分只在一条 clip 上被真实验证过。** 29 条样例里只有
    `11_john_marston_seg_0313` 有其他人长时间在画面里（44% 的帧）。逻辑本身有
    单元测试覆盖，但「在人多的场景里靠谱吗」这个问题，样本量不足以回答。
@@ -539,3 +614,287 @@ open gallery/index.html
 | 12–15 | `duv_*.mp4` | 可播放的 preview |
 
 数字和结论写在 `experiments/README.md`。镜像内部写在 `docker/README.md`。
+
+---
+
+## 11. ABot-World-Explorer-500h
+
+跟 gta-web 不同：这个语料**只有 RGB 和一个 COLMAP 稀疏模型**，深度和语义都没有，
+所以整条预测链路对它才是必需的而不是备选。
+
+### 它跟 handpick29 有三处不一样
+
+| | handpick29 / gta-web | ABot |
+| --- | --- | --- |
+| 布局 | `high/<clip>.mp4` 一层 | `data/<前缀>/<sample_id>/video.mp4` 两层 |
+| 每段长度 | 124 帧（正好一个窗口） | 1800 帧 |
+| 标注 | 引擎输出的 depth / semantic | 只有 `annotations.tar`（动作、字幕、COLMAP） |
+
+三处都会影响命令怎么写：
+
+**布局要 `--recursive`。** `--video` 默认只看一层目录，指向 ABot 根目录会报
+`no .mp4 files in ...`。
+
+**1800 帧要 `--chunk-frames`。** 契约窗口是 124、步长 90，所以合法长度只能是
+`124+90n`；1800 帧取 19 个窗口 = **1744 帧**，尾部 56 帧丢弃，这是契约决定的不是 bug。
+真正的问题是内存：管线原本一次性把整段读进来，1744 帧在 1344×768 下光 RGB 就是
+5.4 GB，由它导出的全分辨率深度栈还要再 7.2 GB。`--chunk-frames` 让模型分批跑、
+每批降到 336×192 就丢掉，实测峰值从 7.7 GiB（仅 484 帧时）降到 5.73 GiB（完整 1744 帧）。
+
+分批**不会改变结果**：降采样用的中值/最小值/均值都与正的缩放系数可交换，所以
+「先降采样再标定」和原来的顺序逐字节一致，`tests/test_chunking.py` 盯着这件事。
+代价是深度后端的跨帧推理会在每个批次接缝处断掉 —— `depth_anything` 是逐帧的，
+不受影响；`mapanything` 靠联合观察整段获得时序一致性，分批会削弱它。
+
+**COLMAP 相机不能和分批一起用。** 每批是独立重建，预测出的位姿不共享坐标系，
+没法解出一个全局尺度，所以两个一起给会直接报错而不是悄悄算错。ABot 的 COLMAP
+平移本来也不是米制的。
+
+### 跑
+
+```bash
+python -m proxy_extract extract \
+  --video /data/binghe/datasets/ABot-World-Explorer-subset2000/data \
+  --recursive \
+  --out /data/binghe/datasets/abot_cond \
+  --semantic-backend standard11 \
+  --depth-backend depth_anything \
+  --chunk-frames 124 \
+  --emit-videos all \
+  --resume --keep-going
+```
+
+多卡照旧加 `--shard i/N`，一张卡一个进程。
+
+产物落在 `<out>/<sample_id>/video/`（目录名取自视频的父目录，ABot 里就是
+`sample_id`，所以 2000 条不会撞名）。
+
+### 体积要先算再跑
+
+单条 1744 帧约 **435 MiB**（深度 `.f32` 就占 429 MiB），2000 条约 **850 GiB**、
+接近 **700 万个文件**。比 RGB 本身（2000 条约 164 GiB）大五倍，落到 ceph 上
+inode 也要先确认够。只想先验证的话，深度换成 `--depth-downsample min` 不会省空间，
+真要省只能少下 episode。
+
+### 交付视频
+
+`--emit-videos all` 会在每个 condition_root 旁边按 `DATA_F.md` 的编码多写三个文件：
+
+```
+depth.mp4      反向 log-z 灰度，near 0.1 / far 256
+semantic.mp4   无损 RGB，(R,G,B) = (0,0,id)
+proxy.mp4      R = log-z(near 0.1 / far 8000)，G/B = 语义色
+```
+
+`--emit-videos proxy` 只写 proxy。已经抽好的 condition_root 想补视频，
+用 `python -m proxy_extract videos --condition-root <dir>`，不必重跑模型。
+
+语义视频必须无损 RGB（`libx264rgb`），这不是讲究：小整数 ID 走 YUV 管线会被色度
+下采样在类别边界上混成从没预测过的类，而且下游查不出来。`tests/test_proxy.py`
+用真实数据核对过三种编码都是逐字节无损的。
+
+> **proxy 的 R 通道方向是推断的，不是文档写明的。** `DATA_F.md` 给了 depth 视频
+> 明确的反向公式（近 = 高码值），但 proxy 的 R 只写了 near/far 和「压到 [0,254]，
+> 天空 = 255」，没说方向。这里默认沿用同一份文档里唯一给出的那个方向（反向），
+> 想要相反的用 `videos --forward-proxy-depth`。**如果 gta-web 录制端的
+> `scripts/compose-proxy.mjs` 能拿到，应当以它为准**：方向搞反不会报错，只会
+> 悄悄毁掉整个数据集的深度通道。
+
+`ego`（G/B = 128/0）需要知道该段主角在不在开车，这个标志来自 `standard11` 的
+player/ped 拆分结果里的 `driving`。ABot 没有 gta-web 那样的 `tag`，所以这完全依赖
+预测；不用 `standard11` 时所有载具都会落到普通 `vehicle`（64/0）。
+
+---
+
+## 12. 720p 交付场景（`scenes`）
+
+上一节产出的是 code-world-model 吃的 `condition_root`：336×192 的逐帧 `.f32` +
+PNG。这一节产出的是**另一种交付物** —— `DATA_F.md` 规定的那一套，1280×720、
+整段长度、四路视频对齐：
+
+```
+<out>/
+  scenes_manifest.json      scene 编号 ↔ sample_id 的映射，provenance 全在这
+  seg_long_000000/
+    color.mp4               RGB，libx264 / yuv420p，CRF 16（唯一有损的一路）
+    depth.mp4               反向 log-z 灰度，near 0.1 / far 256，libx264 无损
+    semantic.mp4            (R,G,B) = (0,0,id)，libx264rgb 无损
+    duv.mp4                 R = log-z（near 0.1 / far 8000，天空 255），
+                            G/B = 语义色，libx264rgb 无损
+    annotation.tar          episode 自带的标注，原样拷贝
+    extraction_report.json
+  seg_long_000001/
+  ...
+```
+
+`depth.mp4` 和 `duv.mp4` 的 R 通道**量程和方向都不一样**，别混着读：前者
+near 0.1 / far 256 且反向（近 = 高码值），后者 near 0.1 / far 8000 且正向
+（近 = 0，远 = 254，255 留给天空）。方向的取舍见第 12 节末尾。
+
+### 跑
+
+多卡直接用封装脚本（venv 原生，自带前置检查、分片、resume、结尾审计）：
+
+```bash
+DATA_DIR=/data/binghe/datasets/ABot-World-Explorer-subset2000/data \
+OUT_DIR=/data/binghe/datasets/abot_scenes \
+scripts/run_scenes.sh
+```
+
+它默认按 `nvidia-smi` 数出的卡数开进程。单条手跑：
+
+```bash
+.venv/bin/python -m proxy_extract scenes \
+  --video /data/binghe/datasets/ABot-World-Explorer-subset2000/data \
+  --recursive \
+  --out /data/binghe/datasets/abot_scenes \
+  --semantic-backend standard11 \
+  --depth-backend mapanything \
+  --resume --keep-going
+```
+
+多卡加 `--shard i/N`，一张卡一个进程。
+
+### 跟 `extract` 的四处关键差别
+
+**不做 336×192 降采样。** 降采样会丢掉 93% 的像素，而从这四路视频重做一遍很便宜；
+现在就做只会让网格的选择永远无法回头。降采样属于后处理。
+
+**不截帧。** `extract` 必须把 1800 帧截到 `124+90n = 1744` 帧以对齐契约窗口；
+`scenes` 按源帧率交付全部 1800 帧，切段也留给后处理。
+
+**1280×720 正好是 1920×1080 的 2/3**，所以缩放不引入形变。更要紧的是，这正是
+`semantic.player` 的先验（锚点 `(0.5, 0.55)`、`max_anchor_distance` 等）当初在
+gta-web 真实语料上拟合的分辨率 —— gta-web 的 semantic 视频本身就是 1280×720。
+所以 player/ped 拆分在这里跑的是原生像素，不是代理网格。
+
+**color 视频从模型看到的同一批解码帧编码。** 不是把源文件另外交给 ffmpeg 缩放：
+两个重采样器不会逐像素一致，而一套 RGB 跟自己的 depth 差半个像素的交付数据，
+对任何要学对应关系的下游来说比没有更糟。
+
+### 实测（真实 ABot episode 前 600 帧，本机 CPU，合成后端）
+
+| | 无光流 | `--flow-downscale 2`（默认） | `--flow-downscale 1` |
+| --- | --- | --- | --- |
+| 耗时 | 159 s | 222 s | 412 s |
+| 光流净成本 | — | 63 s | 253 s |
+| `flicker_after` | 0.0382 | 0.053909 | 0.053934 |
+| 四路视频合计 | 138 MiB | 154 MiB | 154 MiB |
+
+**降采样解光流几乎不花代价**：ds=2 和 ds=1 的 flicker 差 0.05%，而光流开销是 1/4，
+符合 Farneback 对像素数的平方关系。默认值就按这个定的。
+
+> 这里**不能拿「无光流」的 flicker 更低当成它更好**。`flicker_rate` 数的是逐帧
+> 变类的像素比例；不做流补偿时投票会在未对齐的窗口上把移动内容抹平，标签「粘」住
+> 了，于是这个指标反而更低 —— 那是边缘涂抹，不是稳定。上面 ds1/ds2 的对比是在
+> 同样开启光流的前提下比的，才是可比的。
+
+单帧字节数（600 帧实测除以帧数，proxy 最大是因为 R 通道扛着 log-z 的全部细节）：
+
+| 流 | 600 帧 | 折算 1800 帧 |
+| --- | --- | --- |
+| `duv.mp4` | 68.3 MiB | 205 MiB |
+| `depth.mp4` | 44.4 MiB | 133 MiB |
+| `color.mp4` | 29.4 MiB | 88 MiB |
+| `semantic.mp4` | 12.2 MiB | 37 MiB |
+| 合计 + tar | 155 MiB | **≈ 465 MiB** |
+
+所以 **2000 条约 0.89 TiB**，是源 RGB（约 211 GiB）的 4.3 倍。总量跟
+`condition_root` 那条路（约 850 GiB）差不多，但**文件数从约 700 万降到约 1.2 万** ——
+深度进了无损视频而不是逐帧 `.f32`，每个 scene 只有 6 个文件。ceph 上这是决定性的差别。
+
+### 内存：每个 worker 约 40 GiB，这决定开几个进程
+
+600 帧实测峰值 RSS **13.3 GiB**。每一项都是「每帧数组 × 帧数」，没有别的量级项，
+所以线性外推到 1800 帧是 **约 40 GiB**（第一次在 H200 上跑满 1800 帧时请复核这个数）。
+
+内存随 episode 长度走，不随窗口走，因为时序稳定和主角跟踪都跑在整段上 —— 这样它们
+跟测试覆盖的批处理行为完全等价，不需要为流式再引入一套近似。峰值里除了三个主栈
+（深度 6.6 GB、标签 1.7 GB、光流引导 1.7 GB）之外，还有稳定器在释放输入前先分配的
+输出、`np.concatenate` 的双份、以及 range guard 的临时量。
+
+`--chunk-frames`（默认 64）管的是 GPU 上单次前向的激活量，**不管**这些主机端的栈。
+
+**开 8 个 worker 就要约 320 GiB 主机内存。** 如果这不够，能省的地方按性价比排：
+按 `probe` 的帧数预分配以消掉 `concatenate` 的双份（约省 6.6 GB）、
+range guard 改成原地（再省 6.6 GB）、深度栈降到 float16（再省 3.3 GB，
+而 8-bit 对数量化的步长是 3.1%，float16 的精度远远够）。这些都还没做，
+因为当前的判断是主机内存不是瓶颈。
+
+### 会拒绝什么
+
+深度后端返回的若是 up-to-scale（非米制）深度，`scenes` 会**直接报错**而不是交付。
+交付视频编的是绝对米制，而 ABot 的 COLMAP 模型自己只定义到一个相似变换，
+补不上这个尺度。所以这里必须用能预测米制深度的后端。
+
+### 编号与 provenance
+
+`seg_long_000000` 往上按 **sample_id 字典序**编号（6 位，够整个 500h 语料用），
+映射写在 `scenes_manifest.json`。
+排序而不是按发现顺序，有两个后果：分片的 worker 不用互相协调就能得出同一套编号；
+后来新增 episode 只会插入、不会把已交付的重新编号，而这一点 manifest 的 diff 看得见。
+
+重编号会丢掉数据集自己的标识符，所以 manifest 不是可选的 —— 没有它，交付集就没法
+回溯到源语料，某个 scene 出问题也查不到是哪条 episode。
+
+`annotation.tar` 是**原样拷贝**：里面是数据集自己的声明（动作、字幕、COLMAP），
+重新打包会让这条管线变成它并未产出的数据的第二个真相来源。
+
+## 13. 验收交付场景
+
+### 交付格式是设计上不可直视的
+
+`semantic.mp4` 把类别 ID 0–10 放在蓝通道，直接播放几乎全黑；`depth.mp4` 是 log-z
+灰度斜坡，看起来是一片平灰。所以**不要用播放器判断质量**，用：
+
+```bash
+python -m proxy_extract scenes-preview \
+  --scene /data/binghe/datasets/abot_scenes/seg_long_000000 \
+  --out /tmp/sheet.png --frames 6
+```
+
+`.png` 出等距采样的 contact sheet（`color | semantic | depth` 三联 + 类别图例），
+适合 scp 回来看；后缀换成 `.mp4` 出同样面板的视频。
+
+### 合成后端会伪造输出，而且看起来完全正常
+
+`synthetic` 深度/语义后端存在的意义是无 GPU 时验证管线，它们产出的视频在结构上
+跟真实产物**不可区分** —— 同样的编码、同样的类别 ID、同样的报告字段。这已经害过
+一次：一张用 `synthetic` 出的对照图被当成了「真实分割器失效」的证据。
+
+现在有三道防线：
+
+- `run_scenes.sh` 直接**拒绝** `SEMANTIC=synthetic` 或 `DEPTH=synthetic`，除非显式
+  设 `ALLOW_SYNTHETIC=1`；
+- `extract_scene` 在写盘时抛 `PlaceholderOutput` 警告；
+- `extraction_report.json` 里带 `"deliverable": false` 和 `"placeholder_backends"`。
+
+验收任何一批数据，先 `grep -L '"deliverable": true' */extraction_report.json`。
+
+### 真后端在 ABot 上长什么样
+
+在真实 episode 上实测（`standard11` = Mask2Former swin-large ADE20K，本机 CPU
+2.9 s/帧），荒野徒步素材的构成大致是：
+
+| | 占比 |
+| --- | --- |
+| vegetation | 72–88% |
+| terrain | 6–25% |
+| sky | 2.5–17% |
+| person | 1.7–2.2% |
+
+草地归 vegetation 而不是 terrain，是 DATA_F.md 明确规定的（`7 vegetation = 树、草、
+灌木`；`8 terrain = 山地、岩石、野外地面`），不是映射错误。
+
+主角判定在同一素材上跑 90 帧连续窗口：`resolved: True`，轨迹全程 90/90 帧，中心距
+锚点 0.08 帧宽，中位面积 1.53%，merged 0%。掩码是贴合的人形轮廓。
+
+### 坐骑：`animal` → `vehicle`
+
+标准的 11 类里没有动物类。被骑乘的马是载具，归 `prop` 会告诉世界模型「一个大体积
+移动主体是静态杂物」，这是两种可选错误里更有害的一种，所以 `animal` 映射到
+`vehicle`（3）。
+
+代价要写明：ADE20K 只有**一个** `animal` 标签，分不出马、鹿、狗、鸟，所以这个映射
+连带把野生动物也算作 vehicle。要把坐骑和野生动物分开需要实例掩码，映射表做不到。
+实测两条 episode 共 24 帧里 `animal` 命中 0 像素，所以这个代价的实际暴露面很小。

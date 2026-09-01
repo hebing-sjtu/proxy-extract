@@ -2,6 +2,10 @@
 # Loosen deliberately, not by accident: numpy 2.x and transformers 5.x are both
 # breaking-change majors, and the semantic backend reads `id2label` off the
 # checkpoint config, which transformers has moved before.
+#
+# One file for both deployment paths — `scripts/setup_venv.sh` and the image
+# install from it — so a venv and a container cannot drift into disagreeing
+# about the versions the measurements in RUNBOOK.md were taken on.
 
 # --- core, needed for contract / taxonomy / QC / encoding (no GPU) ---
 numpy==2.5.1

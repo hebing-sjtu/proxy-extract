@@ -27,7 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Requirements before source so an edit to the package does not re-download
 # ~3 GB of torch.
-COPY docker/requirements.txt /tmp/requirements.txt
+COPY requirements.txt /tmp/requirements.txt
 RUN pip install -r /tmp/requirements.txt
 
 COPY proxy-extract /opt/proxy-extract
@@ -35,7 +35,7 @@ RUN pip install --no-deps -e /opt/proxy-extract
 
 # Weights live on a mounted volume, never baked in: they are gigabytes, several
 # are gated, and re-pulling them on every image rebuild is the slowest possible
-# way to iterate. `docker/fetch_models.py` fills this directory.
+# way to iterate. `scripts/fetch_models.py` fills this directory.
 ENV HF_HOME=/cache/huggingface
 # 777 so the image still works when run with `--user $(id -u)`, which is how you
 # avoid root-owned files appearing in your working copy.
@@ -44,7 +44,7 @@ RUN mkdir -p /cache/huggingface && chmod 777 /cache/huggingface
 # not writable, which it is not under `--user`.
 ENV MPLCONFIGDIR=/tmp/matplotlib
 
-COPY docker/fetch_models.py /opt/fetch_models.py
+COPY scripts/fetch_models.py /opt/fetch_models.py
 COPY experiments /opt/experiments
 
 WORKDIR /work

@@ -25,12 +25,30 @@ UID_ENV := DOCKER_UID=$(shell id -u) DOCKER_GID=$(shell id -g)
 # A representative clip: urban, one person, already measured end-to-end.
 CLIP ?= 26_trevor_seg_0004
 
-.PHONY: help image version build buildx push pull save load test fetch qc extract convert preview gallery shards
+# The maintained deployment path. Targets below that do not need a container go
+# through this interpreter rather than compose.
+VENV   ?= $(CURDIR)/.venv
+VPY    := $(VENV)/bin/python
+
+.PHONY: help venv venv-core venv-test venv-fetch scenes scenes-audit \
+        image version build buildx push pull save load test fetch qc extract \
+        convert preview gallery shards
 
 help:
 	@echo "IMAGE = $(IMAGE)   PLATFORM = $(PLATFORM)"
+	@echo "VENV  = $(VENV)"
 	@echo
-	@echo "镜像"
+	@echo "venv（维护的主路径，见 RUNBOOK 第 2 节）"
+	@echo "  make venv        建 .venv，装死 pin 的依赖，跑自检"
+	@echo "  make venv-core   同上但不装 torch（只跑合约/分类/QC/编码）"
+	@echo "  make venv-test   在 .venv 里跑测试（应看到 348 passed）"
+	@echo "  make venv-fetch  用 .venv 拉权重"
+	@echo
+	@echo "交付数据（RUNBOOK 第 12/13 节）"
+	@echo "  make scenes       多卡跑 720p 交付场景，DATA_DIR= OUT_DIR= 覆盖路径"
+	@echo "  make scenes-audit 统计 complete/incomplete/missing"
+	@echo
+	@echo "镜像（备选路线，RUNBOOK 第 3 节）"
 	@echo "  make build     在本机构建（本机就是 $(PLATFORM) 时用这个）"
 	@echo "  make buildx    交叉构建到 $(PLATFORM)（在 arm64 Mac 上必须用这个）"
 	@echo "  make push      推到 registry，需要 REGISTRY=..."
@@ -38,8 +56,8 @@ help:
 	@echo "  make save      导出 $(NAME)-$(VERSION).tar.gz（没有 registry 时）"
 	@echo "  make load      导入上面那个 tar"
 	@echo
-	@echo "跑"
-	@echo "  make test      不需要 GPU / 权重的自检（应看到 229 passed）"
+	@echo "容器里跑"
+	@echo "  make test      不需要 GPU / 权重的自检（应看到 348 passed）"
 	@echo "  make fetch     下载权重到 $(HF_CACHE_DIR)"
 	@echo "  make qc        对 high 渲染做相机 QC"
 	@echo "  make extract   抽一条 clip（CLIP=$(CLIP)）"
@@ -48,6 +66,24 @@ help:
 	@echo "  make gallery   把实测图册拷到 gallery/index.html"
 	@echo
 	@echo "服务器上的数据/输出路径用 DATA_DIR= 和 OUT_DIR= 覆盖。"
+
+venv:
+	scripts/setup_venv.sh
+
+venv-core:
+	EXTRAS=core scripts/setup_venv.sh
+
+venv-test:
+	$(VPY) -m pytest proxy-extract/tests -q
+
+venv-fetch:
+	$(VPY) scripts/fetch_models.py --set default
+
+scenes:
+	scripts/run_scenes.sh
+
+scenes-audit:
+	$(VPY) -m proxy_extract scenes-audit --out $(OUT_DIR)
 
 image:
 	@echo $(IMAGE)

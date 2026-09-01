@@ -33,11 +33,12 @@ def test_fetch_sets_use_the_same_repo_names_the_backends_do():
     from proxy_extract.depth.mapanything import APACHE_CHECKPOINT, DEFAULT_CHECKPOINT
     from proxy_extract.semantic.panoptic import ADE20K_CHECKPOINT, CITYSCAPES_CHECKPOINT
 
-    # Imported the way the container does, so a rename in either place fails.
+    # Loaded by path rather than imported, because it lives in `scripts/` and is
+    # run as a script by both deployment paths, so a rename fails here.
     import importlib.util
 
     spec = importlib.util.spec_from_file_location(
-        "fetch_models", ROOT / "docker" / "fetch_models.py"
+        "fetch_models", ROOT / "scripts" / "fetch_models.py"
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
