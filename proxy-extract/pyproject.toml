@@ -21,7 +21,12 @@ dependencies = [
 [project.optional-dependencies]
 # Heavy model backends. Imported lazily so the contract, QC, taxonomy and
 # encoding layers stay usable (and testable) without a GPU.
-depth = ["torch>=2.4", "mapanything"]
+# `depth_anything` needs only transformers, so it is covered by `semantic`'s
+# pins and by requirements.txt. `mapanything` is deliberately absent: it is not
+# published on PyPI, so naming it here made this extra uninstallable rather than
+# optional. Install it directly when you want that backend:
+#   pip install 'git+https://github.com/facebookresearch/map-anything'
+depth = ["torch>=2.4", "transformers>=4.45"]
 semantic = ["torch>=2.4", "transformers>=4.45"]
 sam3 = ["torch>=2.4", "sam3"]
 dev = ["pytest>=7.4"]

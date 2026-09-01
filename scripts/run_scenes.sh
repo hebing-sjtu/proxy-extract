@@ -23,7 +23,13 @@ set -euo pipefail
 DATA_DIR="${DATA_DIR:-/data/binghe/datasets/ABot-World-Explorer-subset2000/data}"
 OUT_DIR="${OUT_DIR:-/data/binghe/datasets/ABot-seg-long-2000}"
 SEMANTIC="${SEMANTIC:-standard11}"
-DEPTH="${DEPTH:-mapanything}"
+# depth_anything, not mapanything: this is the pair `fetch_models.py --set
+# default` actually downloads, and its package ships in requirements.txt.
+# mapanything is the better backend — multi-frame, so its scale is consistent
+# across an episode — but it is not on PyPI and its weights are gated, so having
+# it as the default meant following the runbook exactly could not work. Opt in
+# with DEPTH=mapanything once it is installed; see RUNBOOK section 7.
+DEPTH="${DEPTH:-depth_anything}"
 
 # Default to the repo's own venv, which is the maintained deployment path, and
 # fall back to whatever `python` is on PATH so an activated environment still
@@ -101,9 +107,52 @@ fi
 for pair in "semantic=$SEMANTIC" "depth=$DEPTH"; do
   if [[ "${pair#*=}" == "synthetic" && "${ALLOW_SYNTHETIC:-0}" != "1" ]]; then
     die "$pair is a placeholder that invents its output; the scenes would look valid and be worthless.
-       Use semantic=standard11 depth=mapanything, or set ALLOW_SYNTHETIC=1 to dry-run the plumbing."
+       Use semantic=standard11 depth=depth_anything, or set ALLOW_SYNTHETIC=1 to dry-run the plumbing."
   fi
 done
+
+# Load both backends and run one tiny inference before committing to thousands
+# of episodes. The heavy imports are lazy, inside the first call, so merely
+# constructing a backend proves nothing — a missing package or an unfetched
+# checkpoint would otherwise surface once per episode, for every episode.
+echo "checking the backends load (first run also downloads weights)..."
+$PYTHON - "$SEMANTIC" "$DEPTH" <<'PY' || die "the backends could not run; fix the above before launching $N_GPUS workers"
+import sys
+
+import numpy as np
+
+from proxy_extract.depth import get_backend as depth_backend
+from proxy_extract.semantic import get_backend as semantic_backend
+
+semantic, depth = sys.argv[1], sys.argv[2]
+frame = np.zeros((64, 64, 3), dtype=np.uint8)
+
+try:
+    result = depth_backend(depth).estimate([frame], cameras=None)
+except Exception as error:
+    print(f"depth backend '{depth}' failed: {type(error).__name__}: {error}", file=sys.stderr)
+    if isinstance(error, ImportError) and depth == "mapanything":
+        print(
+            "mapanything is not on PyPI. Either install it:\n"
+            "  pip install 'git+https://github.com/facebookresearch/map-anything'\n"
+            "or use the backend the default weight set covers:\n"
+            "  DEPTH=depth_anything",
+            file=sys.stderr,
+        )
+    raise SystemExit(1)
+
+if not result.metric:
+    print(f"depth backend '{depth}' returns up-to-scale depth; delivery needs metres", file=sys.stderr)
+    raise SystemExit(1)
+
+try:
+    semantic_backend(semantic).segment([frame])
+except Exception as error:
+    print(f"semantic backend '{semantic}' failed: {type(error).__name__}: {error}", file=sys.stderr)
+    raise SystemExit(1)
+
+print(f"  ok: semantic={semantic} depth={depth} (metric)")
+PY
 
 gib() { awk -v m="$1" 'BEGIN {printf "%.1f", m / 1024}'; }
 

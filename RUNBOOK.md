@@ -557,14 +557,28 @@ out/cond/high/26_trevor_seg_0004/
                     synthetic       假数据
 ```
 
-两个必须知道的坑：
+三个必须知道的坑：
+
+**`depth_anything` 是默认值，因为它是装完就能用的那个。** `requirements.txt` 覆盖
+它的依赖（只要 transformers），`fetch_models.py --set default` 拉的也正是它的权重。
+
+**`mapanything` 要单独装，而且不在 PyPI 上。**
+
+```bash
+.venv/bin/python -m pip install 'git+https://github.com/facebookresearch/map-anything'
+.venv/bin/python scripts/fetch_models.py --set mapanything
+```
+
+权重是 CC-BY-NC 且在 hub 上是 gated 的，要先 `hf auth login` 并接受条款；商用要用
+`facebook/map-anything-apache`。
 
 **depth_anything 是逐帧预测的**，帧与帧之间的尺度没有绑定。静态场景问题不大，
-但如果下游对时序深度一致性敏感，得换 mapanything 或者用 GT 相机做尺度标定。
-这个 caveat 会写进每份 report 的 `depth.meta.caveat`。
+但如果下游对时序深度一致性敏感，`mapanything` 是多帧的、尺度在整段内一致，这是
+它值得装的理由。这个 caveat 会写进每份 report 的 `depth.meta.caveat`。
 
-**mapanything 的默认权重是 CC-BY-NC 且在 hub 上是 gated 的。**
-商用要用 `facebook/map-anything-apache`。
+`run_scenes.sh` 启动前会**真的把两个后端各跑一次单帧推理**，所以后端装错或权重没拉
+会在几秒内失败，而不是在 2000 条上各失败一次。`--keep-going` 也不再吞 ImportError：
+那说明机器不对，不是这条 episode 不对。
 
 ---
 
@@ -579,6 +593,7 @@ venv 相关的先看这几条：
 | `error: need Python >= 3.10` | 系统 `python3` 常常是 3.9 | `PYTHON=/path/to/python3.12 scripts/setup_venv.sh` |
 | `sys.prefix` 不是 venv 路径 | shell 里 activate 了 conda/主环境 | `deactivate`，或直接用 `.venv/bin/python` 全路径调用 |
 | 报错说找不到 ffmpeg | 三条出路都写在报错里 | 见第 2 节「ffmpeg 从哪来」 |
+| `No module named 'mapanything'` | 它不在 PyPI，`setup_venv.sh` 不会装它 | `DEPTH=depth_anything`，或按第 7 节从 git 装 |
 
 模型和数据相关：
 
@@ -787,7 +802,7 @@ scripts/run_scenes.sh
   --recursive \
   --out /data/binghe/datasets/abot_scenes \
   --semantic-backend standard11 \
-  --depth-backend mapanything \
+  --depth-backend depth_anything \
   --resume --keep-going
 ```
 

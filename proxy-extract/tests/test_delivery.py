@@ -13,6 +13,7 @@ rather than by inspecting what was intended:
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -467,3 +468,78 @@ def test_the_scene_preview_refuses_a_directory_that_is_not_a_scene(tmp_path):
 
     with pytest.raises(FileNotFoundError, match="no color.mp4"):
         render_scene_preview(tmp_path, tmp_path / "sheet.png")
+
+
+def _assignment(episode, index=0):
+    return delivery.SceneAssignment(
+        index=index, sample_id=f"sample{index}", video=episode, annotations=None
+    )
+
+
+def test_a_missing_dependency_stops_the_run_even_with_keep_going(episode, tmp_path, monkeypatch):
+    """The failure this prevents cost 1800 episodes of wall time.
+
+    `--keep-going` exists so one unreadable episode costs one scene. A backend
+    whose package is not installed is not that: every remaining episode fails
+    identically, so skipping burns the corpus and reports a run that produced
+    nothing.
+    """
+    def explode(*args, **kwargs):
+        raise ModuleNotFoundError("No module named 'mapanything'")
+
+    monkeypatch.setattr(delivery, "extract_scene", explode)
+
+    assignments = [_assignment(episode, i) for i in range(5)]
+    with pytest.raises(delivery.DeliveryError, match="environment problem"):
+        delivery.deliver_dataset(
+            assignments,
+            tmp_path,
+            config=delivery.DeliveryConfig(
+                depth_backend="synthetic", semantic_backend="synthetic", size=SIZE
+            ),
+            on_error="skip",
+        )
+
+
+def test_the_message_says_it_is_not_the_episodes_fault(episode, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        delivery,
+        "extract_scene",
+        lambda *a, **k: (_ for _ in ()).throw(ImportError("No module named 'mapanything'")),
+    )
+    with pytest.raises(delivery.DeliveryError) as caught:
+        delivery.deliver_dataset(
+            [_assignment(episode)],
+            tmp_path,
+            config=delivery.DeliveryConfig(
+                depth_backend="synthetic", semantic_backend="synthetic", size=SIZE
+            ),
+            on_error="skip",
+        )
+    message = str(caught.value)
+    assert "mapanything" in message
+    assert "--keep-going deliberately does not cover it" in message
+
+
+def test_an_ordinary_bad_episode_is_still_skipped(episode, tmp_path, monkeypatch):
+    """The environment rule must not swallow what keep-going is actually for."""
+    calls = []
+
+    def flaky(video, scene_dir, **kwargs):
+        calls.append(video)
+        if len(calls) == 1:
+            raise ValueError("this episode has no moov atom")
+        return {"scene": scene_dir.name}
+
+    monkeypatch.setattr(delivery, "extract_scene", flaky)
+
+    reports = delivery.deliver_dataset(
+        [_assignment(episode, 0), _assignment(episode, 1)],
+        tmp_path,
+        config=delivery.DeliveryConfig(
+            depth_backend="synthetic", semantic_backend="synthetic", size=SIZE
+        ),
+        on_error="skip",
+    )
+    assert "failed" in reports[0] and "moov" in reports[0]["failed"]
+    assert reports[1]["scene"] == delivery.scene_dir_for(tmp_path, 1).name

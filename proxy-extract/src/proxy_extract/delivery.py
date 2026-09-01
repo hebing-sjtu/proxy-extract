@@ -95,6 +95,14 @@ _TAXONOMY_OF_BACKEND = {"coarse6": "coarse6", "standard11": "standard11"}
 PLACEHOLDER_BACKENDS = frozenset({"synthetic"})
 
 
+# Failures that say the machine is wrong rather than the episode. The model
+# backends import torch and their own packages lazily, inside the first call, so
+# a missing dependency does not surface until an episode is already in flight —
+# right where `--keep-going` would otherwise swallow it once per episode for the
+# length of the corpus.
+ENVIRONMENT_ERRORS = (ImportError,)
+
+
 class DeliveryError(RuntimeError):
     pass
 
@@ -633,6 +641,18 @@ def deliver_dataset(
                     refiner=refiner,
                 )
             )
+        except ENVIRONMENT_ERRORS as error:
+            # Not survivable and not per-episode: the backend's dependency is
+            # missing, so every remaining episode fails the same way. Skipping
+            # would burn the whole corpus and report a run that produced
+            # nothing, which is how a missing `mapanything` once cost 1800
+            # episodes' worth of wall time.
+            raise DeliveryError(
+                f"{type(error).__name__}: {error}\n"
+                f"This is an environment problem, not a problem with {item.scene}, so the "
+                "run stops here rather than failing identically on every remaining episode. "
+                "--keep-going deliberately does not cover it."
+            ) from error
         except Exception as error:
             # In a run of thousands, one unreadable episode should cost one
             # scene, not the worker's whole shard.
