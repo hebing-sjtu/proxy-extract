@@ -3,6 +3,7 @@
 #
 #   scripts/run_scenes.sh
 #   DATA_DIR=... OUT_DIR=... N_GPUS=4 scripts/run_scenes.sh
+#   WORKERS_PER_GPU=3 scripts/run_scenes.sh   # fill the GPU's idle CPU phases
 #
 # One process per GPU, each with --shard i/N so the episode list is partitioned
 # with no overlap, --resume so a re-run picks up only what is missing, and
@@ -54,6 +55,17 @@ if [[ -z "${N_GPUS:-}" ]]; then
   [[ "$N_GPUS" -gt 0 ]] || { echo "no GPUs found; set N_GPUS=1 to run on CPU" >&2; exit 1; }
 fi
 
+# Only part of an episode is GPU work. Decoding, the optical-flow stabilisation
+# over the whole 1800-frame stack, and the ffmpeg encodes are all CPU, and the
+# depth model sees one frame per call, so a single worker leaves its GPU idle
+# for long stretches — on an H200 it occupies about 12 of 140 GiB. Stacking
+# workers on a card fills those gaps with another worker's forward pass.
+#
+# Host RAM is what bounds this, not VRAM: each worker holds the full 720p depth
+# and label stacks, ~40 GiB. The check below is against the total worker count.
+WORKERS_PER_GPU="${WORKERS_PER_GPU:-1}"
+n_workers=$((N_GPUS * WORKERS_PER_GPU))
+
 die() { echo "error: $*" >&2; exit 1; }
 
 # ------------------------------------------------------------------ pre-flight
@@ -90,11 +102,11 @@ fi
 # decides how many workers fit, not the GPU.
 if [[ -r /proc/meminfo ]]; then
   total_gib=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 1024 / 1024 ))
-  want_gib=$((N_GPUS * GIB_PER_WORKER))
+  want_gib=$((n_workers * GIB_PER_WORKER))
   if [[ "$total_gib" -lt "$want_gib" ]]; then
     fits=$((total_gib / GIB_PER_WORKER))
-    echo "warning: $N_GPUS workers want about ${want_gib} GiB of host RAM but this node has ${total_gib} GiB." >&2
-    echo "         About ${fits} workers fit. Set N_GPUS=${fits}, or expect the OOM killer." >&2
+    echo "warning: $n_workers workers want about ${want_gib} GiB of host RAM but this node has ${total_gib} GiB." >&2
+    echo "         About ${fits} workers fit. Lower N_GPUS or WORKERS_PER_GPU, or expect the OOM killer." >&2
     echo >&2
   fi
 fi
@@ -231,7 +243,7 @@ gib() { awk -v m="$1" 'BEGIN {printf "%.1f", m / 1024}'; }
 cat <<EOF
 data       $DATA_DIR  ($episodes episodes)
 out        $OUT_DIR  ($(gib "$avail_mib") GiB free, need ~$(gib "$need_mib") GiB)
-shards     $N_GPUS
+shards     $n_workers ($N_GPUS GPU(s) x $WORKERS_PER_GPU worker(s))
 backends   semantic=$SEMANTIC depth=$DEPTH
 weights    ${HF_HOME:-<default HF cache>}
 
@@ -246,8 +258,9 @@ for option in ${DEPTH_OPTIONS:-}; do
 done
 
 pids=()
-for ((i = 0; i < N_GPUS; i++)); do
-  CUDA_VISIBLE_DEVICES="$i" \
+for ((i = 0; i < n_workers; i++)); do
+  gpu=$((i % N_GPUS))
+  CUDA_VISIBLE_DEVICES="$gpu" \
   $PYTHON -m proxy_extract scenes \
     --video "$DATA_DIR" \
     --recursive \
@@ -255,7 +268,7 @@ for ((i = 0; i < N_GPUS; i++)); do
     --semantic-backend "$SEMANTIC" \
     --depth-backend "$DEPTH" \
     ${depth_options[@]+"${depth_options[@]}"} \
-    --shard "$i/$N_GPUS" \
+    --shard "$i/$n_workers" \
     --resume \
     --keep-going \
     >"$OUT_DIR/logs/shard-$i.log" 2>&1 &
@@ -263,7 +276,7 @@ for ((i = 0; i < N_GPUS; i++)); do
   # Mac used for dry runs ships 3.2.
   pid=$!
   pids+=("$pid")
-  echo "launched shard $i/$N_GPUS on GPU $i (pid $pid)"
+  echo "launched shard $i/$n_workers on GPU $gpu (pid $pid)"
 done
 
 echo
@@ -274,7 +287,7 @@ echo
 # Wait on each individually so a failing shard is named rather than hidden
 # behind a bare non-zero exit.
 failed=0
-for ((i = 0; i < N_GPUS; i++)); do
+for ((i = 0; i < n_workers; i++)); do
   if ! wait "${pids[$i]}"; then
     echo "shard $i FAILED -- see $OUT_DIR/logs/shard-$i.log" >&2
     failed=1

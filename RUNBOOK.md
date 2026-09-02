@@ -688,6 +688,8 @@ venv 相关的先看这几条：
 | `OSError: ... preprocessor_config.json` | 权重没拉全就跑了离线模式 | 重跑 fetch，确认 `--set` 覆盖了你用的后端 |
 | `no such video: ...` | 路径不对；ABot 那种嵌套目录要加 `--recursive` | 见第 11 节 |
 | `no camera tracks under ...` | `camera/` 目录不在或没有 json | 检查数据集目录结构 |
+| 跑到一半，scene 目录里只有 `color.mp4` | 正常，不是卡住。`_infer` 单次解码时一边写 color 一边把 depth/labels 攒在内存，之后还要做全片光流稳定，`depth/semantic/duv` 是最后一次性写出的 | 等这条 episode 结束；想看进度就看 `color.mp4` 在不在变大 |
+| GPU 显存只占了零头、利用率断断续续 | 一条 episode 里只有模型前向是 GPU，解码、光流稳定、ffmpeg 编码都是 CPU，而深度模型一次只吃一帧 | `WORKERS_PER_GPU=3`，用别的 worker 的前向填上这些空档。上限由主机内存决定（每 worker 约 40 GiB），不是显存 |
 | clip 少于 124 帧 | CWM 窗口就是 124 帧 | 这条 clip 用不了，不是 bug |
 | preview 颜色不对 | 手动指定了错的调色板 | 别传，让它自己从 report 读 |
 | 交付的语义看着完全不对 | 很可能用了 `synthetic` 占位后端 | 查 report 的 `deliverable` 字段，见第 13 节 |
@@ -877,7 +879,19 @@ OUT_DIR=/data/binghe/datasets/abot_scenes \
 scripts/run_scenes.sh
 ```
 
-它默认按 `nvidia-smi` 数出的卡数开进程。单条手跑：
+它默认按 `nvidia-smi` 数出的卡数开进程，一卡一个。但一条 episode 里只有模型前向用
+GPU——解码、全片光流稳定、ffmpeg 编码全是 CPU，深度模型又是一次一帧——所以单 worker
+会让卡大段空转（H200 上实测只占 140 GiB 里的 12 GiB）。想填满就多开：
+
+```bash
+WORKERS_PER_GPU=3 scripts/run_scenes.sh
+```
+
+worker 在卡之间轮转分配，`--shard` 按总 worker 数切。**能开几个由主机内存决定，不是
+显存**：每个 worker 要把整条 episode 的 720p depth/label 栈放在内存里，约 40 GiB，
+脚本会按总数核对 `MemTotal` 并在不够时警告。
+
+单条手跑：
 
 ```bash
 .venv/bin/python -m proxy_extract scenes \
