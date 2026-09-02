@@ -417,22 +417,53 @@ echo
 # healthy run and a wedged one look exactly the same from here. Count what has
 # landed on disk instead, which needs nothing from the workers.
 #
-# The load average comes along because it is the one number that separates the
-# two failure modes: far above the core count means the workers are fighting
-# each other for CPU rather than working (see THREADS_PER_WORKER above), near
-# zero with nothing finishing means they are stuck.
+# Three numbers, each answering a question the others cannot:
+#
+#   done       progress, but cumulative - a resumed run into a directory with
+#              work already in it starts at whatever is there, so the count
+#              since launch is spelled out separately rather than left to be
+#              inferred from a number that did not start at zero
+#   writing    liveness. A shard that has written to its log this interval is
+#              doing something, whatever that something is. This is the field
+#              to watch in the first ten minutes, when `done` cannot move yet
+#              because no episode has had time to finish
+#   load       which way it is going wrong. Far above the core count means the
+#              workers are fighting each other for CPU rather than working (see
+#              THREADS_PER_WORKER above); far below it, with `writing` also
+#              low, means they are blocked on something - weights, storage, or
+#              a stall
+done_at_start="$(find "$OUT_DIR" -maxdepth 2 -name extraction_report.json 2>/dev/null | wc -l | tr -d ' ')"
+
 heartbeat() {
   local every="${HEARTBEAT_SECONDS:-60}"
   ((every > 0)) || return 0
+  # This one line is the whole point of the function, so it does not get to
+  # inherit an `errexit` that would end it on a transient stat failure.
+  set +e
   while sleep "$every"; do
-    local done_n started_n alive=0 load=""
+    local done_n alive=0 load="" writing=""
     done_n="$(find "$OUT_DIR" -maxdepth 2 -name extraction_report.json 2>/dev/null | wc -l | tr -d ' ')"
-    started_n="$(find "$OUT_DIR" -maxdepth 1 -type d -name 'seg_*' 2>/dev/null | wc -l | tr -d ' ')"
     for pid in "${pids[@]}"; do
       kill -0 "$pid" 2>/dev/null && alive=$((alive + 1))
     done
-    [[ -r /proc/loadavg ]] && load=", load $(awk '{print $1}' /proc/loadavg)"
-    echo "[$(date +%H:%M:%S)] $done_n/$episodes done, $started_n started, $alive/$n_workers shards alive$load"
+    # Left out rather than guessed at where `find` has no relative -newermt.
+    if fresh="$(find "$OUT_DIR/logs" -name 'shard-*.log' -newermt "-$((every + 5)) seconds" 2>/dev/null)"; then
+      writing="$(printf '%s' "$fresh" | grep -c . || true) writing, "
+    fi
+    # `|| true` on both: under `set -e` an assignment whose command
+    # substitution fails takes the whole heartbeat down, and it would go
+    # without a word - leaving exactly the silent terminal this exists to end.
+    local average=""
+    if [[ -r /proc/loadavg ]]; then
+      average="$(awk '{print $1}' /proc/loadavg || true)"
+    else  # macOS, where the dry runs happen: "{ 3.60 4.06 4.16 }"
+      average="$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}' || true)"
+    fi
+    [[ -n "$average" ]] && load="load $average"
+    local tail="$writing$load"
+    printf '[%s] %s/%s done (+%s this run), %s/%s alive, %s\n' \
+      "$(date +%H:%M:%S)" "$done_n" "$episodes" "$((done_n - done_at_start))" \
+      "$alive" "$n_workers" "${tail%, }"
   done
 }
 heartbeat &

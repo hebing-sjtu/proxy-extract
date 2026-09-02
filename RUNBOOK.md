@@ -300,10 +300,25 @@ LIMIT=4 N_GPUS=2 WORKERS_PER_GPU=2 HEARTBEAT_SECONDS=30 \
 它数的是磁盘上落了什么，不依赖任何 worker 还活着：
 
 ```
-[19:22:04] 12/2000 done, 64 started, 64/64 shards alive, load 130.4
+[19:22:04] 12/2000 done (+10 this run), 64/64 alive, 64 writing, load 121.7
 ```
 
-`HEARTBEAT_SECONDS=0` 关掉。要看细节就跟一个 shard 的日志：
+四个数各回答一个别的数回答不了的问题：
+
+- **done** 是 `find <out> -maxdepth 2 -name extraction_report.json` 数出来的，**累计
+  值**。往一个已经有东西的目录里续跑时它不从 0 开始，所以本轮的增量单独标出来 ——
+  刚起步就显示 `2/2000 done (+0 this run)` 是对的，那 2 条是上一轮留下的。
+- **alive** 是 shard 进程数。少于总数就是有 worker 死了，去 `head -20 logs/shard-*.log`。
+- **writing** 是这个心跳周期内写过日志的 shard 数，也就是活性。**头十分钟看这个**：
+  那时候 `done` 不可能动（一条 episode 还没跑完），但 `writing` 应该等于 shard 总数。
+- **load** 是走哪条岔路。远高于核数是在抢 CPU（见第 3 节「线程」）；**远低于核数、
+  `writing` 也低，是在等什么东西** —— 权重、存储，或者卡住了。
+
+启动那几分钟 load 偏低是正常的：每个 worker 都要把 6.8 GB 的 DA3 权重读进来，几十
+个进程同时读同一个文件系统，这一段既不吃 CPU 也不碰 GPU。load 应该随着 worker 陆续
+读完而往上爬。十分钟后还趴着不动才是有问题。
+
+`HEARTBEAT_SECONDS=0` 关掉心跳。要看细节就跟一个 shard 的日志：
 
 ```bash
 tail -f /data/binghe/datasets/ABot-seg-long-2000/logs/shard-0.log
