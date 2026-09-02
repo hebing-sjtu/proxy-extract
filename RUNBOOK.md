@@ -682,6 +682,7 @@ venv 相关的先看这几条：
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
 | 日志里 `CUDA initialization: The NVIDIA driver on your system is too old`，随后 `Non-CUDA device detected` | torch 的 wheel 是按比驱动更新的 CUDA 构建的，于是**整批 worker 静默退回 CPU**——`nvidia-smi` 照样列出所有卡，`N_GPUS` 照样数对 | 对比 `python -c "import torch; print(torch.version.cuda)"` 和 `nvidia-smi --query-gpu=driver_version --format=csv`；驱动旧就按驱动的 CUDA 重装 torch，如 `--index-url https://download.pytorch.org/whl/cu124`。容器里改不了驱动，只能换 torch。`run_scenes.sh` 现在会在启动前拦下这种情况 |
+| 换过 torch 之后 `OSError: Could not load this library: .../torchaudio/lib/_torchaudio.abi3.so` | torchaudio 的 C++ 扩展是按换掉之前那个 torch 编译的。transformers 导入图像处理器时会路过 `audio_utils`，于是被牵连——跟音频无关 | `pip uninstall -y torchaudio`。它不在 `requirements.txt` 里，transformers 那处 import 由 `is_torchaudio_available()` 守着，包不在就整段跳过。**不要**去装"匹配版本"：torchaudio 停在 2.11，没有配 torch 2.13 的构建 |
 | 确实想用 CPU 跑 | — | `N_GPUS=1 ALLOW_CPU=1 scripts/run_scenes.sh` |
 | 下权重卡住 / 超时 | hub 网络 | 先确认是不是集群出网白名单的问题（见第 7 节）；国内节点才需要 `export HF_ENDPOINT=https://hf-mirror.com` |
 | `OSError: ... preprocessor_config.json` | 权重没拉全就跑了离线模式 | 重跑 fetch，确认 `--set` 覆盖了你用的后端 |
