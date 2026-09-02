@@ -4,6 +4,7 @@
 #   scripts/run_scenes.sh
 #   DATA_DIR=... OUT_DIR=... N_GPUS=4 scripts/run_scenes.sh
 #   WORKERS_PER_GPU=3 scripts/run_scenes.sh   # fill the GPU's idle CPU phases
+#   SCENES_ARGS="--flow-downscale 4" scripts/run_scenes.sh   # cheaper flow
 #
 # One process per GPU, each with --shard i/N so the episode list is partitioned
 # with no overlap, --resume so a re-run picks up only what is missing, and
@@ -246,6 +247,7 @@ out        $OUT_DIR  ($(gib "$avail_mib") GiB free, need ~$(gib "$need_mib") GiB
 shards     $n_workers ($N_GPUS GPU(s) x $WORKERS_PER_GPU worker(s))
 backends   semantic=$SEMANTIC depth=$DEPTH
 weights    ${HF_HOME:-<default HF cache>}
+extra      ${SCENES_ARGS:-<none>}${DEPTH_OPTIONS:+ }${DEPTH_OPTIONS:-}
 
 EOF
 
@@ -255,6 +257,20 @@ EOF
 depth_options=()
 for option in ${DEPTH_OPTIONS:-}; do
   depth_options+=(--depth-backend-option "$option")
+done
+
+# Anything else to hand `scenes`, split on spaces, e.g. the stabilisation
+# tradeoffs from RUNBOOK section 14:
+#
+#   SCENES_ARGS="--flow-downscale 4"
+#   SCENES_ARGS="--flow-downscale 4 --temporal-radius 1"
+#
+# A passthrough rather than one variable per flag, so the launcher does not have
+# to grow a mirror of the CLI. It is unvalidated on purpose: a typo reaches
+# argparse, which refuses it by name in the shard log.
+scenes_args=()
+for word in ${SCENES_ARGS:-}; do
+  scenes_args+=("$word")
 done
 
 pids=()
@@ -268,6 +284,7 @@ for ((i = 0; i < n_workers; i++)); do
     --semantic-backend "$SEMANTIC" \
     --depth-backend "$DEPTH" \
     ${depth_options[@]+"${depth_options[@]}"} \
+    ${scenes_args[@]+"${scenes_args[@]}"} \
     --shard "$i/$n_workers" \
     --resume \
     --keep-going \

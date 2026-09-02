@@ -1078,8 +1078,17 @@ CPU 侧合计约 475 秒，占整条 episode 的四成，这段时间 GPU 是空
    相同**的 Farneback 光流，现在 `stabilize_pair` 只算一遍。实测 483 → 382 秒，省 21%，
    输出逐位一致（`TestSharedFlow` 钉住了这一点）。
 3. 剩下的都是取舍，默认没开：
-   - `--temporal-radius 1`：稳定化再省一半左右，但时序平滑窗口从 ±2 缩到 ±1，去闪烁减弱。
-   - `--flow-downscale 4`：光流成本降到 1/4（光流占稳定化的四成），运动边界精度下降。
+   - `--flow-downscale 4`：光流在真实 720p guide 上的实测成本是 ds1 366.6s / **ds2 101.4s
+     （默认）** / ds4 29.1s（均按 1800 帧折算），所以从默认换到 ds4 省 **72 秒**，稳定化
+     382 → 约 310 秒。质量代价没有在真实内容上量到：合成平移片段上 ds2 和 ds4 与精确光流
+     的标签分歧都是 0.00%，但那个片段只有平滑全局位移，任何尺度都能解出来，测不到风险所在
+     的独立运动物体边界。要开就先跑一条 episode 用 `scenes-preview` 看人物边缘。
+   - `--temporal-radius 1`：稳定化再省一半左右（窗口内的投票和中值都减半，不只是光流），
+     但时序平滑窗口从 ±2 缩到 ±1，去闪烁减弱。
    - color 换 `-preset veryfast`：59 → 19 秒，实测 PSNR 从 38.20 掉到 37.48 dB。不是白捡。
+
+怎么传：`scenes` 直接加这些 flag；走 `run_scenes.sh` 用 `SCENES_ARGS` 透传，
+例如 `SCENES_ARGS="--flow-downscale 4" WORKERS_PER_GPU=3 scripts/run_scenes.sh`。
+启动时打印的 `extra` 一行会回显，确认没打错。
 
 第 3 组要改再说，前两条已经覆盖了大头。
