@@ -381,9 +381,25 @@ ADE20K 只有**一个** `animal` 标签，分不出马鹿狗鸟，所以野生�
    .venv/bin/python scripts/fetch_models.py --set da3      # 6.8 GB
    ```
 
-   `--no-deps` 会漏掉 `gsplat` / `open3d` / `pycolmap` / `moviepy` / `evo`，那些只
-   服务高斯导出和多视角位姿对齐。后端在导入前给这两个子模块装了占位实现，占位被真的
-   调用才会报错 —— 单目路径永远走不到（源码里 `if extrinsics is None: return`）。
+   `--no-deps` 会漏掉一大堆，`pip check` 会把它们全列出来：`gsplat` / `open3d` /
+   `pycolmap` / `moviepy` / `evo` / `trimesh` / `plyfile` 服务高斯导出、位姿对齐和
+   benchmark，`fastapi` / `uvicorn` / `gradio` / `pillow-heif` 服务它自带的 demo
+   服务，`pre-commit` 是开发用的。**这些缺失是正常状态，不要去补**。后端在导入前给
+   `utils.export` 和 `utils.pose_align` 两个子模块装了占位实现，占位被真的调用才会
+   报错 —— 单目路径永远走不到（源码里 `if extrinsics is None: return`）。
+
+   两个看着像例外的其实也不用装：`xformers` 只在 DINOv2 的 SwiGLU 里 try/except 导入，
+   失败就退回纯 torch 实现；`e3nn` 同理，只用于旋转高斯的球谐系数。装 `xformers` 反而
+   要跟 torch 版本严格对齐，是净负债。
+
+   它声明的 `numpy<2` 也不要照做：那条 pin 是 `open3d`/`pycolmap` 的要求，DA3 自己的
+   代码里没有任何 numpy 1 独有的符号（`np.float_`、`np.bool8` 之类一个都没有）。降级
+   numpy 会连带拆掉 opencv 和 torch。
+
+   真正需要的只有下面这些，`einops`/`omegaconf`/`addict`/`imageio` 之外的都已经在
+   `requirements.txt` 里：torch、torchvision、numpy、pillow、opencv、huggingface-hub、
+   safetensors、tqdm。`python scripts/doctor.py` 会逐个核对，并把 `pip check` 的噪声
+   跟真正的缺失分开。
 
 2. **权重是 CC BY-NC 4.0**，只能研究用。想要 Apache-2.0 的只有 `DA3METRIC-LARGE`
    （`--set da3-apache`），但它是 DinoV2+DPT、**没有相机头**：输出 canonical 深度、
@@ -569,6 +585,8 @@ torch 版本与 `torch.cuda.is_available()`（对上 nvidia-smi 的驱动号）�
 | `sys.prefix` 不是 venv 路径 | shell 里 activate 了 conda/主环境 | `deactivate`，或直接用 `.venv/bin/python` 全路径调用 |
 | 报错说找不到 ffmpeg | 三条出路都写在报错里 | 见第 1 节「ffmpeg 从哪来」 |
 | `No module named 'mapanything'` | 它不在 PyPI，`setup_venv.sh` 不会装它 | `DEPTH=depth_anything`，或按第 5 节从 git 装 |
+| `pip` 报一串 `depth-anything-3 requires open3d / pycolmap / fastapi ...` | `--no-deps` 的预期结果，那些服务导出、benchmark 和 demo 服务 | 不用管。`scripts/doctor.py` 的 `da3 deps` 一行会告诉你真正缺没缺 |
+| `pip` 报 `X 0.2.0 requires torch==2.12.0, but you have 2.13.0` | 这个 venv 里还装着别的项目，它的 pin 跟本管线的冲突；下次 `pip install` 就会把 torch 换掉 | 这个 venv 只跑本管线的话 `pip uninstall -y <X>`；否则给本管线单独建一个。`doctor.py` 会按包列出来 |
 
 模型和数据相关：
 

@@ -13,6 +13,7 @@ Nothing here mutates anything or downloads weights.
 
 from __future__ import annotations
 
+import importlib.metadata
 import importlib.util
 import os
 import shutil
@@ -26,7 +27,11 @@ DATA_DIR = Path(
     os.environ.get("DATA_DIR", "/data/binghe/datasets/ABot-World-Explorer-subset2000/data")
 )
 OUT_DIR = Path(os.environ.get("OUT_DIR", "/data/binghe/datasets/ABot-seg-long-2000"))
-GIB_PER_WORKER = 40
+
+# Kept equal to run_scenes.sh, which sizes the run with them.
+GIB_PER_WORKER = 11
+MIB_PER_SCENE = 5200
+WORKERS_PER_GPU = 6
 
 
 @dataclass
@@ -241,7 +246,10 @@ def check_data() -> list[Result]:
         results.append(Result("out", "fail", f"neither {OUT_DIR} nor its parent exists", "mkdir -p it"))
     else:
         usage = shutil.disk_usage(out)
-        need_gib = episodes * 465 / 1024
+        # The per-frame directories, not the videos, are what fills a disk:
+        # depth and semantic are raw arrays at a fixed 2.6 MiB a frame between
+        # them. KEEP_FRAMES=none is most of this back, but assume the default.
+        need_gib = episodes * MIB_PER_SCENE / 1024
         free_gib = usage.free / 1024**3
         enough = free_gib >= need_gib
         results.append(
@@ -272,6 +280,112 @@ def check_memory() -> Result | None:
     return None
 
 
+# What DA3 imports on the path this pipeline drives it down: load the model,
+# call `inference`. Everything else it declares belongs to its demo app, its
+# benchmark suite, its exporters, or its Gaussian-splatting branch, none of
+# which is reachable from here — `xformers` and `e3nn` are behind try/except
+# with working fallbacks, and the two submodules that hard-import the rest are
+# stubbed by the backend. So `pip check` listing a dozen missing packages is
+# the expected state of a correct install, not a problem to fix.
+DA3_RUNTIME_MODULES = {
+    "torch": "torch",
+    "torchvision": "torchvision",
+    "numpy": "numpy",
+    "PIL": "pillow",
+    "cv2": "opencv-python-headless",
+    "einops": "einops",
+    "addict": "addict",
+    "omegaconf": "omegaconf",
+    "huggingface_hub": "huggingface-hub",
+    "safetensors": "safetensors",
+    "imageio": "imageio",
+    "tqdm": "tqdm",
+}
+
+
+def check_da3_dependencies() -> Result | None:
+    """DA3 is installed with --no-deps, so verify the few deps that matter."""
+    if not _installed("depth_anything_3"):
+        return None
+
+    missing = [package for module, package in DA3_RUNTIME_MODULES.items() if not _installed(module)]
+    if missing:
+        return Result(
+            "da3 deps",
+            "fail",
+            f"depth_anything_3 is installed but cannot run: missing {', '.join(missing)}",
+            f"pip install {' '.join(missing)}",
+        )
+    return Result(
+        "da3 deps",
+        "ok",
+        "all runtime deps present (`pip check` also lists open3d, pycolmap, "
+        "moviepy, evo, fastapi ... — unused here)",
+    )
+
+
+# The packages whose version the pipeline is actually sensitive to. A stale pin
+# on anything else is somebody else's business.
+PINNED = ("torch", "torchvision", "numpy", "transformers", "accelerate", "tokenizers")
+
+
+def check_conflicting_pins() -> list[Result]:
+    """Find installed distributions that demand a different torch than this one.
+
+    This is the failure that arrives as a wall of pip text and then gets
+    ignored: another project sharing the environment pins torch==2.12 and
+    accelerate==1.0.1, pip installs them over ours, and the semantic backend
+    breaks somewhere unrelated. Reported per offending distribution, because
+    the fix is to remove that distribution rather than to chase each line.
+    """
+    try:
+        from packaging.requirements import Requirement
+    except ImportError:  # packaging ships with pip, but do not insist
+        return []
+
+    installed = {
+        name.lower().replace("_", "-"): distribution.version
+        for name, distribution in (
+            (dist.metadata["Name"] or "", dist) for dist in importlib.metadata.distributions()
+        )
+        if name
+    }
+
+    conflicts: dict[str, list[str]] = {}
+    for distribution in importlib.metadata.distributions():
+        source = (distribution.metadata["Name"] or "").lower()
+        # DA3's own pins are known to be wrong for this environment and are the
+        # reason it is installed with --no-deps; check_da3_dependencies covers
+        # what it really needs.
+        if not source or source == "depth-anything-3":
+            continue
+        for raw in distribution.requires or []:
+            requirement = Requirement(raw)
+            # Requirements gated on an extra are only real if that extra was
+            # asked for, and nothing here installs extras.
+            if requirement.marker and not requirement.marker.evaluate({"extra": ""}):
+                continue
+            wanted = requirement.name.lower().replace("_", "-")
+            if wanted not in PINNED:
+                continue
+            have = installed.get(wanted)
+            if have and not requirement.specifier.contains(have, prereleases=True):
+                conflicts.setdefault(source, []).append(f"{wanted}{requirement.specifier} (have {have})")
+
+    results = []
+    for source in sorted(conflicts):
+        results.append(
+            Result(
+                "conflict",
+                "warn",
+                f"{source} wants {', '.join(sorted(conflicts[source]))}",
+                f"nothing here needs {source}; in a venv for this pipeline alone: "
+                f"pip uninstall -y {source}",
+            )
+        )
+    return results
+
+
 def main() -> int:
     results: list[Result] = [check_python(), check_package(), check_ffmpeg()]
     results += check_torch()
@@ -279,6 +393,10 @@ def main() -> int:
     if audio:
         results.append(audio)
     results += check_backends()
+    da3 = check_da3_dependencies()
+    if da3:
+        results.append(da3)
+    results += check_conflicting_pins()
     results += check_weights()
     results += check_data()
     memory = check_memory()
@@ -303,7 +421,7 @@ def main() -> int:
         print(f"no blockers; {len(warnings_)} thing(s) worth reading above.")
     else:
         print("everything checks out.")
-    print("\nNext:  WORKERS_PER_GPU=3 scripts/run_scenes.sh")
+    print(f"\nNext:  WORKERS_PER_GPU={WORKERS_PER_GPU} scripts/run_scenes.sh")
     return 0
 
 
