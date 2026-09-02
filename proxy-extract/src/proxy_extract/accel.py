@@ -1,17 +1,18 @@
 """Where the models run and at what precision.
 
-Both backends face the same two questions and have to answer them the same way,
-because they share a GPU and a batch. Keeping the answers here rather than in
-each backend is also what makes the precision choice reviewable: it is the
-single largest throughput lever in the pipeline, and it is not free.
+Every backend faces the same two questions, and keeping the answers here rather
+than in each one is what makes the precision choice reviewable: it is the
+largest throughput lever in the pipeline, and it is not free.
 
-On the depth side the model runs at 504x504 in a window of one frame, which is
-a small enough forward pass that an H200 spends most of it moving weights
-rather than multiplying. Loading those weights as bfloat16 halves the traffic
-and puts the matmuls on tensor cores, and bfloat16 rather than float16 because
-it keeps float32's exponent range - depth is metres, spanning 0.1 to several
-thousand, and a format that overflows partway up that range would fail in the
-one place nothing checks.
+bfloat16 rather than float16 wherever there is a choice, because it keeps
+float32's exponent range. Depth is in metres, spanning 0.1 to several thousand,
+and a format that overflows partway up that range would fail in the one place
+nothing checks.
+
+Only the semantic backend asks this module for a dtype. DA3 runs its own
+autocast inside `inference()` and casts its inputs to float32 on the way in, so
+its weights stay float32 and the question does not arise - see
+`depth._resolve_weight_dtype`, which is where that surprise is written down.
 """
 
 from __future__ import annotations

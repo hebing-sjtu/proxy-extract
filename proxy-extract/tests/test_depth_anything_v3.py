@@ -20,6 +20,7 @@ from proxy_extract.depth.depth_anything_v3 import (
     METRIC_CHECKPOINT,
     NESTED_CHECKPOINT,
     DepthAnythingV3Backend,
+    _resolve_weight_dtype,
 )
 
 PROCESSED = (28, 50)  # what DA3 hands back at process_res, not the frame size
@@ -46,8 +47,10 @@ class _FakeModel:
         self.sky_depth = sky_depth
         self.calls: list[int] = []
         self.process_res: list[int] = []
+        self.casts: list = []
 
-    def to(self, *_args, **_kwargs):
+    def to(self, *args, **_kwargs):
+        self.casts.extend(args)
         return self
 
     def eval(self):
@@ -194,6 +197,50 @@ def test_a_window_groups_frames_into_one_reconstruction(fake_da3):
     assert model.calls == [2, 2, 1]
     assert result.depth.shape[0] == 5
     assert result.meta["single_view"] is False
+
+
+def test_the_weights_are_asked_for_in_full_precision():
+    """DA3 autocasts its own forward pass and casts its inputs to float32.
+
+    Half weights therefore gain nothing and meet a float32 input at the first
+    convolution: `expected scalar type Float but found BFloat16`, several
+    minutes into a shard. This is the whole reason the backend does not share
+    `accel.resolve_dtype` with the semantic one.
+    """
+    assert _resolve_weight_dtype("auto") == "float32"
+    assert _resolve_weight_dtype("float32") == "float32"
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_asking_for_half_weights_is_refused_with_the_reason(dtype):
+    with pytest.raises(ValueError) as caught:
+        _resolve_weight_dtype(dtype)
+
+    message = str(caught.value)
+    assert dtype in message
+    assert "autocast" in message, "the refusal has to say reduced precision is already on"
+
+
+def test_the_model_is_never_cast_away_from_float32(fake_da3):
+    """The same guarantee, seen from the call the model actually receives."""
+    import torch
+
+    model = fake_da3(_FakeModel())
+
+    DepthAnythingV3Backend(device="cpu").estimate(_frames(1))
+
+    dtypes = [cast for cast in model.casts if isinstance(cast, torch.dtype)]
+    assert dtypes == [torch.float32]
+
+
+def test_the_report_records_that_precision_is_the_backends_own_business(fake_da3):
+    fake_da3(_FakeModel())
+
+    meta = DepthAnythingV3Backend(device="cpu").estimate(_frames(1)).meta
+
+    assert meta["dtype"] == "float32"
+    # Reading dtype alone would say the pass ran in float32, which is wrong.
+    assert "bfloat16" in meta["autocast"]
 
 
 def test_the_processing_resolution_is_passed_through(fake_da3):

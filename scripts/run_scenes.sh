@@ -312,7 +312,8 @@ EOF
 
 # ---------------------------------------------------------------------- launch
 
-# Space-separated KEY=VALUE, e.g. DEPTH_OPTIONS="process_res=728 dtype=float32".
+# Space-separated KEY=VALUE, e.g. DEPTH_OPTIONS="process_res=728 window=1".
+# Not dtype: DA3 runs its own bfloat16 autocast, so there is nothing to set.
 depth_options=()
 for option in ${DEPTH_OPTIONS:-}; do
   depth_options+=(--depth-backend-option "$option")

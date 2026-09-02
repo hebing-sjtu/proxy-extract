@@ -25,7 +25,7 @@ import types
 
 import numpy as np
 
-from ..accel import pick_device, resolve_dtype
+from ..accel import pick_device
 from ..cameras import CameraTrack
 from .base import DepthResult
 
@@ -102,6 +102,29 @@ def _stub_unreachable_submodules() -> list[str]:
     return stubbed
 
 
+def _resolve_weight_dtype(requested: str) -> str:
+    """Which dtype to hold DA3's weights in. The answer is float32.
+
+    Unlike the semantic backend, DA3 runs its own mixed precision: `api.py`
+    wraps every forward in `torch.autocast` at bfloat16 where the card supports
+    it, and `_prepare_model_inputs` calls `.float()` on the images on the way
+    in. Half weights therefore buy no tensor cores that are not already in use,
+    and they meet a float32 input at the first convolution:
+
+        RuntimeError: expected scalar type Float but found BFloat16
+
+    So `auto` means float32 here, and an explicit half dtype is refused rather
+    than passed through to fail several minutes into a shard.
+    """
+    if requested in ("auto", "float32"):
+        return "float32"
+    raise ValueError(
+        f"depth_anything_v3 cannot hold its weights in {requested}: it casts its own "
+        "inputs to float32 and autocasts the forward pass to bfloat16 itself, so half "
+        "weights only break it. Reduced precision is already on; leave dtype at auto."
+    )
+
+
 class DepthAnythingV3Backend:
     name = "depth_anything_v3"
 
@@ -143,7 +166,7 @@ class DepthAnythingV3Backend:
                 ) from exc
 
             self.device = pick_device(self.device)
-            self._resolved_dtype = resolve_dtype(self.dtype, self.device)
+            self._resolved_dtype = _resolve_weight_dtype(self.dtype)
             model = DepthAnything3.from_pretrained(self.checkpoint)
             model = model.to(getattr(torch, self._resolved_dtype)).to(self.device).eval()
             self._model = model
@@ -209,6 +232,9 @@ class DepthAnythingV3Backend:
                 "window": self.window,
                 "device": self.device,
                 "dtype": self._resolved_dtype,
+                # Recorded because the weights' dtype does not say what the
+                # matmuls ran in: DA3 autocasts the forward pass itself.
+                "autocast": "internal (bfloat16 where the device supports it)",
                 "sky_from_backend": bool(sky_masks),
                 "stubbed_submodules": self._stubbed,
                 "single_view": self.window == 1,

@@ -210,16 +210,29 @@ worker 一个进程，CUDA OOM 只杀一个 shard，重跑 `make scenes` 会从�
 
 ### 精度
 
-两个后端默认 `dtype=auto`：CUDA 上取 **bfloat16**（Ampere 及以后），其余取
-float32。bfloat16 而不是 float16，是因为它保留 float32 的指数范围 —— 深度是米，
-跨 0.1 到几千，一个会在这个量程中途上溢的格式恰好会在没人检查的地方出错。
+两个后端都在 CUDA 上跑 **bfloat16**，但来路不同，**只有语义那边是我们控制的**。
 
-这是整条管线上单个最大的吞吐杠杆，也不是白拿的。第一次上机时建议拿一条 episode
-两边各跑一次比一比：
+语义后端默认 `dtype=auto`：CUDA（Ampere 及以后）上用 `torch.autocast` 跑 bfloat16，
+其余 float32。权重仍然是 float32，只有 autocast 认的那些算子降精度 —— 归一化层留在
+float32，它们数值上脆弱而且不占时间。bfloat16 而不是 float16，是因为它保留 float32
+的指数范围：深度是米，跨 0.1 到几千，一个会在这个量程中途上溢的格式恰好会在没人
+检查的地方出错。想对比就两边各跑一条：
 
 ```bash
-DEPTH_OPTIONS="dtype=float32" SEMANTIC_OPTIONS="dtype=float32" ...
+SEMANTIC_OPTIONS="dtype=float32" ...
 ```
+
+**DA3 不接受 `dtype`，它自己管。** 它的 `inference()` 内部已经套了一层
+`torch.autocast(bfloat16)`，同时把输入图像 `.float()` 成 float32。所以把它的权重转成
+半精度不会多拿到任何 tensor core，只会让半精度权重在第一个卷积上撞见 float32 输入：
+
+```
+RuntimeError: expected scalar type Float but found BFloat16
+```
+
+后端因此把 `dtype=auto` 解析成 float32，显式要 `bfloat16` 会被当场拒绝并说明原因，而
+不是让它跑到 shard 里再炸。报告里 `depth.meta` 同时记 `dtype: float32` 和
+`autocast: internal`，因为单看前者会误以为这一遍是全精度跑的。
 
 ### 单条手跑
 
@@ -445,8 +458,9 @@ DA3 也支持多帧联合重建（它是 any-view 模型）：
 ```bash
 --depth-backend-option window=4        # 窗口内的帧当作同一场景的多个视角
 --depth-backend-option process_res=728 # 默认 504；调高更清晰也更慢
---depth-backend-option dtype=float32   # 默认 auto，即 CUDA 上 bfloat16
 ```
+
+（没有 `dtype` 可调，理由见第 3 节的「精度」。）
 
 `window > 1` 时该窗口内的尺度绑定在一起。默认 `window=1` 即逐帧 —— 动态场景下多视角
 假设不成立，所以不默认打开。**也别把它当 batch size 用**：调大它是在改模型看到的
@@ -587,6 +601,8 @@ torch 版本与 `torch.cuda.is_available()`（对上 nvidia-smi 的驱动号）�
 | `No module named 'mapanything'` | 它不在 PyPI，`setup_venv.sh` 不会装它 | `DEPTH=depth_anything`，或按第 5 节从 git 装 |
 | `pip` 报一串 `depth-anything-3 requires open3d / pycolmap / fastapi ...` | `--no-deps` 的预期结果，那些服务导出、benchmark 和 demo 服务 | 不用管。`scripts/doctor.py` 的 `da3 deps` 一行会告诉你真正缺没缺 |
 | `pip` 报 `X 0.2.0 requires torch==2.12.0, but you have 2.13.0` | 这个 venv 里还装着别的项目，它的 pin 跟本管线的冲突；下次 `pip install` 就会把 torch 换掉 | 这个 venv 只跑本管线的话 `pip uninstall -y <X>`；否则给本管线单独建一个。`doctor.py` 会按包列出来 |
+| `depth backend 'depth_anything_v3' failed: RuntimeError: expected scalar type Float but found BFloat16` | 有人把 DA3 的权重转成了半精度；它内部自己 autocast 并把输入 `.float()`，于是半精度权重撞上 float32 输入 | 别传 `dtype`。现在 `dtype=auto` 就是 float32，显式要半精度会被拒绝并说明原因，见第 3 节「精度」 |
+| 日志里 `[WARN] Dependency 'e3nn' not found` | DA3 在导入高斯分支的球谐工具 | 正常，它只服务高斯导出，本管线走不到 |
 
 模型和数据相关：
 
