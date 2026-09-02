@@ -65,9 +65,13 @@ def test_the_sliding_window_reproduces_the_batch_pass_exactly(block, radius):
         guide,
     )
 
-    assert [ordinal for ordinal, _, _ in got] == list(range(len(depth)))
-    np.testing.assert_array_equal(np.stack([value for _, _, value in got]), want_labels)
-    np.testing.assert_array_equal(np.stack([value for _, value, _ in got]), want_depth)
+    assert [ordinal for ordinal, _, _, _ in got] == list(range(len(depth)))
+    np.testing.assert_array_equal(np.stack([value for _, _, value, _ in got]), want_labels)
+    np.testing.assert_array_equal(np.stack([value for _, value, _, _ in got]), want_depth)
+    # The fourth element is the frame as it went in, which is what makes
+    # "what did stabilisation change" answerable without a second copy of the
+    # episode - and it has to be that frame, not the one beside it.
+    np.testing.assert_array_equal(np.stack([value for _, _, _, value in got]), labels)
 
 
 def test_the_window_also_matches_with_flow_compensation_off():
@@ -78,8 +82,9 @@ def test_the_window_also_matches_with_flow_compensation_off():
         streaming.WindowStabiliser(radius=2, block=5, flow_compensate=False), depth, labels, None
     )
 
-    np.testing.assert_array_equal(np.stack([value for _, _, value in got]), want_labels)
-    np.testing.assert_array_equal(np.stack([value for _, value, _ in got]), want_depth)
+    np.testing.assert_array_equal(np.stack([value for _, _, value, _ in got]), want_labels)
+    np.testing.assert_array_equal(np.stack([value for _, value, _, _ in got]), want_depth)
+    np.testing.assert_array_equal(np.stack([value for _, _, _, value in got]), labels)
 
 
 def test_the_window_holds_only_the_frames_its_radius_needs():
@@ -221,12 +226,17 @@ class StopsPartWay:
 
 
 def delivery_config(**overrides):
+    # checkpoint_interval=0 so that every batch checkpoints. The default of a
+    # minute is right for an episode that runs for tens of them and wrong for a
+    # 30-frame test, where it would mean no checkpoint is ever written and the
+    # resume tests would quietly degrade into re-running from zero.
     return delivery.DeliveryConfig(
         depth_backend="synthetic",
         semantic_backend="synthetic",
         size=SIZE,
         chunk_frames=5,
         stabilise_block=4,
+        checkpoint_interval=0.0,
         **overrides,
     )
 
@@ -271,9 +281,24 @@ def test_a_resumed_episode_is_identical_to_an_uninterrupted_one(long_episode, tm
     stopped_at = frames.contiguous_count(broken, "depth")
     assert 0 < stopped_at < reference["frames"]
 
-    resumed = delivery.extract_scene(long_episode, broken, config=config)
+    said: list[str] = []
+    resumed = delivery.extract_scene(
+        long_episode,
+        broken,
+        config=delivery_config(
+            flow_compensate=True, flow_downscale=1, progress=said.append, progress_interval=0.0
+        ),
+    )
 
+    # Otherwise this passes by re-running the episode from its first frame,
+    # which tests nothing about seams.
+    assert any("resuming from frame" in line for line in said), said
     assert resumed["frames"] == reference["frames"]
+    # Every frame counted once. The meters resume from the checkpoint, and
+    # frames written after it are redone, so a resume point taken from the disk
+    # rather than from the checkpoint would drop frames out of this average
+    # without disturbing a single pixel.
+    assert resumed["semantic"]["flicker_before"] == reference["semantic"]["flicker_before"]
     want, got = scene_frames(whole), scene_frames(broken)
     for stream in frames.STREAMS:
         for ordinal, (expected, actual) in enumerate(zip(want[stream], got[stream])):

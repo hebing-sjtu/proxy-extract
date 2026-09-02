@@ -332,12 +332,27 @@ make scenes-audit
 [19:22:04] shard 0/64: 32 of 2000 episodes
 [19:22:04] seg_000000 [1/32] start
 [19:22:05] seg_000000 infer: /data/.../ep/video.mp4
-[19:22:35] seg_000000 infer 412 frames written, 7 batches
-[19:30:10] seg_000000 derive: 1800 frames
-[19:30:40] seg_000000 derive 900/1800
-[19:31:12] seg_000000 encode: four videos
-[19:32:01] seg_000000 done in 597s, 1800 frames
+[19:22:35] seg_000000 infer 412/1800 frames, 13.7 f/s, eta 2m (read 4%, model 61%, write 12%, other 23%)
+[19:25:10] seg_000000 derive: 1800 frames
+[19:25:40] seg_000000 derive 900/1800 frames, 31.0 f/s, eta 0m (read 18%, write 41%, other 41%)
+[19:26:12] seg_000000 encode: four videos
+[19:27:01] seg_000000 done in 297s, 1800 frames
 ```
+
+**括号里那组百分比是用来定位瓶颈的**，因为一个占着显存、利用率 0 的 worker，可能
+是在等源文件、在等输出盘、也可能真的在算，三者从外面完全分不出来，而处理方式截然
+相反：
+
+| 哪一项最大 | 意思 | 往哪个方向调 |
+| --- | --- | --- |
+| `model` | 真的在跑前向，符合预期 | 加 `WORKERS_PER_GPU` 直到显存或利用率见顶 |
+| `write` | 卡在输出文件系统上。逐帧目录一帧要写 3 个文件、约 2.8 MiB，几十个 worker 一起写共享存储时它会先到极限 | 减 worker，或 `KEEP_FRAMES=depth` 少写两路，或把 `OUT_DIR` 放到本地盘 |
+| `read` | 卡在读源视频 | 同上，问题在存储不在算力 |
+| `other` | 时间的稳定化（Farneback 光流），纯 CPU | `SCENES_ARGS="--flow-downscale 4"`，或给每个 worker 多一点线程 |
+
+`f/s` 是这个 worker 当前的逐帧速率。**1800 帧的 episode 低于约 1 f/s 就说明有问题**
+—— 那意味着单条要半小时以上。`infer` 那一行数的是读进来的帧数而不是写出的帧数：
+稳定化要攒够一个 block 才放行，写出的计数在头一百多帧里恒为 0。
 
 **心跳停了才是卡住，没输出不算。** worker 用 `python -u` 起，所以这些行是即时落盘的，
 不会攒在缓冲区里 —— 早先没加 `-u` 的时候，一个正常干活的 shard 日志能空好几分钟，
@@ -728,6 +743,7 @@ torch 版本与 `torch.cuda.is_available()`（对上 nvidia-smi 的驱动号）�
 | `depth backend 'depth_anything_v3' failed: RuntimeError: expected scalar type Float but found BFloat16` | 有人把 DA3 的权重转成了半精度；它内部自己 autocast 并把输入 `.float()`，于是半精度权重撞上 float32 输入 | 别传 `dtype`。现在 `dtype=auto` 就是 float32，显式要半精度会被拒绝并说明原因，见第 3 节「精度」 |
 | 日志里 `[WARN] Dependency 'e3nn' not found` | DA3 在导入高斯分支的球谐工具 | 正常，它只服务高斯导出，本管线走不到 |
 | 占着显存、`utilization.gpu` 是 0、日志不动、也不报错 | 按可能性排：**① 线程抢核**（每个库都按整机开池子，见第 3 节「线程」，用旧版脚本启动的必然踩到）；② 上一轮的进程还占着显存和核；③ 正常地在跑 CPU 那一段 —— 稳定化、PNG、ffmpeg 都不用 GPU | 先 `uptime` 看 load average：远高于核数就是 ①，升级脚本后重启即可。`nvidia-smi --query-compute-apps=pid,used_memory --format=csv` 的 pid 数多于 worker 数就是 ②，见下一行。都不是就 `py-spy dump --pid <pid>` 看栈 |
+| 跑了几个小时，帧在慢慢出，但一条 episode 都没完成，GPU 利用率 0、load 也低 | 机器在等，不在算。这种「哪儿都不忙」的组合基本上就是存储：几十个 worker 同时往共享盘写逐帧目录，一帧 3 个文件、约 2.8 MiB | 看 shard 日志心跳括号里的百分比，`write` 高就是它。先减 `WORKERS_PER_GPU`，再考虑 `KEEP_FRAMES=depth`（少写两路）或把 `OUT_DIR` 换到本地盘。想立刻量一下当前速率：`d=$(ls -dt $OUT_DIR/seg_*/frames/color \| head -1); a=$(ls $d \| wc -l); sleep 60; b=$(ls $d \| wc -l); echo $((b-a)) frames/min` |
 | `nvidia-smi` 里的进程数少于自己开的 worker 数（心跳的 `shards alive` 也少） | 有 worker 在起步阶段就死了，日志里是 traceback，但它被淹在几十个日志文件中间 | `head -20 $OUT_DIR/logs/shard-*.log` 一次看全部开头。2026-09 之前的版本有一个必踩的：所有 shard 抢同一个 manifest 临时文件，64 路里能死掉一批，`git pull` 即可 |
 | `nvidia-smi` 里的进程数多于自己开的 worker 数 | 上一轮 worker 没退干净，显存和核都还被它们占着，新一轮于是挤在剩下的卡上 —— 「每张卡 worker 数不一样」通常就是这么来的 | `comm -23 <(nvidia-smi --query-compute-apps=pid --format=csv,noheader \| sort -u) <(pgrep -f "proxy_extract scenes" \| sort -u)` 列出没人认领的 pid，确认后 `kill -9`。下一轮起来前 `nvidia-smi` 应该是干净的 |
 | `scenes-audit` 报 `no scenes_manifest.json` | manifest 在模型加载之前就写了，所以这个 `--out` 下没有 worker 跑过 | 核对 `OUT_DIR` 和 audit 的 `--out` 是不是同一个路径（`ls -d /data/binghe/datasets/ABot-seg-*`） |

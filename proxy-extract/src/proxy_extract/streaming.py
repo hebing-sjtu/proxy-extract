@@ -71,8 +71,15 @@ class WindowStabiliser:
 
     def push(
         self, depth: np.ndarray, labels: np.ndarray, guide: np.ndarray | None = None
-    ) -> Iterator[tuple[int, np.ndarray, np.ndarray]]:
-        """Accept one raw frame, yielding whichever earlier frames are now settled."""
+    ) -> Iterator[tuple[int, np.ndarray, np.ndarray, np.ndarray]]:
+        """Accept one raw frame, yielding whichever earlier frames are now settled.
+
+        Each release carries the labels as they arrived as well as as they
+        leave. The window is holding them anyway, and a caller that wants to
+        measure what stabilisation changed would otherwise have to keep its own
+        copy of every frame in flight - and to keep it in step with a delay it
+        cannot see from outside.
+        """
         if self.flow_compensate and guide is None:
             raise ValueError("flow compensation is on, so every frame needs a guide")
         self._depth.append(np.asarray(depth, dtype=np.float32))
@@ -82,7 +89,7 @@ class WindowStabiliser:
         if self._settled() >= self.block:
             yield from self._flush(final=False)
 
-    def close(self) -> Iterator[tuple[int, np.ndarray, np.ndarray]]:
+    def close(self) -> Iterator[tuple[int, np.ndarray, np.ndarray, np.ndarray]]:
         """Release the tail, whose right-hand neighbours do not exist."""
         yield from self._flush(final=True)
 
@@ -90,7 +97,7 @@ class WindowStabiliser:
         """Frames that could be released now with the full window behind them."""
         return max(self._base + len(self._depth) - self.radius - self._emitted, 0)
 
-    def _flush(self, *, final: bool) -> Iterator[tuple[int, np.ndarray, np.ndarray]]:
+    def _flush(self, *, final: bool) -> Iterator[tuple[int, np.ndarray, np.ndarray, np.ndarray]]:
         start = self._emitted - self._base
         stop = len(self._depth) if final else len(self._depth) - self.radius
         if stop <= start:
@@ -104,7 +111,12 @@ class WindowStabiliser:
             flow_downscale=self.flow_downscale,
         )
         for offset in range(start, stop):
-            yield self._base + offset, steady_depth[offset], steady_labels[offset]
+            yield (
+                self._base + offset,
+                steady_depth[offset],
+                steady_labels[offset],
+                self._labels[offset],
+            )
 
         self._emitted = self._base + stop
         self._trim()
@@ -221,6 +233,22 @@ class FlickerMeter:
             self._changed += int((labels != self._previous).sum())
             self._compared += labels.size
         self._previous = labels
+
+    @property
+    def previous(self) -> np.ndarray | None:
+        """The last frame pushed, which a restart has to be given back.
+
+        The counters alone do not resume this: the pair straddling the restart
+        has no left-hand side without it, so that comparison would silently go
+        missing from the average and the same episode would report two
+        different flicker rates depending on whether it was interrupted.
+        """
+        return self._previous
+
+    def seed(self, labels: np.ndarray | None) -> None:
+        """Supply the left-hand side of the next comparison, without counting it."""
+        if labels is not None:
+            self._previous = np.asarray(labels)
 
     @property
     def rate(self) -> float:

@@ -153,6 +153,34 @@ def write_image(scene_dir: Path, stream: str, ordinal: int, rgb: np.ndarray) -> 
     return _place(frame_path(scene_dir, stream, ordinal), write)
 
 
+def write_stage_array(scene_dir: Path, name: str, array: np.ndarray) -> Path:
+    """Persist one array of run state beside the staged frames.
+
+    For the things a checkpoint needs that its JSON cannot hold. There is one
+    today - the last frame the flicker meter compared - and it belongs here
+    rather than in a stream: it is not a frame of the episode, it is a frame
+    the next process has to be handed to continue an average, and `.stage/`
+    is what gets deleted once the episode no longer needs continuing.
+    """
+    stage = stage_dir_for(scene_dir)
+    stage.mkdir(parents=True, exist_ok=True)
+    payload = np.ascontiguousarray(array)
+
+    def write(target: Path) -> None:
+        with open(target, "wb") as handle:
+            np.save(handle, payload, allow_pickle=False)
+
+    return _place(stage / name, write)
+
+
+def read_stage_array(scene_dir: Path, name: str) -> np.ndarray | None:
+    """The array `write_stage_array` left, or None if this is a first run."""
+    path = stage_dir_for(scene_dir) / name
+    if not path.is_file():
+        return None
+    return np.load(path, allow_pickle=False)
+
+
 def read_array(scene_dir: Path, stream: str, ordinal: int) -> np.ndarray:
     """Read one depth or label frame back.
 

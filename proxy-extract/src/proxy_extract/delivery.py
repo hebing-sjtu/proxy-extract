@@ -46,6 +46,7 @@ import shutil
 import tempfile
 import time
 import warnings
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -197,6 +198,12 @@ class DeliveryConfig:
     # Seconds between within-scene heartbeats. Only the beats are throttled;
     # stage transitions always print.
     progress_interval: float = 30.0
+    # Seconds between checkpoints of the inference stage. Each one waits for
+    # every queued write to land before recording the frame count, so this is
+    # also the interval on which the models stop and wait for the filesystem -
+    # and, on a restart, the most work that can be lost. A minute costs under a
+    # percent of a stage that runs for tens of them.
+    checkpoint_interval: float = 60.0
 
     @property
     def taxonomy(self) -> str:
@@ -241,6 +248,59 @@ class _Progress:
             return
         self._last = now
         self.sink(f"{self.scene} {message}")
+
+
+class _Phases:
+    """Where a stage's wall clock went, as shares of it.
+
+    A worker holding VRAM at 0% utilisation is waiting on the source, waiting
+    on the output filesystem, or actually computing, and the three call for
+    completely different fixes - more workers, fewer workers, faster storage.
+    From outside the process they are indistinguishable, and diagnosing one as
+    another has already cost this project days. So the stage measures itself
+    and puts the answer in its own progress line.
+
+    Wall time, not CPU time: the question is what the pipeline is waiting for,
+    and a thread blocked on a network filesystem burns no CPU at all.
+    """
+
+    def __init__(self) -> None:
+        self.started = time.monotonic()
+        self.totals: dict[str, float] = {}
+
+    @contextmanager
+    def timing(self, phase: str):
+        mark = time.monotonic()
+        try:
+            yield
+        finally:
+            self.totals[phase] = self.totals.get(phase, 0.0) + (time.monotonic() - mark)
+
+    @property
+    def elapsed(self) -> float:
+        return max(time.monotonic() - self.started, 1e-9)
+
+    def shares(self, **extra: float) -> str:
+        """The phases as percentages, with whatever is left over named.
+
+        `other` is not padding: in this stage it is the temporal stabilisation,
+        which is CPU work nobody thinks about until it is the majority.
+        """
+        named = {**self.totals, **extra}
+        rest = self.elapsed - sum(named.values())
+        parts = [f"{name} {value / self.elapsed:.0%}" for name, value in named.items()]
+        parts.append(f"other {max(rest, 0.0) / self.elapsed:.0%}")
+        return ", ".join(parts)
+
+
+def _pace(frames_done: int, total: int | None, clock: _Phases, blocked: float) -> str:
+    """One phrase: how fast, how much longer, and what the time went on."""
+    rate = frames_done / clock.elapsed
+    eta = ""
+    if total and rate > 0 and total > frames_done:
+        seconds = (total - frames_done) / rate
+        eta = f", eta {seconds / 60:.0f}m" if seconds >= 60 else f", eta {seconds:.0f}s"
+    return f"{rate:.1f} f/s{eta} ({clock.shares(write=blocked)})"
 
 
 def extract_scene(
@@ -307,6 +367,7 @@ def extract_scene(
         semantic_backend=semantic_backend,
         refiner=refiner,
         progress=progress,
+        source_frames=info.frames or None,
     )
     if not state["metric"]:
         raise DeliveryError(
@@ -380,6 +441,11 @@ def extract_scene(
 # --------------------------------------------------------------------- stages
 
 STATE_NAME = "state.json"
+
+# The one piece of checkpoint state that is an array rather than a number: the
+# last labels the flicker meter compared, which the next process needs as the
+# left-hand side of its first comparison.
+FLICKER_PREVIOUS = "flicker_previous.npy"
 
 
 def _state_path(scene_dir: Path) -> Path:
@@ -465,6 +531,7 @@ def _stage_infer(
     semantic_backend,
     refiner,
     progress: "_Progress | None" = None,
+    source_frames: int | None = None,
 ) -> dict:
     """Decode once, predict, stabilise, and write colour and depth frames.
 
@@ -486,7 +553,15 @@ def _stage_infer(
 
     progress = progress or _Progress(config, scene_dir.name)
     written_streams = ("color", "depth", frames.STAGING_STREAM)
-    done = frames.complete_through(scene_dir, written_streams)
+    # Frames on disk are only usable as far as the last checkpoint: the range
+    # guard's and the flicker meter's totals were saved there, and frames
+    # written after it are ones those totals have never seen. Counting them as
+    # done would drop them from both statistics silently. So the checkpoint is
+    # the resume point, and anything past it is written again.
+    done = min(
+        frames.complete_through(scene_dir, written_streams),
+        int(state.get("frames", 0)) if "range_state" in state else 0,
+    )
     if done:
         progress.say(f"resuming from frame {done}")
     for stream in written_streams:
@@ -497,6 +572,7 @@ def _stage_infer(
     if done and "range_state" in state:
         guard.restore(state["range_state"])
         flicker.restore(state["flicker_state"])
+        flicker.seed(frames.read_stage_array(scene_dir, FLICKER_PREVIOUS))
 
     window = streaming.WindowStabiliser(
         radius=config.temporal_radius,
@@ -512,22 +588,42 @@ def _stage_infer(
     semantic_meta: dict = dict(state["semantic_meta"])
     decoded = 0
     total = done
+    clock = _Phases()
+    checkpointed = time.monotonic()
 
     with _FrameWriter(scene_dir, config.writer_threads) as writer:
 
-        def keep(ordinal: int, metres: np.ndarray, labels: np.ndarray) -> None:
+        def keep(
+            ordinal: int, metres: np.ndarray, labels: np.ndarray, raw_labels: np.ndarray
+        ) -> None:
             nonlocal total
             if ordinal < done:
                 return
+            # Measured here rather than where the models produced it, so that
+            # the meter and the range guard advance in step with the frames on
+            # disk. Inference runs a window ahead of what has been released, so
+            # counting at that point would checkpoint statistics covering
+            # frames the next process is going to compute again.
+            flicker.push(raw_labels)
             writer.array("depth", ordinal, guard.apply(metres))
             writer.array(frames.STAGING_STREAM, ordinal, labels)
             total = max(total, ordinal + 1)
 
-        decoding = prefetch(
-            iter_frames(video, size=config.size, chunk=config.chunk_frames),
-            depth=config.prefetch_batches,
+        decoding = iter(
+            prefetch(
+                iter_frames(video, size=config.size, chunk=config.chunk_frames),
+                depth=config.prefetch_batches,
+            )
         )
-        for batch in decoding:
+        while True:
+            # Timed separately from the models because a batch that is not
+            # ready means the source filesystem is the constraint, and no
+            # amount of GPU answers that.
+            with clock.timing("read"):
+                batch = next(decoding, None)
+            if batch is None:
+                break
+
             start, decoded = decoded, decoded + len(batch)
             if decoded <= infer_from:
                 continue
@@ -542,10 +638,11 @@ def _stage_infer(
                 if first + index >= done:
                     writer.image("color", first + index, frame)
 
-            depth_result = depth_backend.estimate(batch, cameras=None)
-            semantic_result = semantic_backend.segment(batch)
-            if refiner is not None:
-                semantic_result = refiner.refine(batch, semantic_result)
+            with clock.timing("model"):
+                depth_result = depth_backend.estimate(batch, cameras=None)
+                semantic_result = semantic_backend.segment(batch)
+                if refiner is not None:
+                    semantic_result = refiner.refine(batch, semantic_result)
 
             raw_depth = np.where(
                 depth_result.valid_mask(), depth_result.depth, 0.0
@@ -556,11 +653,6 @@ def _stage_infer(
             batches += 1
 
             for index in range(len(batch)):
-                # The overlap re-inferred for window context was already
-                # measured by the run that wrote it; counting it twice would
-                # weight those frames double in the reported rate.
-                if first + index >= done:
-                    flicker.push(raw_labels[index])
                 guides = (
                     cv2.cvtColor(batch[index], cv2.COLOR_RGB2GRAY)
                     if config.flow_compensate
@@ -568,30 +660,47 @@ def _stage_infer(
                 )
                 # The window numbers what it was given, and it was given frames
                 # from `infer_from` on, not from the episode's start.
-                for ordinal, metres, labels in window.push(
+                for ordinal, metres, labels, raw in window.push(
                     raw_depth[index], raw_labels[index], guides
                 ):
-                    keep(infer_from + ordinal, metres, labels)
+                    keep(infer_from + ordinal, metres, labels, raw)
 
-            writer.drain()
-            progress.beat(f"infer {total} frames written, {batches} batches")
-            _save_state(
-                scene_dir,
-                {
-                    **state,
-                    "frames": total,
-                    "batches": batches,
-                    "metric": metric,
-                    "depth_meta": depth_meta,
-                    "semantic_meta": semantic_meta,
-                    "range_state": guard.state(),
-                    "flicker_state": flicker.state(),
-                    "range": guard.stats(),
-                },
+            # Frames read, not frames written. The stabiliser holds a block
+            # before it releases anything, so the written count sits at zero
+            # for the first `stabilise_block` frames of every episode - a
+            # progress line that reads as a hang for exactly as long as the
+            # operator is most likely to be watching it.
+            progress.beat(
+                f"infer {decoded}/{source_frames or '?'} frames, "
+                f"{_pace(decoded - infer_from, source_frames, clock, writer.blocked)}"
             )
+            # Not every batch. A checkpoint has to wait for every queued write
+            # to land before it can record a frame count, so doing it per batch
+            # stops the models on the filesystem twenty-eight times an episode
+            # for no gain: what it buys back is bounded by this interval, and
+            # what it costs is however long the slowest write takes.
+            if time.monotonic() - checkpointed >= config.checkpoint_interval:
+                writer.drain()
+                if flicker.previous is not None:
+                    frames.write_stage_array(scene_dir, FLICKER_PREVIOUS, flicker.previous)
+                _save_state(
+                    scene_dir,
+                    {
+                        **state,
+                        "frames": total,
+                        "batches": batches,
+                        "metric": metric,
+                        "depth_meta": depth_meta,
+                        "semantic_meta": semantic_meta,
+                        "range_state": guard.state(),
+                        "flicker_state": flicker.state(),
+                        "range": guard.stats(),
+                    },
+                )
+                checkpointed = time.monotonic()
 
-        for ordinal, metres, labels in window.close():
-            keep(infer_from + ordinal, metres, labels)
+        for ordinal, metres, labels, raw in window.close():
+            keep(infer_from + ordinal, metres, labels, raw)
 
     if total == 0:
         raise DeliveryError(f"decoded zero frames from {video}")
@@ -661,10 +770,15 @@ def _stage_derive(
         for stream in ("semantic", "duv"):
             frames.discard_from(scene_dir, stream, done)
 
+        clock = _Phases()
         with _FrameWriter(scene_dir, config.writer_threads) as writer:
             for ordinal in range(done, count):
-                progress.beat(f"derive {ordinal}/{count}")
-                metres = frames.read_array(scene_dir, "depth", ordinal)
+                progress.beat(
+                    f"derive {ordinal}/{count} frames, "
+                    f"{_pace(ordinal - done, count, clock, writer.blocked)}"
+                )
+                with clock.timing("read"):
+                    metres = frames.read_array(scene_dir, "depth", ordinal)
                 writer.array("semantic", ordinal, standard11[ordinal])
                 writer.image(
                     "duv",
@@ -758,6 +872,11 @@ class _FrameWriter:
         self.limit = max(self.threads * self.QUEUE_PER_THREAD, 1)
         self._pool = None
         self._pending: deque = deque()
+        # Seconds the caller spent waiting on this writer, which is the only
+        # honest measure of what the output filesystem is costing: once the
+        # queue is full, back-pressure arrives as a slow `image()` call in the
+        # middle of the stabiliser rather than as anything named "writing".
+        self.blocked = 0.0
 
     def __enter__(self) -> "_FrameWriter":
         if self.threads:
@@ -776,10 +895,15 @@ class _FrameWriter:
 
     def _submit(self, fn, *args) -> None:
         if self._pool is None:
+            mark = time.monotonic()
             fn(*args)
+            self.blocked += time.monotonic() - mark
             return
-        while len(self._pending) >= self.limit:
-            self._pending.popleft().result()
+        if len(self._pending) >= self.limit:
+            mark = time.monotonic()
+            while len(self._pending) >= self.limit:
+                self._pending.popleft().result()
+            self.blocked += time.monotonic() - mark
         self._pending.append(self._pool.submit(fn, *args))
 
     def array(self, stream: str, ordinal: int, array: np.ndarray) -> None:
@@ -794,8 +918,12 @@ class _FrameWriter:
         What makes a checkpoint honest: when the state file records N frames, N
         frames are on disk rather than queued behind a slow filesystem.
         """
+        if not self._pending:
+            return
+        mark = time.monotonic()
         while self._pending:
             self._pending.popleft().result()
+        self.blocked += time.monotonic() - mark
 
 
 def _copy_annotation(video: Path, out_dir: Path, annotations: Path | None) -> str | None:
