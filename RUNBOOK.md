@@ -208,6 +208,27 @@ worker 一个进程，CUDA OOM 只杀一个 shard，重跑 `make scenes` 会从�
 > 只能靠叠 worker。语义模型那边可以真的加宽：
 > `SEMANTIC_OPTIONS="batch_size=8"`。
 
+### 线程：叠 worker 的另一半
+
+**叠 worker 而不同时限制线程，会得到一台比单 worker 还慢的机器。**这里每个 CPU
+库都按「整台机器归我」来定线程池大小：OpenCV 的光流按核数，torch 的 CPU 算子按
+核数，x264 更是按核数的约 1.5 倍。128 核上开 64 个 worker，于是有上万个线程抢 128
+个核，机器把时间全花在切换上下文上。
+
+症状极具迷惑性：**每张卡都占着显存、利用率却是 0，日志不动，而且哪里都不报错**
+—— 因为确实没有出错，只是每个 worker 都慢了两个数量级。
+
+`run_scenes.sh` 会按 `nproc / worker 数` 均分，下限 1，上限 4（再多这些池子也不
+再变快，只是从别的 worker 手里抢核），并把结果打在启动摘要里：
+
+```
+shards     64 (8 GPU(s) x 8 worker(s), ~704 GiB RAM)
+threads    2 per worker, of 128 core(s)
+```
+
+要自己定就 `THREADS_PER_WORKER=4 make scenes`。手跑单条时不必管：环境变量没设
+时上限就不存在，每个库照旧用满整台机器。
+
 ### 精度
 
 两个后端都在 CUDA 上跑 **bfloat16**，但来路不同，**只有语义那边是我们控制的**。
@@ -256,10 +277,30 @@ tail -f /data/binghe/datasets/ABot-seg-long-2000/logs/shard-0.log
 make scenes-audit
 ```
 
+日志长这样，每条 episode 有起止，中间每 30 秒一行心跳（`--progress-interval` 可调，
+`--quiet` 关掉）：
+
+```
+[19:22:04] shard 0/64: 32 of 2000 episodes
+[19:22:04] seg_000000 [1/32] start
+[19:22:05] seg_000000 infer: /data/.../ep/video.mp4
+[19:22:35] seg_000000 infer 412 frames written, 7 batches
+[19:30:10] seg_000000 derive: 1800 frames
+[19:30:40] seg_000000 derive 900/1800
+[19:31:12] seg_000000 encode: four videos
+[19:32:01] seg_000000 done in 597s, 1800 frames
+```
+
+**心跳停了才是卡住，没输出不算。** worker 用 `python -u` 起，所以这些行是即时落盘的，
+不会攒在缓冲区里 —— 早先没加 `-u` 的时候，一个正常干活的 shard 日志能空好几分钟，
+跟真卡住完全分不出来。
+
 `scenes-audit` 会把每个 scene 重新打开、按 `extraction_report.json` 的帧数核对四路
 视频的实际帧数，而不是看目录在不在 —— 被杀在编码中途的 worker 留下的正是四个长度
 不足的文件，而这恰恰是标记文件会掩盖的失败。它在还有缺口时返回非零，所以可以放进
-shell 循环里等。
+shell 循环里等。它需要 `scenes_manifest.json`，那个文件是 worker 在**加载模型之前**
+就写下的；所以「audit 说没有 manifest」意味着这个 `--out` 下从来没有 worker 跑起来
+过，通常是 `--out` 跟 `OUT_DIR` 不是同一个路径。
 
 ### 体积
 
@@ -603,6 +644,10 @@ torch 版本与 `torch.cuda.is_available()`（对上 nvidia-smi 的驱动号）�
 | `pip` 报 `X 0.2.0 requires torch==2.12.0, but you have 2.13.0` | 这个 venv 里还装着别的项目，它的 pin 跟本管线的冲突；下次 `pip install` 就会把 torch 换掉 | 这个 venv 只跑本管线的话 `pip uninstall -y <X>`；否则给本管线单独建一个。`doctor.py` 会按包列出来 |
 | `depth backend 'depth_anything_v3' failed: RuntimeError: expected scalar type Float but found BFloat16` | 有人把 DA3 的权重转成了半精度；它内部自己 autocast 并把输入 `.float()`，于是半精度权重撞上 float32 输入 | 别传 `dtype`。现在 `dtype=auto` 就是 float32，显式要半精度会被拒绝并说明原因，见第 3 节「精度」 |
 | 日志里 `[WARN] Dependency 'e3nn' not found` | DA3 在导入高斯分支的球谐工具 | 正常，它只服务高斯导出，本管线走不到 |
+| 占着显存、`utilization.gpu` 是 0、日志不动、也不报错 | 按可能性排：**① 线程抢核**（每个库都按整机开池子，见第 3 节「线程」，用旧版脚本启动的必然踩到）；② 上一轮的进程还占着显存和核；③ 正常地在跑 CPU 那一段 —— 稳定化、PNG、ffmpeg 都不用 GPU | 先 `uptime` 看 load average：远高于核数就是 ①，升级脚本后重启即可。`nvidia-smi --query-compute-apps=pid,used_memory --format=csv` 的 pid 数多于 worker 数就是 ②，见下一行。都不是就 `py-spy dump --pid <pid>` 看栈 |
+| `nvidia-smi` 里的进程数多于自己开的 worker 数 | 上一轮 worker 没退干净，显存和核都还被它们占着，新一轮于是挤在剩下的卡上 —— 「每张卡 worker 数不一样」通常就是这么来的 | `comm -23 <(nvidia-smi --query-compute-apps=pid --format=csv,noheader \| sort -u) <(pgrep -f "proxy_extract scenes" \| sort -u)` 列出没人认领的 pid，确认后 `kill -9`。下一轮起来前 `nvidia-smi` 应该是干净的 |
+| `scenes-audit` 报 `no scenes_manifest.json` | manifest 在模型加载之前就写了，所以这个 `--out` 下没有 worker 跑过 | 核对 `OUT_DIR` 和 audit 的 `--out` 是不是同一个路径（`ls -d /data/binghe/datasets/ABot-seg-*`） |
+| `semantic backend 'standard11' failed: ImportError: Mask2FormerLoss requires the scipy library` | Mask2Former 的 `__init__` 无条件构造训练损失，那个损失在构造时就要 scipy（匈牙利匹配用）。本管线不训练也从不调它，但模型加载不过去 | `pip install scipy`。已经写进 `requirements.txt`，老 venv 补装即可 |
 
 模型和数据相关：
 

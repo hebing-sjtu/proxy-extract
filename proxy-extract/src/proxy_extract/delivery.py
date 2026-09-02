@@ -46,6 +46,10 @@ import time
 import warnings
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 import numpy as np
 
@@ -183,10 +187,58 @@ class DeliveryConfig:
     depth_backend_options: dict = field(default_factory=dict)
     semantic_backend_options: dict = field(default_factory=dict)
     refiner_options: dict = field(default_factory=dict)
+    # Where to say what the worker is doing, if anywhere. A scene takes minutes
+    # and a shard takes days, so a worker that says nothing is indistinguishable
+    # from a wedged one — which is a diagnosis that has cost hours. The CLI
+    # supplies a timestamped printer; library callers and tests get silence.
+    progress: "Callable[[str], None] | None" = None
+    # Seconds between within-scene heartbeats. Only the beats are throttled;
+    # stage transitions always print.
+    progress_interval: float = 30.0
 
     @property
     def taxonomy(self) -> str:
         return _TAXONOMY_OF_BACKEND.get(self.semantic_backend, "cwm12")
+
+
+# Fields that describe how the run is driven rather than what it produces, and
+# that JSON cannot hold anyway.
+_UNREPORTABLE = ("progress", "progress_interval")
+
+
+def _reportable(config: DeliveryConfig) -> dict:
+    """The config as the report records it: settings only, no machinery."""
+    return {key: value for key, value in asdict(config).items() if key not in _UNREPORTABLE}
+
+
+class _Progress:
+    """Says what a worker is doing, rarely enough to leave the log readable.
+
+    Stage transitions always print, since there are four of them per episode.
+    Within a stage the caller beats on every frame and this drops all but one
+    every `interval` seconds - a 1800-frame episode would otherwise be 1800
+    lines, times 2000 episodes, times 64 shards.
+    """
+
+    def __init__(self, config: DeliveryConfig, scene: str) -> None:
+        self.sink = config.progress
+        self.interval = max(float(config.progress_interval), 0.0)
+        self.scene = scene
+        self._last = 0.0
+
+    def say(self, message: str) -> None:
+        if self.sink is not None:
+            self.sink(f"{self.scene} {message}")
+
+    def beat(self, message: str) -> None:
+        """Print at most one of these per interval, and always the first."""
+        if self.sink is None:
+            return
+        now = time.monotonic()
+        if now - self._last < self.interval:
+            return
+        self._last = now
+        self.sink(f"{self.scene} {message}")
 
 
 def extract_scene(
@@ -242,6 +294,8 @@ def extract_scene(
     frames.make_dirs(out_dir)
     state = _open_state(out_dir, _fingerprint(config, video, fps))
 
+    progress = _Progress(config, out_dir.name)
+    progress.say(f"infer: {video}")
     state = _stage_infer(
         video,
         out_dir,
@@ -250,6 +304,7 @@ def extract_scene(
         depth_backend=depth_backend,
         semantic_backend=semantic_backend,
         refiner=refiner,
+        progress=progress,
     )
     if not state["metric"]:
         raise DeliveryError(
@@ -259,7 +314,9 @@ def extract_scene(
             "that predicts metric depth."
         )
 
-    state = _stage_derive(out_dir, config, state=state)
+    progress.say(f"derive: {state['frames']} frames")
+    state = _stage_derive(out_dir, config, state=state, progress=progress)
+    progress.say("encode: four videos")
     written = _stage_encode(out_dir, config, fps=fps, state=state)
     annotation = _copy_annotation(video, out_dir, annotations)
 
@@ -281,7 +338,7 @@ def extract_scene(
         "size": [width, height],
         "fps": fps,
         "inference_batches": state["batches"],
-        "config": {**asdict(config), "size": [width, height]},
+        "config": {**_reportable(config), "size": [width, height]},
         "depth": {
             "backend": getattr(depth_backend, "name", config.depth_backend),
             "metric_source": "backend_native",
@@ -405,6 +462,7 @@ def _stage_infer(
     depth_backend,
     semantic_backend,
     refiner,
+    progress: "_Progress | None" = None,
 ) -> dict:
     """Decode once, predict, stabilise, and write colour and depth frames.
 
@@ -424,8 +482,11 @@ def _stage_infer(
     if state["stage"] != "infer":
         return state
 
+    progress = progress or _Progress(config, scene_dir.name)
     written_streams = ("color", "depth", frames.STAGING_STREAM)
     done = frames.complete_through(scene_dir, written_streams)
+    if done:
+        progress.say(f"resuming from frame {done}")
     for stream in written_streams:
         frames.discard_from(scene_dir, stream, done)
 
@@ -511,6 +572,7 @@ def _stage_infer(
                     keep(infer_from + ordinal, metres, labels)
 
             writer.drain()
+            progress.beat(f"infer {total} frames written, {batches} batches")
             _save_state(
                 scene_dir,
                 {
@@ -549,7 +611,13 @@ def _stage_infer(
     return state
 
 
-def _stage_derive(scene_dir: Path, config: DeliveryConfig, *, state: dict) -> dict:
+def _stage_derive(
+    scene_dir: Path,
+    config: DeliveryConfig,
+    *,
+    state: dict,
+    progress: "_Progress | None" = None,
+) -> dict:
     """Finish the labels, then write the semantic and duv frames.
 
     The two steps here are the ones that cannot stream. Run suppression asks
@@ -562,6 +630,7 @@ def _stage_derive(scene_dir: Path, config: DeliveryConfig, *, state: dict) -> di
     if state["stage"] not in {"derive", "encode"}:
         raise DeliveryError(f"cannot derive from stage {state['stage']!r}")
 
+    progress = progress or _Progress(config, scene_dir.name)
     count = int(state["frames"])
     if state["stage"] == "derive":
         labels = frames.read_stack(scene_dir, frames.STAGING_STREAM, count)
@@ -592,6 +661,7 @@ def _stage_derive(scene_dir: Path, config: DeliveryConfig, *, state: dict) -> di
 
         with _FrameWriter(scene_dir, config.writer_threads) as writer:
             for ordinal in range(done, count):
+                progress.beat(f"derive {ordinal}/{count}")
                 metres = frames.read_array(scene_dir, "depth", ordinal)
                 writer.array("semantic", ordinal, standard11[ordinal])
                 writer.image(
@@ -929,12 +999,18 @@ def deliver_dataset(
     )
     refiner = get_refiner(config.semantic_refiner, **config.refiner_options)
 
+    say = config.progress or (lambda _message: None)
+    say(f"{len(assignments)} episodes to do")
+
     reports = []
-    for item in assignments:
+    for position, item in enumerate(assignments, start=1):
         scene_dir = scene_dir_for(output_root, item.index)
         if resume and already_done(scene_dir):
+            say(f"{item.scene} [{position}/{len(assignments)}] already complete")
             reports.append({"scene": item.scene, "skipped": "already complete"})
             continue
+        started = time.time()
+        say(f"{item.scene} [{position}/{len(assignments)}] start")
         try:
             reports.append(
                 extract_scene(
@@ -946,6 +1022,10 @@ def deliver_dataset(
                     semantic_backend=semantic_backend,
                     refiner=refiner,
                 )
+            )
+            say(
+                f"{item.scene} done in {time.time() - started:.0f}s, "
+                f"{reports[-1]['frames']} frames"
             )
         except ENVIRONMENT_ERRORS as error:
             # Not survivable and not per-episode: the backend's dependency is
@@ -964,6 +1044,7 @@ def deliver_dataset(
             # scene, not the worker's whole shard.
             if on_error == "raise":
                 raise
+            say(f"{item.scene} FAILED: {type(error).__name__}: {error}")
             reports.append({"scene": item.scene, "failed": f"{type(error).__name__}: {error}"})
     return reports
 

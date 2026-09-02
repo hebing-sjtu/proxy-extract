@@ -119,6 +119,21 @@ def test_the_docs_quote_the_encoding_constants_the_encoders_use():
 
 
 @needs_checkout
+def test_scipy_stays_pinned_even_though_nothing_here_imports_it():
+    """It looks unused, and removing it stops the semantic backend loading.
+
+    Mask2Former builds its training loss in `__init__`, and that loss requires
+    scipy at construction for its Hungarian matching. Nothing here trains, so a
+    grep for `import scipy` across this package finds nothing and the pin reads
+    like leftovers — which is exactly how it would get dropped.
+    """
+    requirements = (ROOT / "requirements.txt").read_text()
+
+    assert "scipy==" in requirements
+    assert "Mask2Former" in requirements, "the pin needs its reason next to it"
+
+
+@needs_checkout
 @pytest.mark.parametrize("doc", ["RUNBOOK.md", "DATA_F.md"])
 def test_the_docs_describe_the_per_frame_layout(doc):
     """The frame directories are half the delivered bytes; both docs name them.

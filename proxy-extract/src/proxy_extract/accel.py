@@ -17,8 +17,67 @@ its weights stay float32 and the question does not arise - see
 
 from __future__ import annotations
 
+import os
+
 # Names `torch` also knows, so a caller can pass any of them through.
 DTYPES = ("auto", "float32", "bfloat16", "float16")
+
+# How many threads this process may use for CPU work. Read by the CLI and by
+# the encoders; set by run_scenes.sh, which knows how many workers share the
+# node.
+THREAD_VARIABLE = "PROXY_EXTRACT_THREADS"
+
+
+def thread_budget() -> int:
+    """Threads this worker may use, or 0 for "decide for yourself".
+
+    Zero rather than the core count, so that a single interactive run keeps
+    every library's own default and only a fanned-out run is capped.
+    """
+    try:
+        return max(int(os.environ.get(THREAD_VARIABLE, "0")), 0)
+    except ValueError:
+        return 0
+
+
+def limit_threads(threads: int | None = None) -> int:
+    """Cap this process's CPU thread pools, and say what it settled on.
+
+    Every library here sizes its pool to the whole machine, because each of
+    them assumes it is the only thing running. Sixty-four workers on a 128-core
+    node then ask for thousands of threads between them, and the machine spends
+    its time context-switching: the symptom is every GPU at 0% with no error
+    anywhere, which is a genuinely hard thing to diagnose from the outside.
+
+    OpenCV is the one that matters most - Farneback optical flow is the largest
+    CPU cost in the pipeline and it parallelises over the whole pool - but torch
+    also runs CPU ops between forwards, and both honour this per process.
+
+    OMP_NUM_THREADS has to be set before torch is imported to take full effect,
+    which is the launcher's job; this is the backstop for a worker started by
+    hand, and the only way to reach OpenCV, which does not read that variable.
+
+    On macOS this call is accepted and ignored: those wheels parallelise with
+    GCD, whose pool OpenCV does not control, so `getNumThreads` keeps reporting
+    the core count. The deployment target is Linux, where it takes effect.
+    """
+    threads = thread_budget() if threads is None else threads
+    if threads <= 0:
+        return 0
+
+    try:
+        import cv2
+
+        cv2.setNumThreads(threads)
+    except ImportError:  # pragma: no cover - cv2 is a hard dependency
+        pass
+    try:
+        import torch
+
+        torch.set_num_threads(threads)
+    except ImportError:
+        pass
+    return threads
 
 
 def pick_device(requested: str | None = None) -> str:

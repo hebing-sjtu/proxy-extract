@@ -31,7 +31,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import contract
+from . import accel, contract
 from . import taxonomy as tax
 
 # DATA_F.md's depth video range. Note this is *not* the condition range: the
@@ -301,6 +301,13 @@ def open_encoder(
         out_pix_fmt,
         str(path),
     ]
+    # x264 sizes its own pool at about 1.5x the core count, which is right for
+    # one encode on an idle machine and catastrophic for sixty-four of them on
+    # a shared one. Left alone when no budget is set, so an interactive encode
+    # still gets the whole machine.
+    threads = accel.thread_budget()
+    if threads:
+        command[-1:-1] = ["-threads", str(threads)]
     try:
         process = subprocess.Popen(
             command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE

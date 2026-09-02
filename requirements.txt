@@ -41,6 +41,13 @@ transformers==5.16.1
 accelerate==1.14.0
 safetensors==0.8.0
 huggingface-hub==1.29.0
+# Mask2Former's `__init__` builds its training loss unconditionally, and that
+# loss asks for scipy at construction — for the Hungarian matching it uses to
+# pair predictions with ground truth. Nothing here trains and the loss is never
+# called, but the model will not load without it, so it is not optional:
+#
+#   ImportError: Mask2FormerLoss requires the scipy library
+scipy==1.18.1
 
 # --- tests ---
 pytest==9.1.1

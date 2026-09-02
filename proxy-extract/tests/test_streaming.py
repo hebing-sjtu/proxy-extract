@@ -11,6 +11,8 @@ they replaced.
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
@@ -332,3 +334,98 @@ def test_an_unknown_stream_is_refused_rather_than_ignored():
     assert parse_kept_streams("none") == ()
     with pytest.raises(SystemExit, match="dpeth"):
         parse_kept_streams("dpeth")
+
+
+def test_a_scene_reports_the_stage_it_is_in(long_episode, tmp_path):
+    """A silent worker and a wedged worker look the same from outside.
+
+    An episode takes minutes and a shard takes days, so each of the three
+    stages has to announce itself; without that, diagnosing a stall starts by
+    attaching a debugger to a production process.
+    """
+    said: list[str] = []
+    scene = tmp_path / "seg_000000"
+
+    delivery.extract_scene(
+        long_episode,
+        scene,
+        config=delivery_config(progress=said.append, progress_interval=0.0),
+    )
+
+    assert any("infer" in line for line in said)
+    assert any("derive" in line for line in said)
+    assert any("encode" in line for line in said)
+    assert all(line.startswith("seg_000000") for line in said), said
+
+
+def test_progress_is_not_mistaken_for_a_setting(long_episode, tmp_path):
+    """The report is JSON and records the config, which now holds a callable."""
+    scene = tmp_path / "seg_000000"
+
+    report = delivery.extract_scene(
+        long_episode, scene, config=delivery_config(progress=lambda _line: None)
+    )
+
+    json.dumps(report)  # the run writes this; a callable in it would raise here
+    assert "progress" not in report["config"]
+    assert json.loads((scene / delivery.REPORT_NAME).read_text())["config"]
+
+
+def test_the_thread_budget_reaches_the_encoder(tmp_path, monkeypatch):
+    """x264 sizes its pool at ~1.5x the cores unless told otherwise.
+
+    One encode on an idle machine wants that. Sixty-four of them on a shared
+    node want it very much not, and the resulting thrash reads as an idle
+    cluster rather than as a misconfiguration.
+    """
+    import subprocess
+
+    from proxy_extract import accel, proxy
+
+    monkeypatch.setenv(accel.THREAD_VARIABLE, "3")
+    seen: list[list[str]] = []
+    real = subprocess.Popen
+    monkeypatch.setattr(
+        subprocess, "Popen", lambda cmd, **kw: (seen.append(cmd), real(cmd, **kw))[1]
+    )
+
+    encoder = proxy.open_encoder(tmp_path / "x.mp4", 64, 48, 24, kind="color")
+    encoder.write(np.zeros((48, 64, 3), np.uint8))
+    encoder.close()
+
+    argv = seen[0]
+    assert argv[argv.index("-threads") + 1] == "3"
+    # ffmpeg reads options for the output file before the filename, so a flag
+    # appended after it would be taken as a second output and rejected.
+    assert argv.index("-threads") < len(argv) - 1
+
+
+def test_no_budget_leaves_every_pool_alone(tmp_path, monkeypatch):
+    """An interactive run on an idle machine should use the machine."""
+    import subprocess
+
+    from proxy_extract import accel, proxy
+
+    monkeypatch.delenv(accel.THREAD_VARIABLE, raising=False)
+    assert accel.thread_budget() == 0
+    assert accel.limit_threads() == 0
+
+    seen: list[list[str]] = []
+    real = subprocess.Popen
+    monkeypatch.setattr(
+        subprocess, "Popen", lambda cmd, **kw: (seen.append(cmd), real(cmd, **kw))[1]
+    )
+
+    encoder = proxy.open_encoder(tmp_path / "x.mp4", 64, 48, 24, kind="color")
+    encoder.write(np.zeros((48, 64, 3), np.uint8))
+    encoder.close()
+
+    assert "-threads" not in seen[0]
+
+
+def test_a_quiet_scene_says_nothing_at_all(long_episode, tmp_path):
+    """The default, so that library callers and tests are not printed at."""
+    said: list[str] = []
+    delivery.extract_scene(long_episode, tmp_path / "seg_000000", config=delivery_config())
+
+    assert said == []

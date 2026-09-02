@@ -13,6 +13,7 @@ import json
 import sys
 from pathlib import Path
 
+from . import accel
 from . import cameras as camera_io
 from . import contract
 from .frames import STREAMS as FRAME_STREAMS
@@ -160,6 +161,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     scenes.add_argument(
         "--resume", action="store_true", help="skip scenes whose videos already have every frame"
+    )
+    scenes.add_argument(
+        "--quiet", action="store_true",
+        help="do not report progress; a shard then says nothing until it finishes an episode",
+    )
+    scenes.add_argument(
+        "--progress-interval", type=float, default=30.0, metavar="SECONDS",
+        help="seconds between within-episode progress lines (default: %(default)s)",
+    )
+    scenes.add_argument(
+        "--threads", type=int, default=None, metavar="N",
+        help="cap OpenCV, torch and x264 to N threads each, so that workers sharing a "
+        f"node do not each size their pools to the whole of it; defaults to ${accel.THREAD_VARIABLE}, "
+        "which run_scenes.sh sets from the worker count",
     )
     scenes.add_argument(
         "--keep-going", action="store_true", help="log and continue when an episode fails"
@@ -360,8 +375,25 @@ def _run_extract(args: argparse.Namespace) -> int:
     return 0
 
 
+def _say(message: str) -> None:
+    """One progress line, timestamped and flushed.
+
+    Flushed because a shard's stdout is a log file, not a terminal, so Python
+    block-buffers it: without this a worker that is running normally looks
+    identical to one that is wedged for as long as it takes to fill 8 KB.
+    """
+    import time
+
+    print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
+
+
 def _run_scenes(args: argparse.Namespace) -> int:
     from . import delivery
+    from .accel import limit_threads
+
+    threads = limit_threads(args.threads)
+    if threads and not args.quiet:
+        _say(f"capped at {threads} CPU thread(s) per pool")
 
     videos = resolve_videos(args.video, recursive=args.recursive)
     assignments = delivery.assign_scenes(delivery.episodes_from_videos(videos))
@@ -383,6 +415,8 @@ def _run_scenes(args: argparse.Namespace) -> int:
         split_hero=not args.no_hero_split,
         inverted_duv_depth=args.inverted_duv_depth,
         fps=args.fps,
+        progress=None if args.quiet else _say,
+        progress_interval=args.progress_interval,
         **({"color_crf": args.color_crf} if args.color_crf is not None else {}),
     )
 
@@ -394,11 +428,11 @@ def _run_scenes(args: argparse.Namespace) -> int:
     if args.shard:
         index, _, count = args.shard.partition("/")
         mine = shard(assignments, int(index), int(count))
-        print(f"shard {args.shard}: {len(mine)} of {len(assignments)} episodes")
+        _say(f"shard {args.shard}: {len(mine)} of {len(assignments)} episodes")
         if not mine:
             return 0
     else:
-        print(f"{len(assignments)} episodes -> {args.out}, manifest at {manifest}")
+        _say(f"{len(assignments)} episodes -> {args.out}, manifest at {manifest}")
 
     reports = delivery.deliver_dataset(
         mine,

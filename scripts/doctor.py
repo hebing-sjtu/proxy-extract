@@ -199,12 +199,24 @@ def check_backends() -> list[Result]:
             Result("depth backend", "fail", "neither depth_anything_3 nor transformers", "scripts/setup_venv.sh")
         )
 
-    if _installed("transformers"):
-        results.append(Result("semantic backend", "ok", "transformers installed"))
-    else:
+    if not _installed("transformers"):
         results.append(
             Result("semantic backend", "fail", "transformers missing", "scripts/setup_venv.sh")
         )
+    elif not _installed("scipy"):
+        # Mask2Former builds its training loss in __init__, and that loss
+        # requires scipy at construction. The model will not load without it,
+        # which surfaces as an ImportError from a class nothing here calls.
+        results.append(
+            Result(
+                "semantic backend",
+                "fail",
+                "transformers is here but scipy is not, and Mask2Former will not load without it",
+                "pip install scipy",
+            )
+        )
+    else:
+        results.append(Result("semantic backend", "ok", "transformers and scipy installed"))
     return results
 
 

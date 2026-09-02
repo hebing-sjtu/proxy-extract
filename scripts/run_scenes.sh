@@ -86,6 +86,32 @@ fi
 WORKERS_PER_GPU="${WORKERS_PER_GPU:-6}"
 n_workers=$((N_GPUS * WORKERS_PER_GPU))
 
+# Every CPU library here sizes its thread pool to the whole machine, because
+# each one assumes it is alone on it: OpenCV for the optical flow, torch for
+# the ops between forwards, x264 at about 1.5x the core count per encode. With
+# n_workers processes doing that at once the node asks for thousands of threads
+# and spends its time context-switching instead of working - which shows up as
+# every GPU at 0% with nothing in any log, because nothing has gone wrong.
+#
+# Split the cores evenly instead. At least one each, and never more than four:
+# past that these pools stop scaling and only take cores from the other workers.
+cores="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)"
+if [[ -z "${THREADS_PER_WORKER:-}" ]]; then
+  THREADS_PER_WORKER=$((cores / n_workers))
+  ((THREADS_PER_WORKER < 1)) && THREADS_PER_WORKER=1
+  ((THREADS_PER_WORKER > 4)) && THREADS_PER_WORKER=4
+fi
+
+# The first four are read by the libraries themselves, before this pipeline
+# gets a say, so they have to be in the environment rather than set in code.
+# The last one is ours, and reaches OpenCV and x264, which ignore the rest.
+export OMP_NUM_THREADS="$THREADS_PER_WORKER"
+export MKL_NUM_THREADS="$THREADS_PER_WORKER"
+export OPENBLAS_NUM_THREADS="$THREADS_PER_WORKER"
+export NUMEXPR_NUM_THREADS="$THREADS_PER_WORKER"
+export OPENCV_FOR_THREADS_NUM="$THREADS_PER_WORKER"
+export PROXY_EXTRACT_THREADS="$THREADS_PER_WORKER"
+
 die() { echo "error: $*" >&2; exit 1; }
 
 # ------------------------------------------------------------------ pre-flight
@@ -303,6 +329,7 @@ cat <<EOF
 data       $DATA_DIR  ($episodes episodes)
 out        $OUT_DIR  ($(gib "$avail_mib") GiB free, need ~$(gib "$need_mib") GiB)
 shards     $n_workers ($N_GPUS GPU(s) x $WORKERS_PER_GPU worker(s), ~$((n_workers * GIB_PER_WORKER)) GiB RAM)
+threads    $THREADS_PER_WORKER per worker, of $cores core(s)
 backends   semantic=$SEMANTIC depth=$DEPTH
 frames     $KEEP_FRAMES
 weights    ${HF_HOME:-<default HF cache>}
@@ -343,8 +370,11 @@ done
 pids=()
 for ((i = 0; i < n_workers; i++)); do
   gpu=$((i % N_GPUS))
+  # -u because stdout here is a file, not a terminal, and Python block-buffers
+  # that: without it a healthy shard's log stays empty for minutes at a time,
+  # which is indistinguishable from a hung one.
   CUDA_VISIBLE_DEVICES="$gpu" \
-  $PYTHON -m proxy_extract scenes \
+  $PYTHON -u -m proxy_extract scenes \
     --video "$DATA_DIR" \
     --recursive \
     --out "$OUT_DIR" \
