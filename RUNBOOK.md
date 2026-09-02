@@ -681,9 +681,9 @@ venv 相关的先看这几条：
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
-| `torch.cuda.is_available()` 是 `False` | 驱动/torch 构建不匹配，或装的是 CPU wheel | 确认 `nvidia-smi` 正常；`requirements.txt` 的 torch 在 linux/x86_64 上自带 CUDA |
-| CUDA 起不来，驱动报版本低 | torch 2.13 要驱动 >= 525 | 升驱动，或按 `docker/README.md` 换 torch+cuXXX |
-| 下权重卡住 / 超时 | hub 网络 | `export HF_ENDPOINT=https://hf-mirror.com` 后重跑 fetch |
+| 日志里 `CUDA initialization: The NVIDIA driver on your system is too old`，随后 `Non-CUDA device detected` | torch 的 wheel 是按比驱动更新的 CUDA 构建的，于是**整批 worker 静默退回 CPU**——`nvidia-smi` 照样列出所有卡，`N_GPUS` 照样数对 | 对比 `python -c "import torch; print(torch.version.cuda)"` 和 `nvidia-smi --query-gpu=driver_version --format=csv`；驱动旧就按驱动的 CUDA 重装 torch，如 `--index-url https://download.pytorch.org/whl/cu124`。容器里改不了驱动，只能换 torch。`run_scenes.sh` 现在会在启动前拦下这种情况 |
+| 确实想用 CPU 跑 | — | `N_GPUS=1 ALLOW_CPU=1 scripts/run_scenes.sh` |
+| 下权重卡住 / 超时 | hub 网络 | 先确认是不是集群出网白名单的问题（见第 7 节）；国内节点才需要 `export HF_ENDPOINT=https://hf-mirror.com` |
 | `OSError: ... preprocessor_config.json` | 权重没拉全就跑了离线模式 | 重跑 fetch，确认 `--set` 覆盖了你用的后端 |
 | `no such video: ...` | 路径不对；ABot 那种嵌套目录要加 `--recursive` | 见第 11 节 |
 | `no camera tracks under ...` | `camera/` 目录不在或没有 json | 检查数据集目录结构 |

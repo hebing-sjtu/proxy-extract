@@ -114,6 +114,44 @@ for pair in "semantic=$SEMANTIC" "depth=$DEPTH"; do
   fi
 done
 
+# nvidia-smi listing GPUs is not the same as torch being able to use them: a
+# wheel built for a newer CUDA than the driver leaves torch on CPU, with only a
+# UserWarning to say so. N_GPUS then counts cards nobody can reach and the run
+# proceeds at CPU speed on every shard, which on this workload means it never
+# finishes. Checked against N_GPUS rather than unconditionally, so a deliberate
+# CPU run still works by saying N_GPUS=1 ALLOW_CPU=1.
+if [[ "${ALLOW_CPU:-0}" != "1" ]]; then
+  $PYTHON - "$N_GPUS" <<'PY' || die "torch cannot use this node's GPUs; fix that before launching $N_GPUS workers"
+import sys
+
+import torch
+
+wanted = int(sys.argv[1])
+try:
+    available = torch.cuda.is_available()
+    count = torch.cuda.device_count() if available else 0
+except Exception as error:
+    available, count = False, 0
+    print(f"torch.cuda raised: {type(error).__name__}: {error}", file=sys.stderr)
+
+if not available:
+    print(
+        f"nvidia-smi reports GPUs but torch.cuda.is_available() is False, so all {wanted}\n"
+        f"workers would run on CPU. torch {torch.__version__} was built against CUDA\n"
+        f"{torch.version.cuda}; compare that with `nvidia-smi --query-gpu=driver_version\n"
+        "--format=csv`. If the driver is older, reinstall torch for the driver's CUDA,\n"
+        "e.g. --index-url https://download.pytorch.org/whl/cu124. Set ALLOW_CPU=1 to\n"
+        "proceed anyway.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+if count < wanted:
+    print(f"warning: asked for {wanted} shards but torch sees {count} GPUs", file=sys.stderr)
+print(f"  ok: torch sees {count} GPU(s), CUDA {torch.version.cuda}")
+PY
+fi
+
 # Load both backends and run one tiny inference before committing to thousands
 # of episodes. The heavy imports are lazy, inside the first call, so merely
 # constructing a backend proves nothing — a missing package or an unfetched
