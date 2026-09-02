@@ -28,7 +28,13 @@ imageio-ffmpeg==0.6.0
 #
 # The `+cu126` matters: plain `torch==2.13.0` is already satisfied by the cu130
 # build, so pip would do nothing. run_scenes.sh refuses to launch if this is
-# wrong; `nvidia-smi --query-gpu=driver_version --format=csv` says which it is.
+# wrong, and prints this command with the versions filled in; `nvidia-smi` says
+# in its banner which CUDA the driver goes up to.
+#
+# cu126 rather than a build matching the driver's minor version: within CUDA 12
+# any minor works on any 12.x driver from 525.60.13 up, and cu126 is the oldest
+# 12.x line these versions are built for at all — there is no cu124 wheel for
+# any torch past 2.6, which is why asking for one gets you nothing.
 torch==2.13.0
 torchvision==0.28.0
 transformers==5.16.1

@@ -166,16 +166,55 @@ except Exception as error:
     available, count = False, 0
     print(f"torch.cuda raised: {type(error).__name__}: {error}", file=sys.stderr)
 
+def driver_cuda() -> str:
+    """The highest CUDA the installed driver can run, as nvidia-smi reports it.
+
+    Read from the driver rather than from the toolkit, because there need not
+    be a toolkit: the wheels bundle their own runtime, so the driver is the
+    only thing that constrains which wheel works.
+    """
+    import re
+    import subprocess
+
+    try:
+        out = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    found = re.search(r"CUDA Version:\s*([0-9]+\.[0-9]+)", out)
+    return found.group(1) if found else ""
+
+
 if not available:
+    driver = driver_cuda()
+    # Within a major family any minor works: a cu12x wheel runs on any 12.x
+    # driver from 525.60.13 up. Across families nothing does, which is the
+    # usual version of this failure - a cu130 wheel on a 12.x driver.
+    wheels = {"12": "cu126", "13": "cu130"}
+    tag = wheels.get(driver.split(".")[0], "")
+    version = torch.__version__.split("+")[0]
+
     print(
         f"nvidia-smi reports GPUs but torch.cuda.is_available() is False, so all {wanted}\n"
         f"workers would run on CPU. torch {torch.__version__} was built against CUDA\n"
-        f"{torch.version.cuda}; compare that with `nvidia-smi --query-gpu=driver_version\n"
-        "--format=csv`. If the driver is older, reinstall torch for the driver's CUDA,\n"
-        "e.g. --index-url https://download.pytorch.org/whl/cu124. Set ALLOW_CPU=1 to\n"
-        "proceed anyway.",
+        f"{torch.version.cuda}, and this node's driver goes up to CUDA {driver or '?'}.",
         file=sys.stderr,
     )
+    if tag:
+        try:
+            import torchvision
+
+            vision = f" torchvision=={torchvision.__version__.split('+')[0]}+{tag}"
+        except ImportError:
+            vision = ""
+        print(
+            f"\nInstall the {tag} build of the same versions:\n"
+            f"  pip install --index-url https://download.pytorch.org/whl/{tag} \\\n"
+            f"      torch=={version}+{tag}{vision}\n"
+            f"\nThe +{tag} suffix matters: plain torch=={version} is already satisfied by\n"
+            "the build that is failing here, so pip would do nothing.",
+            file=sys.stderr,
+        )
+    print("\nSet ALLOW_CPU=1 to proceed anyway.", file=sys.stderr)
     raise SystemExit(1)
 
 if count < wanted:

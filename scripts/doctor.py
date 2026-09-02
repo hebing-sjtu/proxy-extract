@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib.metadata
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -99,6 +100,7 @@ def check_torch() -> list[Result]:
     results = [Result("torch", "ok", f"{torch.__version__}, built against CUDA {torch.version.cuda}")]
 
     driver = ""
+    driver_cuda = ""
     if shutil.which("nvidia-smi"):
         try:
             out = subprocess.run(
@@ -110,6 +112,14 @@ def check_torch() -> list[Result]:
             driver = out.stdout.strip().splitlines()[0] if out.stdout.strip() else ""
         except (OSError, subprocess.SubprocessError, IndexError):
             driver = ""
+        try:
+            banner = subprocess.run(
+                ["nvidia-smi"], capture_output=True, text=True, timeout=30
+            ).stdout
+            found = re.search(r"CUDA Version:\s*([0-9]+\.[0-9]+)", banner)
+            driver_cuda = found.group(1) if found else ""
+        except (OSError, subprocess.SubprocessError):
+            driver_cuda = ""
 
     try:
         available = torch.cuda.is_available()
@@ -122,14 +132,23 @@ def check_torch() -> list[Result]:
     if available:
         results.append(Result("cuda", "ok", f"{count} device(s), driver {driver or '?'}"))
     elif shutil.which("nvidia-smi"):
+        # A cu12x wheel runs on any 12.x driver >= 525.60.13, so the fix is to
+        # match the driver's major, not its minor. Across majors nothing works.
+        tag = {"12": "cu126", "13": "cu130"}.get(driver_cuda.split(".")[0], "cu126")
+        version = torch.__version__.split("+")[0]
+        vision = importlib.metadata.version("torchvision") if _installed("torchvision") else ""
+        command = f"          torch=={version}+{tag}"
+        if vision:
+            command += f" torchvision=={vision.split('+')[0]}+{tag}"
         results.append(
             Result(
                 "cuda",
                 "fail",
-                f"nvidia-smi is here (driver {driver or '?'}) but torch.cuda.is_available() is False",
-                "the wheel is built for a newer CUDA than the driver; for a 12.x driver:\n"
-                "      pip install --index-url https://download.pytorch.org/whl/cu126 \\\n"
-                "          torch==2.13.0+cu126 torchvision==0.28.0+cu126",
+                f"nvidia-smi is here (driver {driver or '?'}, up to CUDA {driver_cuda or '?'}) "
+                f"but torch is built for CUDA {torch.version.cuda} and sees no devices",
+                f"install the {tag} build of the same versions:\n"
+                f"      pip install --index-url https://download.pytorch.org/whl/{tag} \\\n"
+                f"{command}",
             )
         )
     else:
