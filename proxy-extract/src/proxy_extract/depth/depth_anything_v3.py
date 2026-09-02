@@ -25,9 +25,9 @@ import types
 
 import numpy as np
 
+from ..accel import pick_device, resolve_dtype
 from ..cameras import CameraTrack
 from .base import DepthResult
-from .depth_anything import pick_device
 
 # Metric out of the box; CC BY-NC 4.0. Non-commercial use only.
 NESTED_CHECKPOINT = "depth-anything/DA3NESTED-GIANT-LARGE-1.1"
@@ -112,7 +112,7 @@ class DepthAnythingV3Backend:
         device: str | None = None,
         process_res: int = 504,
         window: int = 1,
-        dtype: str = "float32",
+        dtype: str = "auto",
     ) -> None:
         if window < 1:
             raise ValueError(f"window must be at least 1, got {window}")
@@ -123,6 +123,7 @@ class DepthAnythingV3Backend:
         self.dtype = dtype
         self._model = None
         self._stubbed: list[str] = []
+        self._resolved_dtype: str | None = None
 
     def _load(self):
         if self._model is None:
@@ -142,8 +143,9 @@ class DepthAnythingV3Backend:
                 ) from exc
 
             self.device = pick_device(self.device)
+            self._resolved_dtype = resolve_dtype(self.dtype, self.device)
             model = DepthAnything3.from_pretrained(self.checkpoint)
-            model = model.to(getattr(torch, self.dtype)).to(self.device).eval()
+            model = model.to(getattr(torch, self._resolved_dtype)).to(self.device).eval()
             self._model = model
         return self._model
 
@@ -205,6 +207,8 @@ class DepthAnythingV3Backend:
                 "checkpoint": self.checkpoint,
                 "process_res": self.process_res,
                 "window": self.window,
+                "device": self.device,
+                "dtype": self._resolved_dtype,
                 "sky_from_backend": bool(sky_masks),
                 "stubbed_submodules": self._stubbed,
                 "single_view": self.window == 1,

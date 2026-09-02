@@ -3,7 +3,8 @@
 #
 #   scripts/run_scenes.sh
 #   DATA_DIR=... OUT_DIR=... N_GPUS=4 scripts/run_scenes.sh
-#   WORKERS_PER_GPU=3 scripts/run_scenes.sh   # fill the GPU's idle CPU phases
+#   WORKERS_PER_GPU=8 scripts/run_scenes.sh   # fill the GPU's idle CPU phases
+#   KEEP_FRAMES=depth scripts/run_scenes.sh   # a third of the space
 #   SCENES_ARGS="--flow-downscale 4" scripts/run_scenes.sh   # cheaper flow
 #
 # One process per GPU, each with --shard i/N so the episode list is partitioned
@@ -44,26 +45,45 @@ if [[ -z "${PYTHON:-}" && -x "$_repo/.venv/bin/python" ]]; then
 fi
 PYTHON="${PYTHON:-python}"
 
-# Measured: 465 MiB per 1800-frame episode, and ~40 GiB peak RSS per worker.
 # Both are checked up front, because running out of either at episode 1200 of
 # 2000 wastes far more than the thirty seconds this costs.
-MIB_PER_SCENE="${MIB_PER_SCENE:-465}"
-GIB_PER_WORKER="${GIB_PER_WORKER:-40}"
+#
+# Space: the per-frame directories dominate, and two of the four are a fixed
+# size because they are raw arrays - at 1280x720, depth is 1.758 MiB a frame
+# and semantic 0.879, so 4.6 GiB per 1800-frame episode before the two image
+# streams. The videos are noise beside that, about 25 MiB an episode. Lower
+# this together with KEEP_FRAMES: dropping to depth alone is ~3.2 GiB.
+#
+# Memory: measured 6.6 GiB flat through the streaming inference stage, plus
+# about 2.4 MiB per frame while the protagonist tracker holds the label stack,
+# so ~11 GiB for a 1800-frame episode. It used to be ~40, which is why one
+# worker per GPU was the old default and six is this one.
+MIB_PER_SCENE="${MIB_PER_SCENE:-5200}"
+GIB_PER_WORKER="${GIB_PER_WORKER:-11}"
+
+# Which per-frame streams to keep. Only depth holds something the videos do not
+# - depth.mp4 quantises float16 metres onto 8 bits - so KEEP_FRAMES=depth keeps
+# the informative half at a third of the space, and KEEP_FRAMES=none delivers
+# videos alone. See RUNBOOK section 4.
+KEEP_FRAMES="${KEEP_FRAMES:-color,depth,semantic,duv}"
 
 if [[ -z "${N_GPUS:-}" ]]; then
   N_GPUS="$(nvidia-smi --list-gpus 2>/dev/null | wc -l | tr -d ' ')"
   [[ "$N_GPUS" -gt 0 ]] || { echo "no GPUs found; set N_GPUS=1 to run on CPU" >&2; exit 1; }
 fi
 
-# Only part of an episode is GPU work. Decoding, the optical-flow stabilisation
-# over the whole 1800-frame stack, and the ffmpeg encodes are all CPU, and the
-# depth model sees one frame per call, so a single worker leaves its GPU idle
-# for long stretches — on an H200 it occupies about 12 of 140 GiB. Stacking
-# workers on a card fills those gaps with another worker's forward pass.
+# Only part of an episode is GPU work. Decoding, the optical-flow stabilisation,
+# the PNG writes and the ffmpeg encodes are all CPU, and DA3 sees one frame per
+# call — its `window` is a multi-view setting, not a batch size, so raising it
+# binds those frames' depth scales together rather than making the pass wider.
+# A single worker therefore leaves its GPU idle for long stretches. Stacking
+# workers on a card is what fills those gaps, with another worker's forward.
 #
-# Host RAM is what bounds this, not VRAM: each worker holds the full 720p depth
-# and label stacks, ~40 GiB. The check below is against the total worker count.
-WORKERS_PER_GPU="${WORKERS_PER_GPU:-1}"
+# Host RAM still bounds this rather than VRAM, but far less tightly than it did:
+# a worker peaks near 11 GiB rather than 40, so six per GPU on eight cards wants
+# roughly 530 GiB. Raise it while `nvidia-smi` shows the cards short of full and
+# the RAM check below stays quiet.
+WORKERS_PER_GPU="${WORKERS_PER_GPU:-6}"
 n_workers=$((N_GPUS * WORKERS_PER_GPU))
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -97,9 +117,9 @@ if [[ "$avail_mib" -lt "$need_mib" ]]; then
        Point OUT_DIR at a bigger filesystem, or deliver fewer episodes."
 fi
 
-# Host RAM. The temporal stages and the protagonist tracker run over the whole
-# episode, so each worker holds the full 720p stacks; this is the number that
-# decides how many workers fit, not the GPU.
+# Host RAM. Inference streams, but the protagonist tracker still has to see
+# every frame before it can name the protagonist, so each worker holds one
+# episode of labels; this is the number that decides how many workers fit.
 if [[ -r /proc/meminfo ]]; then
   total_gib=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 1024 / 1024 ))
   want_gib=$((n_workers * GIB_PER_WORKER))
@@ -243,8 +263,9 @@ gib() { awk -v m="$1" 'BEGIN {printf "%.1f", m / 1024}'; }
 cat <<EOF
 data       $DATA_DIR  ($episodes episodes)
 out        $OUT_DIR  ($(gib "$avail_mib") GiB free, need ~$(gib "$need_mib") GiB)
-shards     $n_workers ($N_GPUS GPU(s) x $WORKERS_PER_GPU worker(s))
+shards     $n_workers ($N_GPUS GPU(s) x $WORKERS_PER_GPU worker(s), ~$((n_workers * GIB_PER_WORKER)) GiB RAM)
 backends   semantic=$SEMANTIC depth=$DEPTH
+frames     $KEEP_FRAMES
 weights    ${HF_HOME:-<default HF cache>}
 extra      ${SCENES_ARGS:-<none>}${DEPTH_OPTIONS:+ }${DEPTH_OPTIONS:-}
 
@@ -252,10 +273,17 @@ EOF
 
 # ---------------------------------------------------------------------- launch
 
-# Space-separated KEY=VALUE, e.g. DEPTH_OPTIONS="window=4 process_res=728".
+# Space-separated KEY=VALUE, e.g. DEPTH_OPTIONS="process_res=728 dtype=float32".
 depth_options=()
 for option in ${DEPTH_OPTIONS:-}; do
   depth_options+=(--depth-backend-option "$option")
+done
+
+# Likewise for the semantic model, whose batch size is the one knob that widens
+# its forward pass: SEMANTIC_OPTIONS="batch_size=8".
+semantic_options=()
+for option in ${SEMANTIC_OPTIONS:-}; do
+  semantic_options+=(--semantic-backend-option "$option")
 done
 
 # Anything else to hand `scenes`, split on spaces, e.g. the stabilisation
@@ -282,7 +310,9 @@ for ((i = 0; i < n_workers; i++)); do
     --out "$OUT_DIR" \
     --semantic-backend "$SEMANTIC" \
     --depth-backend "$DEPTH" \
+    --keep-frames "$KEEP_FRAMES" \
     ${depth_options[@]+"${depth_options[@]}"} \
+    ${semantic_options[@]+"${semantic_options[@]}"} \
     ${scenes_args[@]+"${scenes_args[@]}"} \
     --shard "$i/$n_workers" \
     --resume \

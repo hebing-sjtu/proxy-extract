@@ -20,7 +20,12 @@ COLMAP 稀疏模型 —— **没有深度，也没有语义**。这两路都是�
 <dataset_root>/
 ├── scenes_manifest.json          # 哪个 sample_id 变成了哪个 seg
 ├── seg_000000/
-│   ├── proxy/                    # 本管线派生的一切
+│   ├── frames/                   # 逐帧中间结果，也是交付物的一部分
+│   │   ├── color/000000.png      #   RGB，无损
+│   │   ├── depth/000000.npy      #   float16 米，0 = 无深度
+│   │   ├── semantic/000000.npy   #   uint8 类别 id
+│   │   └── duv/000000.png        #   RGB，无损
+│   ├── proxy/                    # 由 frames/ 编出来的四路视频
 │   │   ├── color.mp4             #   RGB
 │   │   ├── depth.mp4             #   深度灰度
 │   │   ├── semantic.mp4          #   语义 ID
@@ -31,8 +36,32 @@ COLMAP 稀疏模型 —— **没有深度，也没有语义**。这两路都是�
 └── ...
 ```
 
-派生的东西全在 `proxy/` 里，源带来的东西留在外面。这样 `ls` 一眼就能分清哪半边
-是数据集自己的说法、哪半边是我们的预测。
+派生的东西全在 `frames/` 和 `proxy/` 里，源带来的东西留在外面。这样 `ls` 一眼就能
+分清哪半边是数据集自己的说法、哪半边是我们的预测。
+
+### frames/ 和 proxy/ 的关系
+
+`proxy/*.mp4` **完全由 `frames/` 编出来**，先落逐帧、再转视频。所以两者逐帧一致，
+不是两条独立的路径。这么排有两个原因：一是管线可以按帧断点续跑，worker 死在第
+1700 帧不用从头再来；二是 `frames/` 保留了视频编码丢掉的精度。
+
+四路里只有 **depth 是视频复现不出来的**：
+
+| 流 | 逐帧 | 视频 | 逐帧是否更有信息 |
+|---|---|---|---|
+| depth | float16 米 | 8-bit log 灰度 | **是** —— 每码 3.1%，float16 约 0.05% |
+| color | 无损 PNG | libx264 CRF 16 | 略微 |
+| semantic | uint8 id | 无损 RGB 的同一批 id | 否，等价 |
+| duv | 无损 PNG | 无损 RGB | 否，且可由 depth + semantic 完全推出 |
+
+空间代价按 1280×720 算，两路数组是定长的：depth 每帧 1.758 MiB、
+semantic 每帧 0.879 MiB，一段 1800 帧就是 4.6 GiB，还没算两路图像。
+所以哪几路值得留是要选的，
+`--keep-frames` 按流选（见 `RUNBOOK.md` 第 4 节）。跑完只剩 `proxy/` 的话用
+`--keep-frames none`。
+
+`frames/depth/*.npy` 用 `np.load` 直接读，单位是米，`0` 表示天空或未命中 —— 和
+`depth.mp4` 的 `gray == 0` 是同一个约定。
 
 `annotations.tar` 里是 `action.json`（逐帧键鼠输入）、`caption.json`，以及完整的
 `sparse/0/{cameras,images,points3D}.txt` COLMAP 模型（相机内外参在这里）。**不做
@@ -163,8 +192,21 @@ near 0.1 / far 8000 且 255 保留给天空，G/B 是语义**颜色**。
   所以事实写在报告里而不是留给人从后端名字去推。
 - `frames` —— `--resume` 拿它跟四路视频实际的帧数比对。被杀在编码中途的段会留下
   长度不足的 mp4，这个比对会认出来并重跑，而不是让截断的段悄悄进数据集。
+- `frames_kept` —— 这一段实际留下了哪几路逐帧目录。跑到一半改过 `--keep-frames`
+  的数据集里，各段可以不一样，所以写在每段自己的报告里而不是全局记一次。
 
 ## 读取建议
+
+留了 `frames/` 的话，depth 和 semantic 直接读数组最省事，也不掉精度：
+
+```python
+import numpy as np
+
+metres = np.load("seg_000000/frames/depth/000000.npy").astype(np.float32)  # 0 = 无深度
+ids = np.load("seg_000000/frames/semantic/000000.npy")                     # uint8
+```
+
+只有视频的话：
 
 ```python
 import cv2, numpy as np

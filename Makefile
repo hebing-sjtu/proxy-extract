@@ -14,9 +14,13 @@ VPY  := $(VENV)/bin/python
 DATA_DIR ?= /data/binghe/datasets/ABot-World-Explorer-subset2000/data
 OUT_DIR  ?= /data/binghe/datasets/ABot-seg-long-2000
 
-# One episode per worker holds ~40 GiB of host RAM, so this is bounded by
-# MemTotal rather than by VRAM; run_scenes.sh checks it and warns.
-WORKERS_PER_GPU ?= 1
+# A worker peaks near 11 GiB of host RAM, so this is still bounded by MemTotal
+# rather than by VRAM; run_scenes.sh checks it and warns.
+WORKERS_PER_GPU ?= 6
+
+# Which per-frame streams outlive the encode. Only depth holds what the videos
+# cannot; see RUNBOOK section 4 before turning this down.
+KEEP_FRAMES ?= color,depth,semantic,duv
 
 .PHONY: help venv venv-core venv-test venv-fetch doctor scenes scenes-audit preview
 
@@ -38,6 +42,7 @@ help:
 	@echo "  make preview        把 SCENE= 渲成可看的 contact sheet"
 	@echo
 	@echo "路径用 DATA_DIR= 和 OUT_DIR= 覆盖，worker 数用 WORKERS_PER_GPU=。"
+	@echo "逐帧目录保留哪几路用 KEEP_FRAMES=（none / depth / 全部），见 RUNBOOK 第 4 节。"
 	@echo "其余传给 scenes 的 flag 走 SCENES_ARGS=，见 RUNBOOK 第 6 节。"
 
 # DA3=1 because depth_anything_v3 is the default depth backend and cannot go in
@@ -59,7 +64,7 @@ doctor:
 
 scenes:
 	DATA_DIR=$(DATA_DIR) OUT_DIR=$(OUT_DIR) WORKERS_PER_GPU=$(WORKERS_PER_GPU) \
-	  scripts/run_scenes.sh
+	  KEEP_FRAMES=$(KEEP_FRAMES) scripts/run_scenes.sh
 
 scenes-audit:
 	$(VPY) -m proxy_extract scenes-audit --out $(OUT_DIR)

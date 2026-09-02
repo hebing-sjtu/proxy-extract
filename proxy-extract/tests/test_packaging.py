@@ -116,3 +116,85 @@ def test_the_docs_quote_the_encoding_constants_the_encoders_use():
     assert str(proxy.PROXY_SKY_CODE) in text
     assert "h264-logz-gray8" in text
     assert "libx264rgb" in text
+
+
+@needs_checkout
+@pytest.mark.parametrize("doc", ["RUNBOOK.md", "DATA_F.md"])
+def test_the_docs_describe_the_per_frame_layout(doc):
+    """The frame directories are half the delivered bytes; both docs name them.
+
+    Each stream has to appear next to the extension it is written with, since
+    reading `depth` as an image or `color` as an array is the mistake the
+    layout section exists to prevent. The docs draw the tree differently, so
+    match `<stream>/<anything>.<ext>` rather than one spelling of the path.
+    """
+    import re
+
+    from proxy_extract import frames
+
+    text = (ROOT / doc).read_text()
+    assert f"{frames.FRAMES_DIRNAME}/" in text
+
+    # The staging stream is deleted before the scene is done, so it is the
+    # code's business and not the reader's.
+    extensions = dict.fromkeys(frames.ARRAY_STREAMS, "npy")
+    extensions.update(dict.fromkeys(frames.IMAGE_STREAMS, "png"))
+    for stream in frames.STREAMS:
+        extension = extensions[stream]
+        assert re.search(rf"{stream}/\S*\.{extension}", text), (
+            f"{doc} does not show {stream} frames as .{extension}"
+        )
+
+
+@needs_checkout
+def test_the_launcher_keeps_streams_the_cli_knows():
+    """`--keep-frames` deletes things, so the launcher's default must parse."""
+    from proxy_extract.cli import parse_kept_streams
+    from proxy_extract.frames import STREAMS
+
+    launcher = (ROOT / "scripts" / "run_scenes.sh").read_text()
+    makefile = (ROOT / "Makefile").read_text()
+
+    default = ",".join(STREAMS)
+    assert f'KEEP_FRAMES="${{KEEP_FRAMES:-{default}}}"' in launcher
+    assert f"KEEP_FRAMES ?= {default}" in makefile
+    assert parse_kept_streams(default) == STREAMS
+    assert "--keep-frames" in launcher
+
+
+@needs_checkout
+def test_the_launcher_budgets_the_memory_a_worker_actually_takes():
+    """Both numbers decide whether a 2000-episode run survives; keep them paired.
+
+    The RAM figure sets how many workers fit on a node and the space figure
+    whether the output filesystem can hold the result. Each is measured, and
+    each is quoted in the runbook next to how it was measured, so the launcher
+    and the prose have to agree on it.
+    """
+    launcher = (ROOT / "scripts" / "run_scenes.sh").read_text()
+    runbook = (ROOT / "RUNBOOK.md").read_text()
+
+    assert 'GIB_PER_WORKER="${GIB_PER_WORKER:-11}"' in launcher
+    assert "11 GiB" in runbook
+    # The per-scene budget has to cover the frame directories, which are an
+    # order of magnitude past the videos they encode.
+    assert 'MIB_PER_SCENE="${MIB_PER_SCENE:-5200}"' in launcher
+    assert "4.6 GiB" in runbook
+
+
+@needs_checkout
+def test_the_docs_state_the_fixed_cost_of_a_stored_frame():
+    """depth and semantic frames are raw arrays, so their size is arithmetic."""
+    import numpy as np
+
+    from proxy_extract import frames
+    from proxy_extract.delivery import DELIVERY_HEIGHT, DELIVERY_WIDTH
+
+    text = (ROOT / "DATA_F.md").read_text()
+    pixels = DELIVERY_WIDTH * DELIVERY_HEIGHT
+
+    depth_mib = pixels * np.dtype(frames.DEPTH_DTYPE).itemsize / 2**20
+    label_mib = pixels * np.dtype(frames.LABEL_DTYPE).itemsize / 2**20
+
+    assert f"{depth_mib:.3f} MiB" in text
+    assert f"{label_mib:.3f} MiB" in text

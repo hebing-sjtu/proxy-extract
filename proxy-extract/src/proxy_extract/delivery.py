@@ -39,6 +39,7 @@ correspondence.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import time
@@ -48,15 +49,14 @@ from pathlib import Path
 
 import numpy as np
 
-from . import proxy
+from . import frames, proxy, streaming
 from .depth import get_backend as get_depth_backend
-from .depth.scale import apply_range_guard
 from .semantic import get_backend as get_semantic_backend
 from .semantic import get_refiner
 from .semantic.people import split_people
 from .taxonomy import NAMES_OF_TAXONOMY
-from .temporal import flicker_rate, stabilize_pair
-from .video import iter_frames, probe
+from .temporal import DEFAULT_MIN_RUN, DEFAULT_RADIUS, suppress_short_runs
+from .video import iter_frames, prefetch, probe
 
 DELIVERY_WIDTH = 1280
 DELIVERY_HEIGHT = 720
@@ -139,10 +139,36 @@ class DeliveryConfig:
     semantic_backend: str = "standard11"
     semantic_refiner: str = "none"
     size: tuple[int, int] = (DELIVERY_WIDTH, DELIVERY_HEIGHT)
-    # Frames per model call. This bounds activation memory on the GPU, not the
-    # host stacks, which are held whole; see `extract_scene` for their cost.
+    # Frames decoded and handed to the models at a time. Bounds activation
+    # memory on the GPU and nothing else: the host side streams, so this is a
+    # throughput knob rather than a memory ceiling, and it is deliberately not
+    # part of the resume fingerprint.
     chunk_frames: int = 64
-    temporal_radius: int = 2
+    # Decoded batches kept ready on a background thread, so the models are not
+    # waiting on the source filesystem between forwards.
+    prefetch_batches: int = 2
+    temporal_radius: int = DEFAULT_RADIUS
+    temporal_min_run: int = DEFAULT_MIN_RUN
+    # Frames released per flow pass. Larger repeats slightly less optical flow
+    # at the window seams and holds proportionally more frames while doing it.
+    stabilise_block: int = streaming.DEFAULT_BLOCK
+    # Frame writes are handed to this many threads so the models are not
+    # waiting behind PNG encoding and a filesystem. 0 writes inline.
+    writer_threads: int = 4
+    # Which per-frame directories survive the encode, if any. Per stream rather
+    # than all-or-nothing because they are not worth the same:
+    #
+    #   depth     float16 metres. The only one the videos cannot reproduce -
+    #             depth.mp4 quantises this onto 8 bits, losing about 60x.
+    #   color     lossless. color.mp4 is CRF 16, so this is slightly better.
+    #   semantic  the same ids semantic.mp4 already carries losslessly.
+    #   duv       derivable outright from depth and semantic.
+    #
+    # At 1280x720 the two array streams cost 2.64 MiB a frame between them, or
+    # 4.6 GiB per 1800-frame episode, and that is before the images. Over a
+    # corpus this is measured in terabytes, so it is worth saying which ones
+    # are actually wanted.
+    keep_frames: tuple[str, ...] = frames.STREAMS
     flow_compensate: bool = True
     # Optical flow is solved at 1/N of the delivery size and scaled back up.
     # Farneback is quadratic in pixel count and a five-frame window needs four
@@ -173,15 +199,23 @@ def extract_scene(
     semantic_backend=None,
     refiner=None,
 ) -> dict:
-    """Write one scene directory from one RGB episode.
+    """Write one scene directory from one RGB episode, in resumable stages.
 
-    Host memory scales with episode length rather than with a window: a
-    1800-frame episode holds 6.6 GB of float32 depth, 1.7 GB of labels and 1.7
-    GB of flow guide, and the stabilisers allocate their output before freeing
-    their input, so peak resident size lands around 20 GB. That is the price of
-    running the temporal stages and the protagonist tracker over the whole
-    episode at once, which is what makes them equivalent to the batch
-    behaviour the tests cover. Size worker count against it.
+    An episode passes through three of them, and each one's output is on disk
+    before the next starts:
+
+        infer   decode, predict, stabilise; write color/ and depth/ frames
+        derive  suppress runs, split the protagonist; write semantic/ and duv/
+        encode  read the four frame directories back into four videos
+
+    So a worker killed at frame 1700 of 1800 resumes at frame 1700. That used
+    to cost the whole episode, which over a corpus this size is the difference
+    between a run that tolerates a node going away and one that does not.
+
+    Only `derive` needs an episode-sized array, and only of labels: run
+    suppression and the protagonist tracker both have to see every frame before
+    they can decide anything. Everything else streams, so peak resident size is
+    a few GB rather than the ~40 that used to cap workers per GPU at three.
 
     Backends may be passed in already constructed so a batch run loads each
     model once rather than once per episode.
@@ -189,8 +223,6 @@ def extract_scene(
     config = config or DeliveryConfig()
     video, out_dir = Path(video), Path(out_dir)
     started = time.time()
-    proxy_dir = proxy_dir_for(out_dir)
-    proxy_dir.mkdir(parents=True, exist_ok=True)
 
     info = probe(video)
     fps = config.fps or (info.fps if info.fps and info.fps > 0 else 24.0)
@@ -205,16 +237,21 @@ def extract_scene(
     if refiner is None:
         refiner = get_refiner(config.semantic_refiner, **config.refiner_options)
 
-    inferred = _infer(
+    out_dir.mkdir(parents=True, exist_ok=True)
+    proxy_dir_for(out_dir).mkdir(parents=True, exist_ok=True)
+    frames.make_dirs(out_dir)
+    state = _open_state(out_dir, _fingerprint(config, video, fps))
+
+    state = _stage_infer(
         video,
-        proxy_dir / VIDEO_NAMES["color"],
+        out_dir,
         config,
-        fps=fps,
+        state=state,
         depth_backend=depth_backend,
         semantic_backend=semantic_backend,
         refiner=refiner,
     )
-    if not inferred.metric:
+    if not state["metric"]:
         raise DeliveryError(
             f"{config.depth_backend} returned up-to-scale depth, but the delivery videos "
             "encode absolute metres. ABot's COLMAP model is itself only defined up to a "
@@ -222,37 +259,8 @@ def extract_scene(
             "that predicts metric depth."
         )
 
-    depth, labels, guide = inferred.depth, inferred.labels, inferred.guide
-    flicker_before = flicker_rate(labels)
-
-    depth, labels = stabilize_pair(
-        depth,
-        labels,
-        guide_frames=guide,
-        radius=config.temporal_radius,
-        flow_downscale=config.flow_downscale,
-    )
-    del guide
-    inferred.guide = None
-
-    labels, hero_info = split_people(
-        labels, taxonomy=config.taxonomy, enabled=config.split_hero
-    )
-    depth, range_stats = apply_range_guard(
-        depth, near=DELIVERY_NEAR_METRES, far=DELIVERY_FAR_METRES
-    )
-
-    written = _encode(
-        proxy_dir,
-        depth,
-        labels,
-        fps=fps,
-        taxonomy=config.taxonomy,
-        driving=bool(hero_info.get("driving", False)),
-        inverted_duv_depth=config.inverted_duv_depth,
-    )
-    written["color"] = str(proxy_dir / VIDEO_NAMES["color"])
-
+    state = _stage_derive(out_dir, config, state=state)
+    written = _stage_encode(out_dir, config, fps=fps, state=state)
     annotation = _copy_annotation(video, out_dir, annotations)
 
     placeholders = placeholder_backends(depth_backend, semantic_backend, config)
@@ -265,15 +273,14 @@ def extract_scene(
             stacklevel=2,
         )
 
-    names = NAMES_OF_TAXONOMY[config.taxonomy]
     report = {
         "scene": out_dir.name,
         "source_video": str(video),
         "source_size": [info.width, info.height],
-        "frames": len(labels),
+        "frames": state["frames"],
         "size": [width, height],
         "fps": fps,
-        "inference_batches": inferred.batches,
+        "inference_batches": state["batches"],
         "config": {**asdict(config), "size": [width, height]},
         "depth": {
             "backend": getattr(depth_backend, "name", config.depth_backend),
@@ -281,144 +288,364 @@ def extract_scene(
             "encoding": "h264-logz-gray8",
             "near_metres": DELIVERY_NEAR_METRES,
             "far_metres": DELIVERY_FAR_METRES,
-            **range_stats,
-            "meta": inferred.depth_meta,
+            **state["range"],
+            "meta": state["depth_meta"],
         },
         "semantic": {
             "backend": getattr(semantic_backend, "name", config.semantic_backend),
             "refiner": getattr(refiner, "name", None),
             "taxonomy": config.taxonomy,
-            "class_fractions": {
-                names[cls]: round(float((labels == cls).mean()), 6) for cls in np.unique(labels)
-            },
-            "hero_split": hero_info,
-            "flicker_before": flicker_before,
-            "flicker_after": flicker_rate(labels),
-            "meta": inferred.semantic_meta,
+            "class_fractions": state["class_fractions"],
+            "hero_split": state["hero_split"],
+            "flicker_before": state["flicker_before"],
+            "flicker_after": state["flicker_after"],
+            "meta": state["semantic_meta"],
         },
         "duv_depth_inverted": config.inverted_duv_depth,
         "placeholder_backends": placeholders,
         "deliverable": not placeholders,
         "videos": written,
+        "frames_kept": sorted(config.keep_frames),
         "annotation": annotation,
         "elapsed_seconds": round(time.time() - started, 2),
     }
     (out_dir / REPORT_NAME).write_text(json.dumps(report, indent=2))
+
+    # Last, so that everything above can be resumed if it fails. The report is
+    # the marker that says this scene is finished; nothing may outlive it.
+    frames.clear_stage(out_dir)
+    frames.keep_only(out_dir, config.keep_frames)
     return report
 
 
-@dataclass
-class _Inferred:
-    depth: np.ndarray  # (N, H, W) float32 metres, invalid = 0
-    labels: np.ndarray  # (N, H, W) uint8
-    guide: list[np.ndarray] | None  # grayscale frames for flow compensation
-    metric: bool
-    batches: int
-    depth_meta: dict
-    semantic_meta: dict
+# --------------------------------------------------------------------- stages
+
+STATE_NAME = "state.json"
 
 
-def _infer(
+def _state_path(scene_dir: Path) -> Path:
+    return frames.stage_dir_for(scene_dir) / STATE_NAME
+
+
+def _fingerprint(config: DeliveryConfig, video: Path, fps: float) -> str:
+    """What has to match for frames already on disk to be reusable.
+
+    Deliberately not everything in the config. `chunk_frames`,
+    `stabilise_block`, `writer_threads` and `keep_frames` change how the work is
+    divided and never what it produces, so an operator who restarts a run with
+    a bigger batch to fill a larger GPU keeps the frames the smaller one wrote.
+    Anything that would change a pixel is in here.
+    """
+    payload = {
+        "video": str(video),
+        "fps": fps,
+        "size": list(config.size),
+        "depth_backend": config.depth_backend,
+        "depth_backend_options": config.depth_backend_options,
+        "semantic_backend": config.semantic_backend,
+        "semantic_backend_options": config.semantic_backend_options,
+        "semantic_refiner": config.semantic_refiner,
+        "refiner_options": config.refiner_options,
+        "temporal_radius": config.temporal_radius,
+        "temporal_min_run": config.temporal_min_run,
+        "flow_compensate": config.flow_compensate,
+        "flow_downscale": config.flow_downscale,
+        "split_hero": config.split_hero,
+        "inverted_duv_depth": config.inverted_duv_depth,
+    }
+    blob = json.dumps(payload, sort_keys=True, default=str).encode()
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+
+def _open_state(scene_dir: Path, fingerprint: str) -> dict:
+    """Read the working state, discarding it if it describes a different run.
+
+    Resuming onto frames produced by different settings would deliver an
+    episode that is half one thing and half another, and nothing downstream
+    could detect it - the videos would be the right length and the right
+    format. So a fingerprint mismatch throws the frames away rather than
+    trying to reconcile them.
+    """
+    path = _state_path(scene_dir)
+    if path.is_file():
+        try:
+            state = json.loads(path.read_text())
+            if state.get("fingerprint") == fingerprint:
+                return state
+        except (ValueError, OSError):
+            pass
+    for stream in frames.ALL_STREAMS:
+        frames.drop_stream(scene_dir, stream)
+    frames.make_dirs(scene_dir)
+    return {
+        "fingerprint": fingerprint,
+        "stage": "infer",
+        "frames": 0,
+        "batches": 0,
+        "metric": True,
+        "depth_meta": {},
+        "semantic_meta": {},
+    }
+
+
+def _save_state(scene_dir: Path, state: dict) -> None:
+    path = _state_path(scene_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state))
+    tmp.replace(path)
+
+
+def _stage_infer(
     video: Path,
-    color_path: Path,
+    scene_dir: Path,
     config: DeliveryConfig,
     *,
-    fps: float,
+    state: dict,
     depth_backend,
     semantic_backend,
     refiner,
-) -> _Inferred:
-    """Decode once: write the colour video and run both models as we go.
+) -> dict:
+    """Decode once, predict, stabilise, and write colour and depth frames.
 
     One decode pass rather than two. Re-reading the file for the colour track
     would be cheap, but it would also be a second resample of the same source,
     and the delivery set's whole value is that its four streams describe the
     same pixels.
+
+    Restarting re-runs the models over `temporal_radius` frames before the
+    resume point. Those frames are already written and their output is thrown
+    away; what they are for is giving the first frame that is *not* written the
+    same left-hand neighbours it would have had in an uninterrupted run, so the
+    seam is invisible in the result rather than merely small.
     """
     import cv2
 
-    width, height = config.size
-    depth_parts: list[np.ndarray] = []
-    label_parts: list[np.ndarray] = []
-    guide: list[np.ndarray] = []
-    depth_meta: dict = {}
-    semantic_meta: dict = {}
-    metric = True
-    batches = 0
+    if state["stage"] != "infer":
+        return state
 
-    color = proxy.open_encoder(
-        color_path, width, height, fps, kind="color", crf=config.color_crf
+    written_streams = ("color", "depth", frames.STAGING_STREAM)
+    done = frames.complete_through(scene_dir, written_streams)
+    for stream in written_streams:
+        frames.discard_from(scene_dir, stream, done)
+
+    guard = streaming.RangeGuard(near=DELIVERY_NEAR_METRES, far=DELIVERY_FAR_METRES)
+    flicker = streaming.FlickerMeter()
+    if done and "range_state" in state:
+        guard.restore(state["range_state"])
+        flicker.restore(state["flicker_state"])
+
+    window = streaming.WindowStabiliser(
+        radius=config.temporal_radius,
+        flow_downscale=config.flow_downscale,
+        block=config.stabilise_block,
+        flow_compensate=config.flow_compensate,
     )
-    try:
-        for batch in iter_frames(video, size=config.size, chunk=config.chunk_frames):
-            for frame in batch:
-                color.write(frame)
+    infer_from = max(done - config.temporal_radius, 0)
+
+    metric = bool(state["metric"])
+    batches = int(state["batches"])
+    depth_meta: dict = dict(state["depth_meta"])
+    semantic_meta: dict = dict(state["semantic_meta"])
+    decoded = 0
+    total = done
+
+    with _FrameWriter(scene_dir, config.writer_threads) as writer:
+
+        def keep(ordinal: int, metres: np.ndarray, labels: np.ndarray) -> None:
+            nonlocal total
+            if ordinal < done:
+                return
+            writer.array("depth", ordinal, guard.apply(metres))
+            writer.array(frames.STAGING_STREAM, ordinal, labels)
+            total = max(total, ordinal + 1)
+
+        decoding = prefetch(
+            iter_frames(video, size=config.size, chunk=config.chunk_frames),
+            depth=config.prefetch_batches,
+        )
+        for batch in decoding:
+            start, decoded = decoded, decoded + len(batch)
+            if decoded <= infer_from:
+                continue
+
+            # A batch straddling the resume point is decoded whole and inferred
+            # from the point onward; `iter_frames` will not seek, deliberately.
+            offset = max(infer_from - start, 0)
+            batch = batch[offset:]
+            first = start + offset
+
+            for index, frame in enumerate(batch):
+                if first + index >= done:
+                    writer.image("color", first + index, frame)
 
             depth_result = depth_backend.estimate(batch, cameras=None)
             semantic_result = semantic_backend.segment(batch)
             if refiner is not None:
                 semantic_result = refiner.refine(batch, semantic_result)
 
-            depth_parts.append(
-                np.where(depth_result.valid_mask(), depth_result.depth, 0.0).astype(np.float32)
-            )
-            label_parts.append(np.asarray(semantic_result.labels, dtype=np.uint8))
-            if config.flow_compensate:
-                guide.extend(cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY) for frame in batch)
-
+            raw_depth = np.where(
+                depth_result.valid_mask(), depth_result.depth, 0.0
+            ).astype(np.float32)
+            raw_labels = np.asarray(semantic_result.labels, dtype=np.uint8)
             metric = metric and depth_result.metric
             depth_meta, semantic_meta = depth_result.meta, semantic_result.meta
             batches += 1
-    finally:
-        color.close()
 
-    if not depth_parts:
+            for index in range(len(batch)):
+                # The overlap re-inferred for window context was already
+                # measured by the run that wrote it; counting it twice would
+                # weight those frames double in the reported rate.
+                if first + index >= done:
+                    flicker.push(raw_labels[index])
+                guides = (
+                    cv2.cvtColor(batch[index], cv2.COLOR_RGB2GRAY)
+                    if config.flow_compensate
+                    else None
+                )
+                # The window numbers what it was given, and it was given frames
+                # from `infer_from` on, not from the episode's start.
+                for ordinal, metres, labels in window.push(
+                    raw_depth[index], raw_labels[index], guides
+                ):
+                    keep(infer_from + ordinal, metres, labels)
+
+            writer.drain()
+            _save_state(
+                scene_dir,
+                {
+                    **state,
+                    "frames": total,
+                    "batches": batches,
+                    "metric": metric,
+                    "depth_meta": depth_meta,
+                    "semantic_meta": semantic_meta,
+                    "range_state": guard.state(),
+                    "flicker_state": flicker.state(),
+                    "range": guard.stats(),
+                },
+            )
+
+        for ordinal, metres, labels in window.close():
+            keep(infer_from + ordinal, metres, labels)
+
+    if total == 0:
         raise DeliveryError(f"decoded zero frames from {video}")
 
-    return _Inferred(
-        depth=np.concatenate(depth_parts),
-        labels=np.concatenate(label_parts),
-        guide=guide if config.flow_compensate else None,
-        metric=metric,
-        batches=batches,
-        depth_meta=depth_meta,
-        semantic_meta=semantic_meta,
-    )
+    state = {
+        **state,
+        "stage": "derive",
+        "frames": total,
+        "batches": batches,
+        "metric": metric,
+        "depth_meta": depth_meta,
+        "semantic_meta": semantic_meta,
+        "range": guard.stats(),
+        "range_state": guard.state(),
+        "flicker_state": flicker.state(),
+        "flicker_before": flicker.rate,
+    }
+    _save_state(scene_dir, state)
+    return state
 
 
-def _encode(
-    proxy_dir: Path,
-    depth: np.ndarray,
-    labels: np.ndarray,
-    *,
-    fps: float,
-    taxonomy: str,
-    driving: bool,
-    inverted_duv_depth: bool,
+def _stage_derive(scene_dir: Path, config: DeliveryConfig, *, state: dict) -> dict:
+    """Finish the labels, then write the semantic and duv frames.
+
+    The two steps here are the ones that cannot stream. Run suppression asks
+    how long a run of a label lasts, and a run has no length until the episode
+    ends; the protagonist tracker has to compare every person track in the clip
+    before it can say which is the protagonist. Both read labels only, so this
+    holds a byte per pixel per frame - 1.7 GB for a 1800-frame episode - rather
+    than the depth stack that used to dominate.
+    """
+    if state["stage"] not in {"derive", "encode"}:
+        raise DeliveryError(f"cannot derive from stage {state['stage']!r}")
+
+    count = int(state["frames"])
+    if state["stage"] == "derive":
+        labels = frames.read_stack(scene_dir, frames.STAGING_STREAM, count)
+        # In place because this stack was read for these two steps and nothing
+        # else; a defensive copy of it is 1.7 GB that no one reads.
+        labels = suppress_short_runs(
+            labels, min_run=config.temporal_min_run, in_place=True
+        )
+        labels, hero_info = split_people(
+            labels, taxonomy=config.taxonomy, enabled=config.split_hero
+        )
+        standard11 = proxy.to_standard11(labels, config.taxonomy)
+        driving = bool(hero_info.get("driving", False))
+
+        state = {
+            **state,
+            "hero_split": hero_info,
+            "flicker_after": streaming.flicker_rate_of(labels),
+            "class_fractions": streaming.class_fractions(
+                labels, NAMES_OF_TAXONOMY[config.taxonomy]
+            ),
+        }
+        del labels
+
+        done = frames.complete_through(scene_dir, ("semantic", "duv"))
+        for stream in ("semantic", "duv"):
+            frames.discard_from(scene_dir, stream, done)
+
+        with _FrameWriter(scene_dir, config.writer_threads) as writer:
+            for ordinal in range(done, count):
+                metres = frames.read_array(scene_dir, "depth", ordinal)
+                writer.array("semantic", ordinal, standard11[ordinal])
+                writer.image(
+                    "duv",
+                    ordinal,
+                    proxy.compose_proxy_frame(
+                        metres,
+                        standard11[ordinal],
+                        driving=driving,
+                        inverted_depth=config.inverted_duv_depth,
+                    ),
+                )
+
+        state = {**state, "stage": "encode"}
+        _save_state(scene_dir, state)
+        frames.drop_stream(scene_dir, frames.STAGING_STREAM)
+    return state
+
+
+def _stage_encode(
+    scene_dir: Path, config: DeliveryConfig, *, fps: float, state: dict
 ) -> dict[str, str]:
-    """Write the depth, semantic and duv videos frame by frame."""
-    frames, height, width = labels.shape
-    standard11 = proxy.to_standard11(labels, taxonomy)
+    """Read the four frame directories back into the four delivery videos.
+
+    Not resumable, unlike the two stages before it: an mp4 cannot be appended
+    to, and there is nothing to gain by pretending otherwise. It is also the
+    cheapest stage by a wide margin, because every pixel it writes has already
+    been decided.
+    """
+    proxy_dir = proxy_dir_for(scene_dir)
+    count = int(state["frames"])
+    width, height = config.size
 
     encoders = {
         stream: proxy.open_encoder(
-            proxy_dir / VIDEO_NAMES[stream], width, height, fps, kind=_ENCODER_KIND[stream]
+            proxy_dir / VIDEO_NAMES[stream],
+            width,
+            height,
+            fps,
+            kind=_ENCODER_KIND[stream],
+            crf=config.color_crf if stream == "color" else None,
         )
-        for stream in ("depth", "semantic", "duv")
+        for stream in VIDEO_NAMES
     }
     try:
-        for ordinal in range(frames):
-            metres = depth[ordinal]
-            encoders["depth"].write(proxy.encode_depth_frame(metres))
-            encoders["semantic"].write(proxy.encode_semantic_frame(standard11[ordinal]))
-            encoders["duv"].write(
-                proxy.compose_proxy_frame(
-                    metres,
-                    standard11[ordinal],
-                    driving=driving,
-                    inverted_depth=inverted_duv_depth,
-                )
+        for ordinal in range(count):
+            encoders["color"].write(frames.read_image(scene_dir, "color", ordinal))
+            encoders["depth"].write(
+                proxy.encode_depth_frame(frames.read_array(scene_dir, "depth", ordinal))
             )
+            encoders["semantic"].write(
+                proxy.encode_semantic_frame(frames.read_array(scene_dir, "semantic", ordinal))
+            )
+            encoders["duv"].write(frames.read_image(scene_dir, "duv", ordinal))
     finally:
         errors = []
         for encoder in encoders.values():
@@ -429,7 +656,74 @@ def _encode(
         if errors:
             raise proxy.EncodeError("; ".join(errors))
 
-    return {stream: str(proxy_dir / VIDEO_NAMES[stream]) for stream in encoders}
+    return {stream: str(proxy_dir / VIDEO_NAMES[stream]) for stream in VIDEO_NAMES}
+
+
+class _FrameWriter:
+    """Hand frame writes to threads so the models are not waiting on a disk.
+
+    Writing a 1800-frame episode is some 3600 PNG encodes and 3600 array
+    writes, and in the inference stage every one of them falls between two
+    model calls. PNG encoding and file writes both release the GIL, so moving
+    them off the calling thread hides nearly all of it behind the forward pass
+    that follows.
+
+    The queue is bounded, and that is not a detail. A queued write holds its
+    frame alive, so an unbounded queue turns into a copy of the episode in host
+    memory - which is the exact cost the streaming rewrite exists to avoid, and
+    it would arrive silently, as memory growth rather than as a wrong answer.
+    """
+
+    # Enough outstanding writes to keep every thread busy across a slow call,
+    # and few enough that what they pin is measured in frames.
+    QUEUE_PER_THREAD = 8
+
+    def __init__(self, scene_dir: Path, threads: int) -> None:
+        from collections import deque
+
+        self.scene_dir = Path(scene_dir)
+        self.threads = max(int(threads), 0)
+        self.limit = max(self.threads * self.QUEUE_PER_THREAD, 1)
+        self._pool = None
+        self._pending: deque = deque()
+
+    def __enter__(self) -> "_FrameWriter":
+        if self.threads:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._pool = ThreadPoolExecutor(max_workers=self.threads)
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        try:
+            self.drain()
+        finally:
+            if self._pool is not None:
+                self._pool.shutdown(wait=True)
+                self._pool = None
+
+    def _submit(self, fn, *args) -> None:
+        if self._pool is None:
+            fn(*args)
+            return
+        while len(self._pending) >= self.limit:
+            self._pending.popleft().result()
+        self._pending.append(self._pool.submit(fn, *args))
+
+    def array(self, stream: str, ordinal: int, array: np.ndarray) -> None:
+        self._submit(frames.write_array, self.scene_dir, stream, ordinal, array)
+
+    def image(self, stream: str, ordinal: int, rgb: np.ndarray) -> None:
+        self._submit(frames.write_image, self.scene_dir, stream, ordinal, rgb)
+
+    def drain(self) -> None:
+        """Block until every queued write has landed, re-raising the first failure.
+
+        What makes a checkpoint honest: when the state file records N frames, N
+        frames are on disk rather than queued behind a slow filesystem.
+        """
+        while self._pending:
+            self._pending.popleft().result()
 
 
 def _copy_annotation(video: Path, out_dir: Path, annotations: Path | None) -> str | None:

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from ..accel import pick_device
 from ..cameras import CameraTrack
 from .base import DepthResult
 
@@ -20,17 +21,7 @@ from .base import DepthResult
 OUTDOOR_CHECKPOINT = "depth-anything/Depth-Anything-V2-Metric-Outdoor-Small-hf"
 INDOOR_CHECKPOINT = "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf"
 
-
-def pick_device(requested: str | None = None) -> str:
-    import torch
-
-    if requested:
-        return requested
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+__all__ = ["DepthAnythingBackend", "INDOOR_CHECKPOINT", "OUTDOOR_CHECKPOINT", "pick_device"]
 
 
 class DepthAnythingBackend:

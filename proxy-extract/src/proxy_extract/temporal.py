@@ -23,6 +23,10 @@ DEFAULT_RADIUS = 2
 # Suppress runs of a single frame. Raising this trades responsiveness to genuine
 # fast changes for more aggressive flicker removal.
 DEFAULT_MIN_RUN = 2
+# `suppress_short_runs` saturates its run counters into a uint8 to keep a
+# whole-episode buffer affordable, so it cannot represent a threshold a byte
+# cannot hold. Nothing near this is a sensible flicker setting anyway.
+MAX_MIN_RUN = 255
 
 
 def _flow_between(source: np.ndarray, target: np.ndarray, *, downscale: int = 1) -> np.ndarray:
@@ -137,7 +141,9 @@ def _median_at(
     return np.nan_to_num(merged, nan=0.0).astype(np.float32)
 
 
-def suppress_short_runs(labels: np.ndarray, *, min_run: int = DEFAULT_MIN_RUN) -> np.ndarray:
+def suppress_short_runs(
+    labels: np.ndarray, *, min_run: int = DEFAULT_MIN_RUN, in_place: bool = False
+) -> np.ndarray:
     """Erase label runs shorter than `min_run` frames along the time axis.
 
     A majority vote cannot fix the worst case on its own. Perfect frame-to-frame
@@ -146,35 +152,52 @@ def suppress_short_runs(labels: np.ndarray, *, min_run: int = DEFAULT_MIN_RUN) -
     class than of the other, so the vote re-elects the flicker. Collapsing short
     runs attacks it directly, and a genuine sustained change - a run longer than
     `min_run` - passes through untouched.
+
+    `in_place` overwrites the caller's array. A whole episode of labels is 1.7
+    GB, so the defensive copy is worth declining when the caller has just read
+    the stack for this and nothing else.
     """
-    labels = np.asarray(labels, dtype=np.uint8).copy()
+    labels = np.asarray(labels, dtype=np.uint8)
+    if not in_place:
+        labels = labels.copy()
     frames = labels.shape[0]
     if min_run < 2 or frames < 3:
         return labels
 
+    if min_run > MAX_MIN_RUN:
+        raise ValueError(f"min_run must be at most {MAX_MIN_RUN}, got {min_run}")
+
     # Run length at every (frame, pixel): how far the current label extends
-    # backwards, plus how far it extends forwards. Two sequential passes over
-    # the time axis, each vectorised across all pixels.
+    # backwards, plus how far it extends forwards. The only question asked of
+    # either count is whether it reaches `min_run`, so both saturate there and
+    # fit in a byte.
     #
-    # A run cannot be longer than the clip, so the counters only need to hold
-    # `2 * frames` for the sum below. At the 1280x720 delivery size these are
-    # the largest arrays in the process by a wide margin - 3.3 GB each for a
-    # 1800-frame episode - which makes the narrower dtype worth picking.
-    counter = np.int16 if 2 * frames + 1 <= np.iinfo(np.int16).max else np.int32
-    backward = np.ones_like(labels, dtype=counter)
-    for t in range(1, frames):
-        backward[t] = np.where(labels[t] == labels[t - 1], backward[t - 1] + 1, 1)
-    forward = np.ones_like(labels, dtype=counter)
+    # That matters because at the 1280x720 delivery size a whole-episode counter
+    # is the largest array in the process. Holding two of them as int16 cost
+    # 6.6 GB for a 1800-frame episode, which was most of the reason a worker
+    # needed tens of gigabytes and only a few would fit alongside a GPU.
+    #
+    # One buffer serves for both: it is filled with the capped forward count,
+    # then overwritten in place with the verdict, computed against a backward
+    # count that never needs more than the previous frame.
+    short = np.ones_like(labels, dtype=np.uint8)
     for t in range(frames - 2, -1, -1):
-        forward[t] = np.where(labels[t] == labels[t + 1], forward[t + 1] + 1, 1)
-    too_short = (backward + forward - 1) < min_run
+        grown = np.minimum(short[t + 1].astype(np.int16) + 1, min_run)
+        short[t] = np.where(labels[t] == labels[t + 1], grown, 1)
+
+    backward = np.ones(labels.shape[1:], dtype=np.uint8)
+    for t in range(frames):
+        if t:
+            grown = np.minimum(backward.astype(np.int16) + 1, min_run)
+            backward = np.where(labels[t] == labels[t - 1], grown, 1).astype(np.uint8)
+        short[t] = (backward.astype(np.int16) + short[t] - 1) < min_run
 
     # Short runs adopt the label of whatever precedes them. A short run at the
     # very start has nothing before it, so seed those from the future first.
     for t in range(frames - 2, -1, -1):
-        labels[t] = np.where(too_short[t], labels[t + 1], labels[t])
+        labels[t] = np.where(short[t], labels[t + 1], labels[t])
     for t in range(1, frames):
-        labels[t] = np.where(too_short[t], labels[t - 1], labels[t])
+        labels[t] = np.where(short[t], labels[t - 1], labels[t])
     return labels
 
 
@@ -290,6 +313,35 @@ def stabilize_pair(
             ),
         )
 
+    steady_depth, steady_labels = flow_compensated_pair(
+        depth,
+        labels,
+        guide_frames=guide_frames,
+        radius=radius,
+        flow_downscale=flow_downscale,
+    )
+    return steady_depth, suppress_short_runs(steady_labels, min_run=min_run)
+
+
+def flow_compensated_pair(
+    depth: np.ndarray,
+    labels: np.ndarray,
+    *,
+    guide_frames: list[np.ndarray] | None = None,
+    radius: int = DEFAULT_RADIUS,
+    flow_downscale: int = 1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """The window pass alone: median for depth, vote for labels, no run filter.
+
+    Split out from `stabilize_pair` because the two halves need different
+    amounts of context. This one is strictly local - frame `i` reads only
+    `i-radius .. i+radius` - which is what lets a streaming caller hold a
+    handful of frames instead of the episode. Run suppression is not local in
+    the same way, so it gets its own, wider window rather than forcing this one
+    to be conservative for both.
+    """
+    depth = np.asarray(depth, dtype=np.float32)
+    labels = np.asarray(labels, dtype=np.uint8)
     shape = depth.shape[1:]
     if labels.shape[1:] != shape:
         raise ValueError(f"depth is {shape} but labels are {labels.shape[1:]}")
@@ -308,7 +360,7 @@ def stabilize_pair(
         )
         steady_depth[index] = _median_at(depth, index, offsets, flows)
         steady_labels[index] = _vote_at(labels, index, offsets, flows)
-    return steady_depth, suppress_short_runs(steady_labels, min_run=min_run)
+    return steady_depth, steady_labels
 
 
 def flicker_rate(labels: np.ndarray) -> float:

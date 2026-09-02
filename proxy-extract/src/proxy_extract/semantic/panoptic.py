@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from ..accel import pick_device, resolve_dtype
 from ..taxonomy import (
     ADE20K_TO_COARSE6,
     ADE20K_TO_CWM,
@@ -74,6 +75,7 @@ class PanopticBackend:
         checkpoint: str | None = None,
         device: str | None = None,
         batch_size: int = 4,
+        dtype: str = "auto",
     ) -> None:
         if profile not in _PROFILES:
             raise ValueError(f"unknown profile {profile!r}; expected one of {sorted(_PROFILES)}")
@@ -84,21 +86,22 @@ class PanopticBackend:
         self.fallback = fallback
         self.device = device
         self.batch_size = batch_size
+        self.dtype = dtype
         self._model = None
         self._processor = None
         self._lut: np.ndarray | None = None
         self._unmapped: list[str] = []
+        self._resolved_dtype: str | None = None
 
     def _load(self):
         if self._model is None:
-            import torch
-
             from transformers import AutoImageProcessor
 
-            device = self.device or ("cuda" if torch.cuda.is_available() else "cpu")
+            device = pick_device(self.device)
             self._processor = AutoImageProcessor.from_pretrained(self.checkpoint)
             self._model = _load_segmentation_model(self.checkpoint).to(device).eval()
             self.device = device
+            self._resolved_dtype = resolve_dtype(self.dtype, device)
 
             id2label = {int(k): str(v) for k, v in self._model.config.id2label.items()}
             self._lut, self._unmapped = resolve_label_lut(id2label, self.mapping, default=self.fallback)
@@ -114,10 +117,23 @@ class PanopticBackend:
         target_sizes = [(height, width)]
         labels: list[np.ndarray] = []
 
+        # Autocast rather than casting the weights: the normalisation layers
+        # stay in float32, where they are numerically fragile and cost nothing,
+        # while the matmuls that dominate the pass move to tensor cores. The
+        # output is a class id, so the only thing reduced precision can change
+        # is which of two near-tied classes wins a pixel.
+        device_type = self.device.split(":")[0]
+        reduced = self._resolved_dtype != "float32"
+        autocast = torch.autocast(
+            device_type=device_type,
+            dtype=getattr(torch, self._resolved_dtype) if reduced else torch.float32,
+            enabled=reduced,
+        )
+
         for start in range(0, len(frames), self.batch_size):
             batch = frames[start : start + self.batch_size]
             inputs = processor(images=batch, return_tensors="pt").to(self.device)
-            with torch.no_grad():
+            with torch.no_grad(), autocast:
                 outputs = model(**inputs)
             maps = processor.post_process_semantic_segmentation(
                 outputs, target_sizes=target_sizes * len(batch)
@@ -132,6 +148,9 @@ class PanopticBackend:
                 "backend": self.name,
                 "profile": self.profile,
                 "checkpoint": self.checkpoint,
+                "device": self.device,
+                "dtype": self._resolved_dtype,
+                "batch_size": self.batch_size,
                 "unmapped_source_labels": self._unmapped,
             },
         )

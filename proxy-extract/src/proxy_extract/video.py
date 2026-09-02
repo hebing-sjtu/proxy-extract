@@ -113,3 +113,54 @@ def iter_frames(
         capture.release()
     if batch:
         yield batch
+
+
+def prefetch(batches: "Iterator[list[np.ndarray]]", depth: int = 2) -> "Iterator[list[np.ndarray]]":
+    """Pull from `batches` on a background thread, keeping `depth` ready.
+
+    Decoding is not expensive next to a model forward, but it is not free
+    either, and doing it between two forwards leaves the GPU idle for exactly
+    as long as it takes - including however long the source file's filesystem
+    feels like taking, which on network storage is the part that varies. OpenCV
+    releases the GIL while it decodes, so a thread is enough.
+
+    The queue is bounded: a decoder that outruns the models must wait rather
+    than read the whole episode into memory, which is the thing the streaming
+    rewrite exists to avoid.
+    """
+    import queue
+    import threading
+
+    if depth < 1:
+        raise ValueError(f"depth must be >= 1, got {depth}")
+
+    done = object()
+    slots: queue.Queue = queue.Queue(maxsize=depth)
+
+    def pump() -> None:
+        try:
+            for batch in batches:
+                slots.put((batch, None))
+        except BaseException as error:  # noqa: BLE001 - re-raised on the consumer
+            slots.put((None, error))
+        finally:
+            slots.put((done, None))
+
+    thread = threading.Thread(target=pump, daemon=True)
+    thread.start()
+    try:
+        while True:
+            batch, error = slots.get()
+            if error is not None:
+                raise error
+            if batch is done:
+                return
+            yield batch
+    finally:
+        # A consumer that stops early - an exception downstream, say - leaves
+        # the pump blocked on a full queue. Drain it so the thread can finish.
+        while thread.is_alive():
+            try:
+                slots.get_nowait()
+            except queue.Empty:
+                thread.join(timeout=0.1)

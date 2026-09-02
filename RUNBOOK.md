@@ -19,37 +19,52 @@
 
 一条 episode：
 
+一条 episode 走三个阶段，**每个阶段的产物落盘之后下一个才开始**：
+
 ```
 data/<prefix>/<sample_id>/video.mp4   1920x1080, ~1800 帧
         │
-        │  video.iter_frames   解码 + resize 到 1280x720，按 64 帧一批
+        │  video.prefetch(iter_frames)  解码 + resize 到 1280x720，按 64 帧一批，
+        │                               在后台线程上跑，不让 GPU 等磁盘
         ▼
-   ┌─ 每批 ────────────────────────────────────────┐
-   │  color.mp4 边解码边写出（所以它最先出现）       │
-   │  depth 后端    → 米制深度      (GPU)           │
-   │  semantic 后端 → 11 类 ID 图   (GPU)           │
-   └───────────────────────────────────────────────┘
-        │   全片的 depth / labels / 灰度 guide 攒在内存（每 worker 约 40 GiB）
+┌─ 阶段 1  infer ─────────────────────────────── 断点粒度：帧 ──┐
+│  depth 后端    → 米制深度       (GPU)                          │
+│  semantic 后端 → 11 类 ID 图    (GPU)                          │
+│  streaming.WindowStabiliser  滑窗光流补偿：中值 + 多数投票     │
+│                              (CPU，最慢的一段；只持有 ±radius) │
+│  streaming.RangeGuard        逐帧截断到 0.1 / 256 m            │
+│        ↓ 写 frames/color/*.png、frames/depth/*.npy             │
+└────────────────────────────────────────────────────────────────┘
         ▼
-   temporal.stabilize_pair        光流补偿的中值 + 多数投票   (CPU，最慢的一段)
+┌─ 阶段 2  derive ───────────────────────── 断点粒度：帧 ────────┐
+│  temporal.suppress_short_runs   抹掉过短的标签游程                │
+│  semantic.people.split_people   从人物掩码里挑出主角，其余为 NPC  │
+│      两步都必须看完整段，所以这里持有一段的 labels（约 1.6 GiB）  │
+│        ↓ 写 frames/semantic/*.npy、frames/duv/*.png            │
+└────────────────────────────────────────────────────────────────┘
         ▼
-   semantic.people.split_people   从人物掩码里挑出主角，其余为 NPC
-        ▼
-   depth.scale.apply_range_guard  截断到 0.1 / 8000 m
-        ▼
-   delivery._encode               一次写出 depth / semantic / duv 三路
+┌─ 阶段 3  encode ──────────────────── 不可续跑，但最便宜 ───────┐
+│  把四个 frames/ 目录读回来编成四路 mp4                          │
+└────────────────────────────────────────────────────────────────┘
         ▼
 seg_000123/
+    frames/{color,depth,semantic,duv}/NNNNNN.{png,npy}
     proxy/{color,depth,semantic,duv}.mp4
     annotations.tar
     extraction_report.json
 ```
 
-两个时序含义值得先知道：
+三个含义值得先知道：
 
-- **跑到一半 `proxy/` 里只有 `color.mp4` 是正常的**，不是卡住。另外三路要等全片
-  光流稳定做完才一次性写出。想看进度就看 `color.mp4` 有没有在变大。
+- **先落逐帧、再转 mp4**。所以 worker 被杀在第 1700 帧，重跑从 1700 帧继续，不是
+  从头。想看进度就看 `frames/depth/` 里的文件数。
+- **跑到一半没有任何 mp4 是正常的**，不是卡住 —— 四路视频都在阶段 3 一次编出来。
 - 深度和语义**各只前向一次**。`duv.mp4` 是这两者的确定性合成，不是第三次推理。
+
+续跑时阶段 1 会把停下来那一点之前的 `temporal-radius` 帧重新前向一遍。那几帧的
+结果直接丢掉，它们的作用是让**第一帧没写出来的**拿到和不中断时一样的左邻居 ——
+否则接缝两侧会用截断的时间窗做稳定，而这种缺陷没有任何帧数或格式检查看得出来。
+`test_streaming.py` 直接对比了续跑和一次跑完的逐帧结果。
 
 外层编排是 `scripts/run_scenes.sh`：按 `--shard i/N` 把 episode 列表无重叠切开，
 一个 worker 一个进程绑一张卡，`--resume` 让重跑只补缺的，`--keep-going` 让一条坏
@@ -159,21 +174,52 @@ scripts/run_scenes.sh
 ```
 
 启动前它会真的把两个后端各跑一次单帧推理，所以后端装错或权重没拉会在几秒内失败，
-而不是在 2000 条上各失败一次。它同时核对磁盘空间（每条约 465 MiB）和主机内存。
+而不是在 2000 条上各失败一次。它同时核对磁盘空间和主机内存 —— 两个数都随
+`KEEP_FRAMES` 变，见下面的「体积」。
 
 ### 开几个 worker
 
-默认按 `nvidia-smi` 数出的卡数开进程，一卡一个。但一条 episode 里只有模型前向用
-GPU —— 解码、全片光流稳定、ffmpeg 编码全是 CPU，深度模型又是一次一帧 —— 所以单
-worker 会让卡大段空转（H200 上实测只占 140 GiB 里的 12 GiB）。想填满就多开：
+默认 `WORKERS_PER_GPU=6`。一条 episode 里只有模型前向用 GPU —— 解码、光流稳定、
+PNG 写盘、ffmpeg 编码全是 CPU，深度模型又是一次一帧 —— 所以单 worker 会让卡大段
+空转。填满卡的办法是在一张卡上叠 worker，让别人的前向填进这些空档：
 
 ```bash
-WORKERS_PER_GPU=3 make scenes
+WORKERS_PER_GPU=8 make scenes
 ```
 
-**能开几个由主机内存决定，不是显存。** 每个 worker 要把整条 episode 的 720p
-depth/label 栈放在内存里，约 40 GiB，脚本会按总数核对 `MemTotal` 并在不够时警告。
-8 个 worker 就要约 320 GiB。
+**能开几个仍然由主机内存决定，不是显存**，但比以前宽得多。实测一个 worker 峰值
+约 **11 GiB**（阶段 1 恒定 6.6 GiB，阶段 2 每帧再加约 2.4 MiB），过去是约 40 GiB
+——这正是默认值从 1 变成 6 的原因。8 卡 × 6 worker 约 530 GiB，脚本会按总数核对
+`MemTotal` 并在不够时警告。
+
+显存这边没有预检，因为每 worker 占多少取决于后端和 `process_res`，没实测过的数
+写进脚本只会变成一个假的保证。跑起来之后自己看一眼：
+
+```bash
+nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv -l 5
+```
+
+利用率没到顶而显存还有富余就加 `WORKERS_PER_GPU`。加过头的后果是有界的：一个
+worker 一个进程，CUDA OOM 只杀一个 shard，重跑 `make scenes` 会从它写到的那一帧
+接着走。
+
+> **DA3 的 `window` 不是 batch size。** 它是多视图设置：`window=4` 会把这 4 帧当成
+> 同一场景的 4 个视角，把它们的深度尺度绑在一起，而不是把前向做宽。所以填满 GPU
+> 只能靠叠 worker。语义模型那边可以真的加宽：
+> `SEMANTIC_OPTIONS="batch_size=8"`。
+
+### 精度
+
+两个后端默认 `dtype=auto`：CUDA 上取 **bfloat16**（Ampere 及以后），其余取
+float32。bfloat16 而不是 float16，是因为它保留 float32 的指数范围 —— 深度是米，
+跨 0.1 到几千，一个会在这个量程中途上溢的格式恰好会在没人检查的地方出错。
+
+这是整条管线上单个最大的吞吐杠杆，也不是白拿的。第一次上机时建议拿一条 episode
+两边各跑一次比一比：
+
+```bash
+DEPTH_OPTIONS="dtype=float32" SEMANTIC_OPTIONS="dtype=float32" ...
+```
 
 ### 单条手跑
 
@@ -204,20 +250,34 @@ shell 循环里等。
 
 ### 体积
 
-单帧字节数（真实 episode 前 600 帧实测除以帧数；`duv` 最大是因为 R 通道扛着 log-z
-的全部细节）：
+四路视频约 **465 MiB / 1800 帧**（`duv` 最大，因为 R 通道扛着 log-z 的全部细节），
+2000 条约 0.89 TiB。逐帧目录比它大一个数量级：
 
-| 流 | 600 帧 | 折算 1800 帧 |
-| --- | --- | --- |
-| `duv.mp4` | 68.3 MiB | 205 MiB |
-| `depth.mp4` | 44.4 MiB | 133 MiB |
-| `color.mp4` | 29.4 MiB | 88 MiB |
-| `semantic.mp4` | 12.2 MiB | 37 MiB |
-| 合计 + tar | 155 MiB | **≈ 465 MiB** |
+| 流 | 逐帧 / 帧 | 逐帧 / 1800 帧 | 视频 / 1800 帧 |
+| --- | --- | --- | --- |
+| `depth` | 1.758 MiB（定长） | 3.09 GiB | 133 MiB |
+| `semantic` | 0.879 MiB（定长） | 1.55 GiB | 37 MiB |
+| `color` | 取决于画面 | — | 88 MiB |
+| `duv` | 取决于画面 | — | 205 MiB |
+| 合计 | | **≥ 4.6 GiB** | ≈ 465 MiB |
 
-**2000 条约 0.89 TiB**，是源 RGB（约 211 GiB）的 4.3 倍，每个 scene 6 个文件，
-全集约 1.2 万个文件。深度进的是无损视频而不是逐帧 `.f32` —— 走 `condition_root`
-那条路总量差不多（约 850 GiB）但文件数约 700 万，ceph 上这是决定性的差别。
+两路数组是**定长**的，因为它们就是原始数组；两路 PNG 取决于内容，合成素材上很小，
+真实游戏画面上会大得多。**全留的话 2000 条要按 10 TiB 以上准备**，文件数约 1400 万
+—— ceph 上后面这个数和前面一样要紧。
+
+所以 `KEEP_FRAMES` 是要选的，按流选：
+
+```bash
+KEEP_FRAMES=depth make scenes    # 只留视频复现不出来的那一路，约 3.2 GiB/段
+KEEP_FRAMES=none  make scenes    # 只要四路视频，回到 465 MiB/段
+```
+
+哪一路值得留见 `DATA_F.md` 的对照表。一句话：**只有 depth 是视频复现不出来的**
+（8-bit log 每码 3.1%，float16 约 0.05%）；`duv` 完全可以由 depth + semantic 推
+出来，`semantic.mp4` 本来就是同一批 id 的无损编码。
+
+注意逐帧目录不影响断点续跑的能力 —— 它在跑的过程中总是存在的，`KEEP_FRAMES` 只
+决定编完 mp4 之后删不删。
 
 ---
 
@@ -369,10 +429,12 @@ DA3 也支持多帧联合重建（它是 any-view 模型）：
 ```bash
 --depth-backend-option window=4        # 窗口内的帧当作同一场景的多个视角
 --depth-backend-option process_res=728 # 默认 504；调高更清晰也更慢
+--depth-backend-option dtype=float32   # 默认 auto，即 CUDA 上 bfloat16
 ```
 
 `window > 1` 时该窗口内的尺度绑定在一起。默认 `window=1` 即逐帧 —— 动态场景下多视角
-假设不成立，所以不默认打开。
+假设不成立，所以不默认打开。**也别把它当 batch size 用**：调大它是在改模型看到的
+东西，不是在把前向做宽。
 
 ---
 
@@ -393,17 +455,22 @@ IO，也不要预拆帧**。下面是本机（macOS，CPU 单机）在真实 ABo
 CPU 侧合计约 475 秒，占整条 episode 的四成，这段时间 GPU 是空的 —— 这就是显存只占
 零头、算力断断续续的原因。
 
-**为什么不预拆帧**：解码只占 4 秒。把 1800 帧 720p 写成文件再读回来是 5 GB 的额外写
-加 5 GB 的额外读（原始帧 1280×720×3 = 2.76 MB），换的是那 4 秒里的一部分。方向是反的。
+**关于预拆帧**：曾经的结论是「不要预拆帧」，理由是解码只占 4 秒，而把 1800 帧写出来
+再读回来是几 GB 的额外读写 —— 拿 IO 换那 4 秒，方向是反的。**这个理由现在仍然成立，
+但管线还是落了逐帧**，因为落盘买的不是解码时间，是另外两样东西：按帧续跑，以及
+`frames/depth` 这个视频复现不出来的交付物。代价是真实的（每段 ≥ 4.6 GiB 的写），
+所以它是可选的 —— `KEEP_FRAMES=none` 仍然会在跑的过程中落盘（续跑要它），只是编完
+mp4 就删。
 
 **按性价比该调什么**：
 
-1. `WORKERS_PER_GPU=3`。不缩短单条 episode，但让别的 worker 的前向填进那 475 秒空档，
-   吞吐提升最直接，且不改变任何输出。上限是主机内存，不是显存。
-2. 光流共享（已默认生效）。`stabilize_depth` 和 `stabilize_labels` 原来各算一遍**完全
+1. `WORKERS_PER_GPU`（默认 6）。不缩短单条 episode，但让别的 worker 的前向填进那
+   475 秒空档，吞吐提升最直接，且不改变任何输出。上限是主机内存，不是显存。
+2. `dtype=auto`（已默认）。CUDA 上两个模型都跑 bfloat16，是单个最大的杠杆。见第 3 节。
+3. 光流共享（已默认生效）。`stabilize_depth` 和 `stabilize_labels` 原来各算一遍**完全
    相同**的 Farneback 光流，现在 `stabilize_pair` 只算一遍。实测 483 → 382 秒，省 21%，
    输出逐位一致（`TestSharedFlow` 钉住了这一点）。
-3. 剩下的都是取舍，默认没开：
+4. 剩下的都是取舍，默认没开：
    - `--flow-downscale 4`：光流在真实 720p guide 上的实测成本是 ds1 366.6s /
      **ds2 101.4s（默认）** / ds4 29.1s（均按 1800 帧折算），所以从默认换到 ds4 省
      **72 秒**，稳定化 382 → 约 310 秒。质量代价没有在真实内容上量到：合成平移片段上
@@ -416,7 +483,7 @@ CPU 侧合计约 475 秒，占整条 episode 的四成，这段时间 GPU 是空
      不是白捡。
 
 怎么传：`scenes` 直接加这些 flag；走 `run_scenes.sh` 用 `SCENES_ARGS` 透传，例如
-`SCENES_ARGS="--flow-downscale 4" WORKERS_PER_GPU=3 make scenes`。启动时打印的
+`SCENES_ARGS="--flow-downscale 4" WORKERS_PER_GPU=8 make scenes`。启动时打印的
 `extra` 一行会回显，确认没打错。
 
 ### 光流的取舍
@@ -440,20 +507,40 @@ Farneback 对像素数的平方关系。默认值就按这个定的。
 
 ### 内存怎么来的
 
-600 帧实测峰值 RSS **13.3 GiB**。每一项都是「每帧数组 × 帧数」，没有别的量级项，
-所以线性外推到 1800 帧是**约 40 GiB**（第一次在 H200 上跑满 1800 帧时请复核这个数）。
+本机实测峰值 RSS，按阶段分：
 
-内存随 episode 长度走、不随窗口走，因为时序稳定和主角跟踪都跑在整段上 —— 这样它们
-跟测试覆盖的批处理行为完全等价，不需要为流式再引入一套近似。峰值里除了三个主栈
-（深度 6.6 GB、标签 1.7 GB、光流引导 1.7 GB）之外，还有稳定器在释放输入前先分配的
-输出、`np.concatenate` 的双份、以及 range guard 的临时量。
+| 帧数 | 阶段 1 infer | 阶段 2 derive（累计峰值） |
+| --- | --- | --- |
+| 600 | 6.46 GiB | 7.63 GiB |
+| 1200 | 6.64 GiB | 9.24 GiB |
 
-`--chunk-frames`（默认 64）管的是 GPU 上单次前向的激活量，**不管**这些主机端的栈。
+**阶段 1 不随 episode 长度走**（600 → 1200 帧只动了 0.2 GiB）：滑窗只持有
+`stabilise_block + 2 × radius` 帧，默认 132 帧。剩下的是每批的模型输出和预取队列，
+都由 `--chunk-frames` 定，跟总长无关。
 
-要省的话按性价比排：按 `probe` 的帧数预分配以消掉 `concatenate` 的双份（约省 6.6 GB）、
-range guard 改成原地（再省 6.6 GB）、深度栈降到 float16（再省 3.3 GB，而 8-bit 对数
-量化的步长是 3.1%，float16 的精度远远够）。这些都还没做，因为当前判断是主机内存不是
-瓶颈。
+**阶段 2 随长度线性**，约 2.4 MiB/帧：`suppress_short_runs` 和 `split_people` 都
+必须看完整段才能定一个结论 —— 一段游程有多长要到片尾才知道，哪个人是主角要比完
+全片的所有人物轨迹才知道。所以这里持有一段的 labels，但只是 labels，一像素一字节，
+不是过去那个 float32 的深度栈。
+
+线性外推到 1800 帧是**约 11 GiB**，过去是约 40 GiB。上面这些是在一台笔记本上用
+合成后端量的，第一次上 H200 时请拿真后端复核一遍 —— 模型自己的分配器也算在
+worker 的 RSS 里，而合成后端什么都不分配：
+
+```bash
+python scripts/measure_footprint.py --frames 1800 \
+    --depth-backend depth_anything_v3 --semantic-backend standard11
+```
+
+它按 `run_scenes.sh` 的变量名把 `GIB_PER_WORKER` 和 `MIB_PER_SCENE` 直接打出来。
+
+要再省的话，剩下的都在阶段 2：`split_people` 里 `person_masks` 和 `labels.copy()`
+各占一份整段（各约 0.9 MiB/帧）。没做，因为 11 GiB 下 8 卡 × 6 worker 只要 530 GiB，
+瓶颈已经不在这里。
+
+`--chunk-frames`（默认 64）管的是 GPU 上单次前向的激活量和每批输出的大小；
+`--stabilise-block`（默认 128）管滑窗持有多少帧。两者都不影响输出，也都不在续跑的
+指纹里 —— 换更大的卡重启一次跑，之前写好的帧照样接着用。
 
 ---
 
@@ -494,7 +581,7 @@ torch 版本与 `torch.cuda.is_available()`（对上 nvidia-smi 的驱动号）�
 | `OSError: ... preprocessor_config.json` | 权重没拉全就跑了离线模式 | 重跑 fetch，确认 `--set` 覆盖了你用的后端 |
 | `no video.mp4 under ...` | 忘了 `--recursive`；ABot 是嵌套目录 | 见第 3 节 |
 | 跑到一半 scene 的 `proxy/` 里只有 `color.mp4` | 正常，不是卡住 | 见第 0 节 |
-| GPU 显存只占零头、利用率断断续续 | 一条 episode 里只有模型前向是 GPU | `WORKERS_PER_GPU=3`，见第 3 节 |
+| GPU 显存只占零头、利用率断断续续 | 一条 episode 里只有模型前向是 GPU | 加 `WORKERS_PER_GPU`（默认 6），见第 3 节 |
 | 觉得瓶颈是磁盘 / 想先把视频拆成帧 | 解码只占 4 秒 | 别这么做，见第 6 节 |
 | preview 颜色不对 | 手动指定了错的调色板 | 别传，让它自己从 report 读 |
 | 交付的语义看着完全不对 | 很可能用了 `synthetic` 占位后端 | 查 report 的 `deliverable` 字段，见第 4 节 |

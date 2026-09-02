@@ -15,8 +15,11 @@ from pathlib import Path
 
 from . import cameras as camera_io
 from . import contract
+from .frames import STREAMS as FRAME_STREAMS
 from .pipeline import ExtractionConfig, condition_dir_for, extract_clip, extract_dataset, shard
 from .proxy import DEFAULT_COLOR_CRF
+from .streaming import DEFAULT_BLOCK
+from .temporal import DEFAULT_MIN_RUN
 
 DEPTH_BACKENDS = ("mapanything", "depth_anything", "depth_anything_v3", "synthetic")
 SEMANTIC_BACKENDS = ("ade20k", "cityscapes", "coarse6", "standard11", "synthetic")
@@ -79,7 +82,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     scenes = sub.add_parser(
         "scenes",
-        help="write DATA_F.md delivery segments (1280x720 color/depth/semantic/duv + annotations)",
+        help="write DATA_F.md delivery segments: per-frame frames/ plus the four "
+        "1280x720 videos derived from them, and the source annotations",
     )
     scenes.add_argument(
         "--video", type=Path, nargs="+", required=True,
@@ -98,12 +102,39 @@ def build_parser() -> argparse.ArgumentParser:
         "e.g. --depth-backend-option window=4 for DA3's multi-view mode",
     )
     scenes.add_argument("--semantic-backend", choices=SEMANTIC_BACKENDS, default="standard11")
+    scenes.add_argument(
+        "--semantic-backend-option", action="append", default=[], metavar="KEY=VALUE",
+        help="pass a keyword to the semantic backend's constructor, repeatable; "
+        "e.g. --semantic-backend-option batch_size=16 to fill a larger GPU",
+    )
     scenes.add_argument("--refiner", choices=REFINERS, default="none")
     scenes.add_argument(
         "--chunk-frames", type=int, default=64, metavar="N",
-        help="frames per model call; bounds GPU activation memory, not the host stacks",
+        help="frames decoded and handed to the models at a time; bounds GPU activation "
+        "memory. The host side streams, so this is a throughput knob, not a memory ceiling",
+    )
+    scenes.add_argument(
+        "--stabilise-block", type=int, default=DEFAULT_BLOCK, metavar="N",
+        help=f"frames released per flow pass (default {DEFAULT_BLOCK}); larger repeats "
+        "slightly less optical flow at the window seams and holds more frames while doing it",
+    )
+    scenes.add_argument(
+        "--writer-threads", type=int, default=4, metavar="N",
+        help="threads writing per-frame files, so the models are not waiting on a disk; "
+        "0 writes inline",
+    )
+    scenes.add_argument(
+        "--keep-frames", default=",".join(FRAME_STREAMS), metavar="STREAMS",
+        help="which per-frame directories survive the encode, comma separated, or 'none' "
+        f"(default {','.join(FRAME_STREAMS)}). Only depth carries what the videos cannot: "
+        "depth.mp4 quantises float16 metres onto 8 bits. duv is derivable from depth and "
+        "semantic, and semantic.mp4 already holds the same ids losslessly",
     )
     scenes.add_argument("--temporal-radius", type=int, default=2)
+    scenes.add_argument(
+        "--temporal-min-run", type=int, default=DEFAULT_MIN_RUN, metavar="N",
+        help=f"erase label runs shorter than N frames (default {DEFAULT_MIN_RUN})",
+    )
     scenes.add_argument("--no-flow-compensate", action="store_true")
     scenes.add_argument(
         "--flow-downscale", type=int, default=2, metavar="N",
@@ -111,7 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     scenes.add_argument(
         "--color-crf", type=int, default=None,
-        help=f"x264 quality for high_color.mp4 (default {DEFAULT_COLOR_CRF}); 0 is lossless",
+        help=f"x264 quality for proxy/color.mp4 (default {DEFAULT_COLOR_CRF}); 0 is lossless",
     )
     scenes.add_argument(
         "--inverted-duv-depth", action="store_true",
@@ -209,6 +240,28 @@ def parse_backend_options(pairs: list[str]) -> dict:
         except (ValueError, SyntaxError):
             options[key] = value
     return options
+
+
+def parse_kept_streams(value: str) -> tuple[str, ...]:
+    """Read `--keep-frames` into the stream names delivery expects.
+
+    Named rather than numbered, and refused rather than ignored when unknown:
+    getting this wrong deletes the expensive half of a scene, and a typo that
+    silently kept nothing would not be noticed until the run was over.
+    """
+    text = value.strip().lower()
+    if text in {"none", ""}:
+        return ()
+    if text == "all":
+        return FRAME_STREAMS
+    chosen = tuple(part.strip() for part in text.split(",") if part.strip())
+    unknown = [name for name in chosen if name not in FRAME_STREAMS]
+    if unknown:
+        raise SystemExit(
+            f"--keep-frames does not know {', '.join(unknown)}; "
+            f"expected some of {', '.join(FRAME_STREAMS)}, or none"
+        )
+    return chosen
 
 
 def resolve_videos(paths: list[Path], *, recursive: bool = False) -> list[Path]:
@@ -317,9 +370,14 @@ def _run_scenes(args: argparse.Namespace) -> int:
         depth_backend=args.depth_backend,
         depth_backend_options=parse_backend_options(args.depth_backend_option),
         semantic_backend=args.semantic_backend,
+        semantic_backend_options=parse_backend_options(args.semantic_backend_option),
         semantic_refiner=args.refiner,
         chunk_frames=args.chunk_frames,
+        stabilise_block=args.stabilise_block,
+        writer_threads=args.writer_threads,
+        keep_frames=parse_kept_streams(args.keep_frames),
         temporal_radius=args.temporal_radius,
+        temporal_min_run=args.temporal_min_run,
         flow_compensate=not args.no_flow_compensate,
         flow_downscale=args.flow_downscale,
         split_hero=not args.no_hero_split,
