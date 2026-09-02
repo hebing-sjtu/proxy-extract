@@ -385,6 +385,41 @@ KEEP_FRAMES=none  make scenes    # 只要四路视频，回到 465 MiB/段
 
 ## 4. 验收
 
+### 哪些序列已经跑完，怎么取回来看
+
+一轮 2000 条要跑十几个小时，不必等它跑完。**「完成」有一个确切的判据**：四路视频
+都能打开，且帧数与 `extraction_report.json` 自称的帧数一致 —— 跟 `--resume` 用的是
+同一个检查，所以被杀在编码中途留下的那种「四个文件都在、其中几个是短的」不会被算
+进来。列出来：
+
+```bash
+.venv/bin/python -m proxy_extract scenes-audit \
+  --out /data/binghe/datasets/ABot-seg-long-2000 --list complete
+```
+
+一行一个 `seg_NNNNNN`，只有名字，是给管道用的（`--list incomplete` / `missing` 看
+另外两类）。跑的过程中随时可以问，它不统计体积，所以不会去 stat 那几百万个逐帧文件。
+
+取回本地：
+
+```bash
+ssh node '/workspace/proxy-extract/.venv/bin/python -m proxy_extract scenes-audit \
+    --out /data/binghe/datasets/ABot-seg-long-2000 --list complete' > done.txt
+
+rsync -ar --files-from=done.txt --exclude 'frames/' \
+  node:/data/binghe/datasets/ABot-seg-long-2000/ ./scenes/
+```
+
+两个地方会咬人：
+
+- **`-r` 必须显式给。**`--files-from` 会关掉递归，`-a` 里的那个也不算数 —— 少了它
+  rsync 正常退出、一个文件都不复制。
+- **`--exclude 'frames/'` 决定了这是 465 MiB 还是 5 GiB 一条。**逐帧目录比视频大一
+  个数量级（见第 3 节「体积」），检视根本用不上；要的是 `proxy/` 四路视频加
+  `extraction_report.json`，上面这条命令拿的就是这些。
+
+拿回来之后别用播放器看，用下面的 contact sheet。
+
 ### 交付格式是设计上不可直视的
 
 `semantic.mp4` 把类别 ID 0–10 放在蓝通道，直接播放几乎全黑；`depth.mp4` 是 log-z

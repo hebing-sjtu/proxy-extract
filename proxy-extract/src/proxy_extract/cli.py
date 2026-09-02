@@ -191,6 +191,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     audit.add_argument("--out", type=Path, required=True)
     audit.add_argument("--report", type=Path, help="also write the JSON here")
+    audit.add_argument(
+        "--list", dest="listing", choices=("complete", "incomplete", "missing"),
+        help="print the scene names in this state, one per line, instead of the summary; "
+        "complete means all four videos hold every frame the report claims, so the list "
+        "is safe to hand to rsync while the run is still going",
+    )
 
     validate = sub.add_parser("validate", help="re-read a condition_root and check it")
     validate.add_argument("--condition-root", type=Path, required=True)
@@ -470,6 +476,12 @@ def _run_scenes(args: argparse.Namespace) -> int:
 
 def _run_scenes_audit(args: argparse.Namespace) -> int:
     from . import delivery
+
+    if args.listing:
+        # Names alone, nothing else on stdout: this is meant to be piped.
+        for scene in delivery.list_scenes(args.out, args.listing):
+            print(scene)
+        return 0
 
     summary = delivery.audit(args.out)
     print(json.dumps(summary, indent=2))

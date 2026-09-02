@@ -371,6 +371,37 @@ def test_progress_is_not_mistaken_for_a_setting(long_episode, tmp_path):
     assert json.loads((scene / delivery.REPORT_NAME).read_text())["config"]
 
 
+def test_the_finished_scenes_can_be_listed_while_the_rest_are_running(long_episode, tmp_path):
+    """Taking delivery of a long run in pieces needs a list, not a percentage.
+
+    And the list has to hold the same line as `--resume`: a scene killed
+    mid-encode leaves four openable files of which some are short, and if that
+    counted as complete it would be copied away and inspected as if it were.
+    """
+    from proxy_extract import delivery
+
+    out = tmp_path / "out"
+    episodes = [(f"ep{index}", long_episode, None) for index in range(3)]
+    assignments = delivery.assign_scenes(episodes)
+    delivery.write_manifest(out, assignments)
+
+    assert delivery.list_scenes(out, "missing") == ["seg_000000", "seg_000001", "seg_000002"]
+    assert delivery.list_scenes(out) == []
+
+    delivery.extract_scene(long_episode, out / "seg_000001", config=delivery_config())
+    assert delivery.list_scenes(out) == ["seg_000001"]
+    assert delivery.list_scenes(out, "missing") == ["seg_000000", "seg_000002"]
+
+    # A scene whose encode was cut short must not be offered for download.
+    truncated = out / "seg_000001" / "proxy" / "depth.mp4"
+    truncated.write_bytes(b"")
+    assert delivery.list_scenes(out) == []
+    assert delivery.list_scenes(out, "incomplete") == ["seg_000001"]
+
+    with pytest.raises(delivery.DeliveryError, match="unknown scene state"):
+        delivery.list_scenes(out, "finished")
+
+
 def test_every_shard_can_write_the_manifest_at_once(tmp_path):
     """Sixty-four workers write this within a second of each other.
 

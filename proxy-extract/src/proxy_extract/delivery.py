@@ -1000,6 +1000,44 @@ def audit(output_root: Path, assignments: list[SceneAssignment] | None = None) -
     }
 
 
+SCENE_STATES = ("complete", "incomplete", "missing")
+
+
+def list_scenes(
+    output_root: Path,
+    which: str = "complete",
+    assignments: list[SceneAssignment] | None = None,
+) -> list[str]:
+    """Scene names in one state, in delivery order, for feeding to another tool.
+
+    Separate from `audit` rather than a field of it, because the two are asked
+    very different questions. `audit` answers "how far along is this", and pays
+    for it by stat-ing every file of every finished scene - which at 1800 frames
+    across four per-frame streams is some seven thousand files a scene, and at
+    two thousand scenes is a long walk. This answers "which ones can I take
+    now", wants none of those sizes, and is asked while the run is still going.
+
+    Plain names on purpose: `seg_000000` is both the directory relative to the
+    output root and what `rsync --files-from` wants to read.
+    """
+    if which not in SCENE_STATES:
+        raise DeliveryError(f"unknown scene state {which!r}; expected one of {SCENE_STATES}")
+
+    output_root = Path(output_root)
+    assignments = assignments if assignments is not None else read_manifest(output_root)
+
+    names = []
+    for item in assignments:
+        scene_dir = scene_dir_for(output_root, item.index)
+        if not scene_dir.is_dir():
+            state = "missing"
+        else:
+            state = "complete" if already_done(scene_dir) else "incomplete"
+        if state == which:
+            names.append(item.scene)
+    return names
+
+
 def deliver_dataset(
     assignments: list[SceneAssignment],
     output_root: Path,
