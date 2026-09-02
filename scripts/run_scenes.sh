@@ -4,6 +4,7 @@
 #   scripts/run_scenes.sh
 #   DATA_DIR=... OUT_DIR=... N_GPUS=4 scripts/run_scenes.sh
 #   WORKERS_PER_GPU=8 scripts/run_scenes.sh   # fill the GPU's idle CPU phases
+#   LIMIT=8 scripts/run_scenes.sh             # prove a node on 8 episodes first
 #   KEEP_FRAMES=depth scripts/run_scenes.sh   # a third of the space
 #   SCENES_ARGS="--flow-downscale 4" scripts/run_scenes.sh   # cheaper flow
 #
@@ -131,6 +132,14 @@ except Exception as error:
 
 episodes="$(find "$DATA_DIR" -name video.mp4 -type f 2>/dev/null | wc -l | tr -d ' ')"
 [[ "$episodes" -gt 0 ]] || die "no video.mp4 under $DATA_DIR (expected data/<prefix>/<sample_id>/video.mp4)"
+
+# LIMIT=8 delivers the first eight episodes and stops. The scene numbering is
+# the full run's, so a trial is a prefix of the real delivery and the space
+# check below asks for what the trial actually needs, not for ten terabytes.
+if [[ -n "${LIMIT:-}" ]]; then
+  ((LIMIT > 0)) || die "LIMIT must be a positive episode count, not '$LIMIT'"
+  ((episodes = episodes < LIMIT ? episodes : LIMIT))
+fi
 
 mkdir -p "$OUT_DIR/logs"
 
@@ -326,7 +335,7 @@ PY
 gib() { awk -v m="$1" 'BEGIN {printf "%.1f", m / 1024}'; }
 
 cat <<EOF
-data       $DATA_DIR  ($episodes episodes)
+data       $DATA_DIR  ($episodes episodes${LIMIT:+, limited from $(find "$DATA_DIR" -name video.mp4 -type f 2>/dev/null | wc -l | tr -d ' ')})
 out        $OUT_DIR  ($(gib "$avail_mib") GiB free, need ~$(gib "$need_mib") GiB)
 shards     $n_workers ($N_GPUS GPU(s) x $WORKERS_PER_GPU worker(s), ~$((n_workers * GIB_PER_WORKER)) GiB RAM)
 threads    $THREADS_PER_WORKER per worker, of $cores core(s)
@@ -366,6 +375,9 @@ scenes_args=()
 for word in ${SCENES_ARGS:-}; do
   scenes_args+=("$word")
 done
+if [[ -n "${LIMIT:-}" ]]; then
+  scenes_args+=(--limit "$LIMIT")
+fi
 
 pids=()
 for ((i = 0; i < n_workers; i++)); do
@@ -400,6 +412,37 @@ echo "follow one:   tail -f $OUT_DIR/logs/shard-0.log"
 echo "check totals: $PYTHON -m proxy_extract scenes-audit --out $OUT_DIR"
 echo
 
+# Every worker's stdout is its own log file, so without this the terminal that
+# started a twelve-hour run says nothing at all until the run ends - and a
+# healthy run and a wedged one look exactly the same from here. Count what has
+# landed on disk instead, which needs nothing from the workers.
+#
+# The load average comes along because it is the one number that separates the
+# two failure modes: far above the core count means the workers are fighting
+# each other for CPU rather than working (see THREADS_PER_WORKER above), near
+# zero with nothing finishing means they are stuck.
+heartbeat() {
+  local every="${HEARTBEAT_SECONDS:-60}"
+  ((every > 0)) || return 0
+  while sleep "$every"; do
+    local done_n started_n alive=0 load=""
+    done_n="$(find "$OUT_DIR" -maxdepth 2 -name extraction_report.json 2>/dev/null | wc -l | tr -d ' ')"
+    started_n="$(find "$OUT_DIR" -maxdepth 1 -type d -name 'seg_*' 2>/dev/null | wc -l | tr -d ' ')"
+    for pid in "${pids[@]}"; do
+      kill -0 "$pid" 2>/dev/null && alive=$((alive + 1))
+    done
+    [[ -r /proc/loadavg ]] && load=", load $(awk '{print $1}' /proc/loadavg)"
+    echo "[$(date +%H:%M:%S)] $done_n/$episodes done, $started_n started, $alive/$n_workers shards alive$load"
+  done
+}
+heartbeat &
+heartbeat_pid=$!
+# Disowned so that killing it at the end is silent: bash otherwise reports
+# "Terminated: 15" for a job it is still tracking, in the middle of the audit.
+disown "$heartbeat_pid" 2>/dev/null || true
+# Killed on the way out however this script ends, including Ctrl-C.
+trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT
+
 # Wait on each individually so a failing shard is named rather than hidden
 # behind a bare non-zero exit.
 failed=0
@@ -409,6 +452,8 @@ for ((i = 0; i < n_workers; i++)); do
     failed=1
   fi
 done
+
+kill "$heartbeat_pid" 2>/dev/null || true
 
 # ----------------------------------------------------------------------- audit
 

@@ -270,7 +270,40 @@ RuntimeError: expected scalar type Float but found BFloat16
 `--recursive` 是必须的：ABot 把每条 episode 放在 `data/<prefix>/<sample_id>/`
 下面，单层列目录什么也找不到。
 
+### 先用 LIMIT 试一小轮
+
+正式开 2000 条之前，**在目标节点上跑几条**。`LIMIT=8` 只交付前 8 个 scene，编号跟
+全量跑一模一样（先编号、后截断），所以这一轮的产物就是正式交付的前缀，不用删掉重
+来；空间预检也只按这 8 条算，不会拿 10 TiB 的需求把试跑挡在门外。
+
+两卡节点上先这样，跑通再往上加：
+
+```bash
+LIMIT=4 N_GPUS=2 WORKERS_PER_GPU=2 HEARTBEAT_SECONDS=30 \
+  OUT_DIR=/data/binghe/datasets/ABot-seg-trial make scenes
+```
+
+要看的三件事，按顺序：
+
+1. 启动摘要里 `threads` 那行在不在（在，说明跑的是新脚本）；
+2. 前台心跳的 `shards alive` 是不是等于 shard 总数 —— **少了就是有 worker 一起步就
+   死了**，`head -20 logs/shard-*.log` 会直接给出 traceback；
+3. `load` 是不是在核数附近。远超核数说明线程还在抢核。
+
+一条 episode 走完（心跳的 `done` 加一）就说明整条链路是通的。然后 `WORKERS_PER_GPU`
+往上加，每加一档看一眼 `nvidia-smi` 的利用率和 `load`，直到利用率不再涨。
+
 ### 跟一眼进度
+
+**`make scenes` 的终端本身几乎不打印东西，这是设计如此**：每个 worker 的 stdout 各
+自进 `<out>/logs/shard-i.log`，否则 64 路日志交织在一起没法看。前台只留一行心跳，
+它数的是磁盘上落了什么，不依赖任何 worker 还活着：
+
+```
+[19:22:04] 12/2000 done, 64 started, 64/64 shards alive, load 130.4
+```
+
+`HEARTBEAT_SECONDS=0` 关掉。要看细节就跟一个 shard 的日志：
 
 ```bash
 tail -f /data/binghe/datasets/ABot-seg-long-2000/logs/shard-0.log
@@ -645,6 +678,7 @@ torch 版本与 `torch.cuda.is_available()`（对上 nvidia-smi 的驱动号）�
 | `depth backend 'depth_anything_v3' failed: RuntimeError: expected scalar type Float but found BFloat16` | 有人把 DA3 的权重转成了半精度；它内部自己 autocast 并把输入 `.float()`，于是半精度权重撞上 float32 输入 | 别传 `dtype`。现在 `dtype=auto` 就是 float32，显式要半精度会被拒绝并说明原因，见第 3 节「精度」 |
 | 日志里 `[WARN] Dependency 'e3nn' not found` | DA3 在导入高斯分支的球谐工具 | 正常，它只服务高斯导出，本管线走不到 |
 | 占着显存、`utilization.gpu` 是 0、日志不动、也不报错 | 按可能性排：**① 线程抢核**（每个库都按整机开池子，见第 3 节「线程」，用旧版脚本启动的必然踩到）；② 上一轮的进程还占着显存和核；③ 正常地在跑 CPU 那一段 —— 稳定化、PNG、ffmpeg 都不用 GPU | 先 `uptime` 看 load average：远高于核数就是 ①，升级脚本后重启即可。`nvidia-smi --query-compute-apps=pid,used_memory --format=csv` 的 pid 数多于 worker 数就是 ②，见下一行。都不是就 `py-spy dump --pid <pid>` 看栈 |
+| `nvidia-smi` 里的进程数少于自己开的 worker 数（心跳的 `shards alive` 也少） | 有 worker 在起步阶段就死了，日志里是 traceback，但它被淹在几十个日志文件中间 | `head -20 $OUT_DIR/logs/shard-*.log` 一次看全部开头。2026-09 之前的版本有一个必踩的：所有 shard 抢同一个 manifest 临时文件，64 路里能死掉一批，`git pull` 即可 |
 | `nvidia-smi` 里的进程数多于自己开的 worker 数 | 上一轮 worker 没退干净，显存和核都还被它们占着，新一轮于是挤在剩下的卡上 —— 「每张卡 worker 数不一样」通常就是这么来的 | `comm -23 <(nvidia-smi --query-compute-apps=pid --format=csv,noheader \| sort -u) <(pgrep -f "proxy_extract scenes" \| sort -u)` 列出没人认领的 pid，确认后 `kill -9`。下一轮起来前 `nvidia-smi` 应该是干净的 |
 | `scenes-audit` 报 `no scenes_manifest.json` | manifest 在模型加载之前就写了，所以这个 `--out` 下没有 worker 跑过 | 核对 `OUT_DIR` 和 audit 的 `--out` 是不是同一个路径（`ls -d /data/binghe/datasets/ABot-seg-*`） |
 | `semantic backend 'standard11' failed: ImportError: Mask2FormerLoss requires the scipy library` | Mask2Former 的 `__init__` 无条件构造训练损失，那个损失在构造时就要 scipy（匈牙利匹配用）。本管线不训练也从不调它，但模型加载不过去 | `pip install scipy`。已经写进 `requirements.txt`，老 venv 补装即可 |

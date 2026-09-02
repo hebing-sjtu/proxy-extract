@@ -163,6 +163,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume", action="store_true", help="skip scenes whose videos already have every frame"
     )
     scenes.add_argument(
+        "--limit", type=int, default=None, metavar="N",
+        help="deliver only the first N scenes, numbered as they would be in the full "
+        "run; for proving a node before committing it to thousands of episodes",
+    )
+    scenes.add_argument(
         "--quiet", action="store_true",
         help="do not report progress; a shard then says nothing until it finishes an episode",
     )
@@ -397,6 +402,11 @@ def _run_scenes(args: argparse.Namespace) -> int:
 
     videos = resolve_videos(args.video, recursive=args.recursive)
     assignments = delivery.assign_scenes(delivery.episodes_from_videos(videos))
+    if args.limit:
+        # After the numbering, not before it, so scene N of a trial run is scene
+        # N of the full one. The trial's output is then a prefix of the real
+        # delivery rather than a differently-numbered thing to be thrown away.
+        assignments = assignments[: args.limit]
 
     config = delivery.DeliveryConfig(
         depth_backend=args.depth_backend,

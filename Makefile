@@ -22,6 +22,11 @@ WORKERS_PER_GPU ?= 6
 # cannot; see RUNBOOK section 4 before turning this down.
 KEEP_FRAMES ?= color,depth,semantic,duv
 
+# Empty means the whole corpus. `make scenes LIMIT=4` delivers the first four
+# scenes, numbered as the full run would number them, which is how a node gets
+# proved before thousands of episodes are committed to it.
+LIMIT ?=
+
 .PHONY: help venv venv-core venv-test venv-fetch doctor scenes scenes-audit preview
 
 help:
@@ -42,6 +47,7 @@ help:
 	@echo "  make preview        把 SCENE= 渲成可看的 contact sheet"
 	@echo
 	@echo "路径用 DATA_DIR= 和 OUT_DIR= 覆盖，worker 数用 WORKERS_PER_GPU=。"
+	@echo "换节点先试几条：make scenes LIMIT=4，编号与全量一致，见 RUNBOOK 第 3 节。"
 	@echo "逐帧目录保留哪几路用 KEEP_FRAMES=（none / depth / 全部），见 RUNBOOK 第 4 节。"
 	@echo "其余传给 scenes 的 flag 走 SCENES_ARGS=，见 RUNBOOK 第 6 节。"
 
@@ -64,7 +70,7 @@ doctor:
 
 scenes:
 	DATA_DIR=$(DATA_DIR) OUT_DIR=$(OUT_DIR) WORKERS_PER_GPU=$(WORKERS_PER_GPU) \
-	  KEEP_FRAMES=$(KEEP_FRAMES) scripts/run_scenes.sh
+	  KEEP_FRAMES=$(KEEP_FRAMES) LIMIT=$(LIMIT) scripts/run_scenes.sh
 
 scenes-audit:
 	$(VPY) -m proxy_extract scenes-audit --out $(OUT_DIR)

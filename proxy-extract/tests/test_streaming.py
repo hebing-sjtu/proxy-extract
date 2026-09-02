@@ -371,6 +371,36 @@ def test_progress_is_not_mistaken_for_a_setting(long_episode, tmp_path):
     assert json.loads((scene / delivery.REPORT_NAME).read_text())["config"]
 
 
+def test_every_shard_can_write_the_manifest_at_once(tmp_path):
+    """Sixty-four workers write this within a second of each other.
+
+    They write identical content, so the last one winning is fine - but only if
+    each stages its own scratch file. Sharing one means the second writer's
+    rename lands on a path the first already moved away, and that shard dies
+    before reading a frame. It presents as an uneven GPU assignment, which is
+    nowhere near the actual fault.
+
+    Threads rather than processes: the scratch name is unique per call, so this
+    is the stricter test of the two as well as the one that runs anywhere.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from proxy_extract import delivery
+
+    episodes = [(f"ep{index:04d}", tmp_path / f"ep{index}.mp4", None) for index in range(200)]
+    assignments = delivery.assign_scenes(episodes)
+    out = tmp_path / "out"
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        for done in [
+            pool.submit(delivery.write_manifest, out, assignments) for _ in range(64)
+        ]:
+            done.result()
+
+    assert len(delivery.read_manifest(out)) == len(assignments)
+    assert not list(out.glob("*.tmp")), "scratch files outlived the writes"
+
+
 def test_the_thread_budget_reaches_the_encoder(tmp_path, monkeypatch):
     """x264 sizes its pool at ~1.5x the cores unless told otherwise.
 

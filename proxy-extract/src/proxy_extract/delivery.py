@@ -41,7 +41,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
+import tempfile
 import time
 import warnings
 from dataclasses import asdict, dataclass, field
@@ -883,8 +885,20 @@ def write_manifest(output_root: Path, assignments: list[SceneAssignment]) -> Pat
 
     Renumbering discards the dataset's own identifiers, so without this the
     delivered set cannot be traced back to the corpus it came from, and a
-    problem found in one scene cannot be looked up in the source. Written
-    atomically because every sharded worker writes the same content.
+    problem found in one scene cannot be looked up in the source.
+
+    Every sharded worker writes this, with identical content, within a second
+    of the others starting - so the write has to be atomic *and* the scratch
+    file has to be unique per call. A shared scratch name is not merely untidy:
+    two workers open it, the first renames it into place, and the second's
+    rename fails on a file that no longer exists, killing that shard before it
+    has read a single frame. On a 64-way launch that quietly costs a handful of
+    shards every time, and the survivors look like an uneven GPU assignment.
+
+    `mkstemp` rather than the pid, because the uniqueness wanted here is per
+    call: nothing about this function requires its callers to be in different
+    processes, and a name that is only unique per process would make that an
+    unwritten rule with a nasty failure mode.
     """
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -901,9 +915,15 @@ def write_manifest(output_root: Path, assignments: list[SceneAssignment]) -> Pat
         "count": len(assignments),
     }
     path = output_root / MANIFEST_NAME
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, indent=2))
-    tmp.replace(path)
+    handle, scratch = tempfile.mkstemp(dir=output_root, prefix=f"{MANIFEST_NAME}.", suffix=".tmp")
+    tmp = Path(scratch)
+    try:
+        with os.fdopen(handle, "w") as file:
+            json.dump(payload, file, indent=2)
+        os.replace(tmp, path)
+    finally:
+        # Gone already on the happy path; this is for a write that raised.
+        tmp.unlink(missing_ok=True)
     return path
 
 
