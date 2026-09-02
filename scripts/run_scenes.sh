@@ -16,9 +16,8 @@
 # of the run. It also caps host memory per process, which matters here - see the
 # RAM pre-flight below.
 #
-# Bare metal rather than containers, because the H200 nodes are driven from a
-# venv. The container route is in RUNBOOK.md section 3 and takes the same
-# arguments.
+# Bare metal rather than containers: the H200 nodes are driven from a venv, so
+# nothing here needs a docker daemon or root.
 
 set -euo pipefail
 
@@ -31,7 +30,7 @@ SEMANTIC="${SEMANTIC:-standard11}"
 # hangs silently where that is blocked; depth_anything (V2) installs cleanly but
 # sees one frame at a time. DA3 carries its backbone inside its own checkpoint.
 #
-# It is not pip-installable either — see RUNBOOK section 7 for the --no-deps
+# It is not pip-installable either — see RUNBOOK section 5 for the --no-deps
 # recipe — so DEPTH=depth_anything remains the fallback that needs no extra
 # install. The weights are CC-BY-NC 4.0: research use only.
 DEPTH="${DEPTH:-depth_anything_v3}"
@@ -216,7 +215,7 @@ except Exception as error:
     elif depth == "mapanything" and isinstance(error, (OSError, socket.timeout)):
         # Its DINOv2 backbone comes from dl.fbaipublicfiles.com via torch.hub,
         # which no HF mirror covers, so this is the failure most likely to look
-        # like a wedged job. See RUNBOOK section 7.
+        # like a wedged job. See RUNBOOK section 5.
         print(
             "mapanything pulls its DINOv2 backbone through torch.hub from\n"
             "dl.fbaipublicfiles.com, which HF_ENDPOINT does not mirror. Pre-populate\n"
@@ -260,7 +259,7 @@ for option in ${DEPTH_OPTIONS:-}; do
 done
 
 # Anything else to hand `scenes`, split on spaces, e.g. the stabilisation
-# tradeoffs from RUNBOOK section 14:
+# tradeoffs from RUNBOOK section 6:
 #
 #   SCENES_ARGS="--flow-downscale 4"
 #   SCENES_ARGS="--flow-downscale 4 --temporal-radius 1"

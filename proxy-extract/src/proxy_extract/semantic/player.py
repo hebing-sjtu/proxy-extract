@@ -15,9 +15,10 @@ to defend — it follows from how the camera is mounted, not from how the subjec
 happens to move.
 
 The anchor and the thresholds below are deliberately parameters rather than
-constants baked into the scoring. `eval/player_bench.py` fits them against the
-engine's own player/ped labels on the gta-web corpus; hard-coding a guess here
-and calling it a prior would be asserting the thing that needs measuring.
+constants baked into the scoring. Their current values were fitted against a
+corpus that shipped engine player/ped labels; hard-coding a guess here and
+calling it a prior would be asserting the thing that needs measuring. ABot
+carries no such labels, so re-fitting them needs a corpus that does.
 """
 
 from __future__ import annotations

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "proxy-extract"
 version = "0.1.0"
-description = "Extract Depth + Semantic-ID proxy conditions from gameplay video for the CWM v2v dataset"
+description = "Predict metric depth and semantic IDs for RGB-only video corpora"
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",
@@ -19,8 +19,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Heavy model backends. Imported lazily so the contract, QC, taxonomy and
-# encoding layers stay usable (and testable) without a GPU.
+# Heavy model backends. Imported lazily so the contract, taxonomy and encoding
+# layers stay usable (and testable) without a GPU.
 # `depth_anything` needs only transformers, so it is covered by `semantic`'s
 # pins and by requirements.txt. `mapanything` is deliberately absent: it is not
 # published on PyPI, so naming it here made this extra uninstallable rather than

@@ -6,13 +6,11 @@
 #   VENV=/data/binghe/venvs/proxy scripts/setup_venv.sh
 #   EXTRAS=core scripts/setup_venv.sh  # no torch, for contract/QC/encoding work
 #
-# A venv rather than the container: these nodes already carry a working main
-# environment, and the image route wants a docker daemon, the container toolkit
-# and root. A venv is the smaller intervention — it installs nothing outside its
-# own directory and is deleted by removing that directory.
+# A venv rather than the node's main environment: it installs nothing outside
+# its own directory and is uninstalled by removing that directory, which is the
+# smallest intervention on a machine that already carries a working environment.
 #
-# Versions come from ../requirements.txt, the same file the image installs from,
-# so a venv and a container cannot disagree about what RUNBOOK.md measured.
+# Versions come from ../requirements.txt, which is what RUNBOOK.md measured.
 
 set -euo pipefail
 
@@ -81,7 +79,7 @@ esac
 # actually needs at runtime are named explicitly. Opt-in, since the weights are
 # 6.8 GB and CC-BY-NC; without it, use DEPTH=depth_anything.
 if [[ "${DA3:-0}" == "1" ]]; then
-  echo "installing depth-anything-3 (--no-deps; see RUNBOOK section 7)"
+  echo "installing depth-anything-3 (--no-deps; see RUNBOOK section 5)"
   "$py" -m pip install --no-deps --ignore-requires-python \
     "git+https://github.com/ByteDance-Seed/depth-anything-3"
   "$py" -m pip install einops omegaconf addict imageio
@@ -142,7 +140,7 @@ or drive it without activating:
 
   $py -m proxy_extract --help
 
-Next: pull the weights, then section 12 of RUNBOOK.md for the delivery run.
+Next: pull the weights, then section 3 of RUNBOOK.md for the delivery run.
 
   $py scripts/fetch_models.py --set default
 EOF

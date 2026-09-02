@@ -1,4 +1,4 @@
-"""Reader for ABot-World-Explorer-500h episodes.
+"""Reader for ABot-World-Explorer episodes.
 
 Layout, per the dataset card (30,969 episodes, Apache-2.0):
 
@@ -82,9 +82,9 @@ def load_actions(annotations: Path) -> list[dict]:
 
     Worth more here than the label they look like: whether the player pressed
     forward is a fact about the protagonist that no bystander shares, so this
-    is an independent signal for the player/ped split. `eval.player_bench` can
-    only score the geometric signals, because gta-web records inputs in a
-    different shape — so anything built on this has to be validated separately.
+    is an independent signal for the player/ped split. Nothing scores it yet —
+    the corpus ships no player/ped ground truth — so anything built on it has
+    to be validated separately before it can be trusted.
     """
     payload = json.loads(read_members(annotations)["action.json"])
     if isinstance(payload, dict):

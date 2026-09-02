@@ -1,12 +1,12 @@
 """Encode a condition_root into the three delivery videos DATA_F.md defines.
 
 The condition_root is what code-world-model consumes: raw float32 depth and an
-8-bit ID map per frame. The videos here are the gta-web delivery format, and
-their encodings are fixed by that document rather than chosen:
+8-bit ID map per frame. The videos here are the delivery format, and their
+encodings are fixed by DATA_F.md rather than chosen:
 
-    depth_*.mp4      inverted log-z in 8-bit grey, near 0.1 m, far 256 m
-    semantic_*.mp4   lossless RGB, (R, G, B) = (0, 0, id)
-    proxy_*.mp4      R = forward log-z over near 0.1 / far 8000, sky 255,
+    depth.mp4        inverted log-z in 8-bit grey, near 0.1 m, far 256 m
+    semantic.mp4     lossless RGB, (R, G, B) = (0, 0, id)
+    duv.mp4          R = forward log-z over near 0.1 / far 8000, sky 255,
                      G/B = semantic colour
 
 Two of those are load-bearing details rather than preferences. The semantic

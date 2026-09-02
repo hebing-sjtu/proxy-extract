@@ -1,60 +1,65 @@
-# gta-web clip 数据集
+# ABot-seg-long-2000 数据格式
 
-第三人称固定步长录制（契约 v3）：24 fps，1280×720，每段 **124 帧 / 5.166… 秒**。同一帧的 color / depth / semantic / proxy / track 对齐：`t = frame / 24`。
+交付集的格式说明。怎么把它跑出来见 `RUNBOOK.md`。
+
+源是 **ABot-World-Explorer-subset2000**（2000 段，Apache-2.0），只有 RGB 和一个
+COLMAP 稀疏模型 —— **没有深度，也没有语义**。这两路都是本仓库预测出来的，不是
+引擎通道。DUV 不是第四次预测，是同帧 depth + semantic 的合成。
+
+| | 源 | 交付 |
+|---|---|---|
+| 路径 | `/data/binghe/datasets/ABot-World-Explorer-subset2000/` | `/data/binghe/datasets/ABot-seg-long-2000/` |
+| 布局 | `data/<prefix>/<sample_id>/{video.mp4, annotations.tar}` | `seg_NNNNNN/` |
+| 分辨率 | 1920×1080 | 1280×720（正好 2/3，不引入形变） |
+| 长度 | 整段，约 1800 帧 | 同上，**不切窗、不截断** |
+| 帧率 | 源帧率 | 源帧率 |
 
 ## 目录
 
-| 目录 | 内容 |
-|---|---|
-| `clips-1000-20260828-234354/` | 主集：1000 段。walk / run / drive / look 各 250。stamp `smtd4g8ri`，2 worker。 |
-| `clips-1000-fix-run-101/` | 从主集筛出的 101 条 run 重录（去掉「先环绕再跑」）。stamp `fixrun101`。轨迹与主集对应段相同，文件名不同。 |
-
-清单都在各目录的 `clips.json`。
-
-## 文件命名
-
-每个 worker 一条长会话，再按段切成 `_pXXX` 分片：
-
 ```
-color_<stamp>_pXXX.mp4      # RGB 画面  libx264
-depth_<stamp>_pXXX.mp4      # 深度灰度  h264-logz-gray8
-semantic_<stamp>_pXXX.mp4   # 语义 ID   libx264rgb / rgb24
-proxy_<stamp>_pXXX.mp4      # 后处理合成，R=深度 G/B=语义
+<dataset_root>/
+├── scenes_manifest.json          # 哪个 sample_id 变成了哪个 seg
+├── seg_000000/
+│   ├── proxy/                    # 本管线派生的一切
+│   │   ├── color.mp4             #   RGB
+│   │   ├── depth.mp4             #   深度灰度
+│   │   ├── semantic.mp4          #   语义 ID
+│   │   └── duv.mp4               #   depth + semantic 的合成
+│   ├── annotations.tar           # 源 episode 的标注，逐字节原样拷贝
+│   └── extraction_report.json    # 这一段是怎么跑出来的
+├── seg_000001/
+└── ...
 ```
 
-长会话（整 worker、未切段）以及对齐元数据：
+派生的东西全在 `proxy/` 里，源带来的东西留在外面。这样 `ls` 一眼就能分清哪半边
+是数据集自己的说法、哪半边是我们的预测。
 
-```
-color_<stamp>.mp4
-depth_<stamp>.mp4
-semantic_<stamp>.mp4
-capture_<stamp>.json
-depth_<stamp>.json
-track_<stamp>.json          # 每帧相机 / 玩家 / 输入
-```
+`annotations.tar` 里是 `action.json`（逐帧键鼠输入）、`caption.json`，以及完整的
+`sparse/0/{cameras,images,points3D}.txt` COLMAP 模型（相机内外参在这里）。**不做
+任何转换**：它的内容是数据集自己的声明，重打包会让本管线变成一份它没有生产过的
+数据的第二个真值来源。要读它用 `proxy_extract.datasets.abot`，它直接从 tar 里取
+成员，不解包。
 
-主集 stamp：`w00_smtd4g8ri`、`w01_smtd4g8ri`（各 500 段）。  
-101 集 stamp：`w00_fixrun101`、`w01_fixrun101`。
+编号按 `sample_id` 字典序，从 `seg_000000` 起，六位。排序而非发现顺序，是为了让
+编号只是输入集合的函数：分片的 worker 不用协调就能算出同样的号，补跑新增 episode
+时也只会插入、不会把已交付的段重新编号。`scenes_manifest.json` 记着每段的来源，
+否则重编号就把数据集自己的标识丢了。
 
-`clips.json` 里每段有 `tag`、出生点 `(x,z,heading)`、目标 `(goalX,goalZ)`、`turn`、以及上述分片文件名。`frameStart` / `frameEnd` 是该段在长会话里的帧区间（半开）。
+## 对齐
 
-## 动作标签
+四路视频**逐帧对齐**，帧数相同，尺寸相同。它们由同一次解码的同一批像素产出 ——
+color 不是把源文件另外交给 ffmpeg 转出来的，因为两个 resampler 不会对到像素级，
+而 RGB 和自己的 depth 差半个像素的交付集，对任何学对应关系的东西都是负价值。
 
-| tag | 含义 |
-|---|---|
-| `walk` | 步行到目标 |
-| `run` | 冲刺到目标 |
-| `drive` / `driveFast` | 开车（本集只有 `drive`） |
-| `look` | 原地，相机环绕。`subject` 为 `person` 或 `car` |
-
-`turn=true` 表示规划路径上有一次拐弯（旧数据里弯常常贴在开场；新规划会先直走再转）。
+`annotations.tar` 里的 COLMAP 是对 **1920×1080 源片**解的，内参要自己按 2/3 缩放
+到 1280×720。它只定义到一个相似变换，**不是米制**，不能拿来给深度定标。
 
 ## Depth（米制）
 
 相机空间 **正 view-z**（视线方向距离，米），不是视锥 NDC。
 
 1. 距离 `d` clip 到 `[near, far] = [0.1 m, 256 m]`
-2. 量化到 16-bit 再压成 8-bit 灰度（越近越亮）：
+2. 量化到 16-bit 再压成 8-bit 灰度（**越近越亮**）：
 
 ```
 q16  = round( (ln(far) − ln(d)) / (ln(far) − ln(near)) × 65535 )
@@ -70,62 +75,119 @@ d_m = exp( ln(256) − (gray / 255) × (ln(256) − ln(0.1)) )
 
 `gray == 0`：天空或未命中，没有有效距离。
 
-编码名：`h264-logz-gray8`。解码请读灰度，不要当普通 YUV 色度用。
+编码名：`h264-logz-gray8`。codec 是 `libx264`，像素格式 `gray`，`crf 0`。
+**解码请读灰度，不要当普通 YUV 色度用。**
+
+一个码是 log 尺度上的固定比值，所以误差是相对的：`(256/0.1)^(1/255) ≈ 1.031`，
+即每码约 3.1%。
 
 ## Semantic（序号）
 
-每像素一个类别整数。视频是 **无损 RGB**：`(R, G, B) = (0, 0, id)`，codec `libx264rgb` + `rgb24`（`crf 0`）。**不要用 YUV H.264**，相邻 id 会被量化并掉。
+每像素一个类别整数。视频是**无损 RGB**：`(R, G, B) = (0, 0, id)`，codec
+`libx264rgb` + `rgb24`（`crf 0`）。**不要用 YUV H.264**，色度下采样会把相邻 id
+混成一个从没被预测过的类，而且下游发现不了。
 
 读 **B 通道**（或确认 R=G=0 后读任一通道）：
 
-| id | 类 | 怎么定 |
+| id | 类 | 说明 |
 |---:|---|---|
 | 0 | sky | 未命中 / 天空 |
-| 1 | player | 本段可控角色（`userData.semantic`） |
+| 1 | player | 本段可控角色 |
 | 2 | ped | NPC |
 | 3 | vehicle | 载具网格（车、部分船/机） |
-| 4 | building | 楼、地标，名字/资产匹配 building、住宅、mall 等 |
-| 5 | road | **仅沥青材质**（`asphalt`）。路砖上的水泥、人行道、标线不算 road |
+| 4 | building | 楼、地标 |
+| 5 | road | 沥青路面 |
 | 6 | ground | 地块、人行道、标线、路砖非沥青部分 |
-| 7 | vegetation | 树、草、灌木、树池（含材质名 leaf/foliage） |
+| 7 | vegetation | 树、草、灌木、树池 |
 | 8 | terrain | 山地、岩石、野外地面 |
 | 9 | water | 海、湖、河、池 |
 | 10 | prop | 灯、椅、牌、栏、HVAC 等；对不上上面规则时的默认类 |
 
-判定顺序（实现见 `src/semantic.ts`）：
+只有这 11 个类，**没有实例 ID**。开车片段里自己的车和交通车在 semantic 里都是
+`3`，不区分 ego —— 那个区分只出现在 DUV 的 G/B 里。
 
-1. 沿父节点找显式 `userData.semantic`（角色、车、行人录制时打上）
-2. 名称 / `sourceFile` / `category` 正则（建筑、路、树、水、车、地形、道具）
-3. 材质名覆盖：沥青 → road；树叶 → vegetation；road 网格上的 concrete/sidewalk/paint → ground
-4. 其余 → prop
+两点要知道：
 
-没有实例 ID，只有这 11 个类。开车片段里自己的车和交通车都是 `3`，不在 semantic 里区分 ego。
+- **player / ped 不是分割器分出来的**。任何类别体系下主角和路人都是同样的像素，
+  分开靠的是相机怎么架 —— 第三人称相机绑在玩家身上，玩家投影在一个固定的屏幕锚点
+  附近不动，别人会飘过画面。实现见 `semantic/player.py`。
+- **road / ground 是功能区分，不是外观区分**。原始定义里 road 只认沥青材质，路砖上
+  的水泥和标线算 ground —— 这需要场景图才判得准，从图像上只能逼近。见
+  `taxonomy.py` 的 `ROAD_GROUND_IS_FUNCTIONAL`。
 
-## Proxy（后处理）
+## DUV（后处理）
 
-由同帧 depth + semantic 合成，不是游戏内实时通道。文件名把 `color_` 换成 `proxy_`。
+由**同帧** depth + semantic 合成，不是第三次前向。depth 和 semantic 各只预测一次，
+DUV 是它们的确定性变换。
 
 | 通道 | 含义 |
 |---|---|
-| **R** | 全图像素的 log-z `d`。有效深度从 depth 灰度反解到米，再按 **near=0.1 / far=8000** 重新 log 压到 `[0, 254]`；天空/无效 = **255** |
+| **R** | 全图像素的 log-z。有效深度从 depth 灰度反解到米，再按 **near=0.1 / far=8000** 重新 log 压到 `[0, 254]`（**近 0，远 254**，方向与 depth.mp4 相反）；天空/无效 = **255** |
 | **G, B** | 语义色，不占 R |
+
+```
+R = round( (ln(d) − ln(0.1)) / (ln(8000) − ln(0.1)) × 254 )     d 有效
+  = 255                                                         天空 / 无效
+```
 
 | 类 | G | B | 备注 |
 |---|---:|---:|---|
 | player | 0 | 255 | semantic id 1 |
 | ped | 0 | 128 | id 2 |
-| ego | 128 | 0 | id 3 且该段 `tag` 为 drive |
-| vehicle | 64 | 0 | id 3，非 drive 段 |
+| ego | 128 | 0 | id 3 且该段是驾驶段 |
+| vehicle | 64 | 0 | id 3，非驾驶段 |
 | vegetation | 255 | 0 | id 7 |
 | road | 255 | 255 | id 5 |
 | other | 0 | 0 | building / ground / terrain / water / prop |
-| sky | 255 | 255 | id 0 或 depth=0；靠 **R=255** 和 road 区分 |
+| sky | 255 | 255 | id 0 或 depth 无效；靠 **R=255** 和 road 区分 |
 
-合成脚本：`node scripts/compose-proxy.mjs <dir>`。
+sky 和 road 的 G/B 撞在一起是原格式如此，**只能靠 R 分**：sky 的 R 恒为 255，
+而有效深度最大只到 254。这也是 R 走正向、把 255 留作哨兵的原因。
 
-## 对齐与读取建议
+编码同 semantic：`libx264rgb` + `rgb24` + `crf 0`。不无损的话 R 会被压出
+254/255 之间的中间值，天空掩码就碎了。
 
-- 分片帧数必须是 124。`ffprobe` 数帧即可校验。
-- color 是普通 YUV H.264；depth 当灰度；semantic / proxy 必须按 RGB 无损解（`rgb24`）。
-- 相机外参、玩家位姿在 `track_<stamp>.json` 的 `camera.frames` / `player.frames`，下标与长会话帧号一致；分片对应 `frameStart .. frameEnd-1`。
-- 主集里 101 条有问题的 run 已用新视频覆盖同名 `*_smtd4g8ri_pXXX.mp4`；`track_w01_*.json` 仍是旧运动，和这 101 条画面不再逐帧对应。要以新轨迹为准请用 `clips-1000-fix-run-101/track_*.json`。
+**这跟 code-world-model 的 DUV 不是一回事**，混用会静默污染训练。CWM 的 DUV 在
+R 里放的是 near 0.3 / far 256 的深度码，G/B 是调色板的 (u, v)；这里 R 是
+near 0.1 / far 8000 且 255 保留给天空，G/B 是语义**颜色**。
+
+## extraction_report.json
+
+每段自己的运行记录：帧数、尺寸、fps、两个后端的名字、深度的编码参数和统计、
+各类别像素占比、稳定化前后的 flicker、耗时。
+
+要看的两个字段：
+
+- `deliverable` —— `false` 表示这段是用**合成后端**跑的。合成后端伪造输出，产物
+  在结构上和真的完全一样（同 codec、同类 id、同报告形状），只有看像素才认得出，
+  所以事实写在报告里而不是留给人从后端名字去推。
+- `frames` —— `--resume` 拿它跟四路视频实际的帧数比对。被杀在编码中途的段会留下
+  长度不足的 mp4，这个比对会认出来并重跑，而不是让截断的段悄悄进数据集。
+
+## 读取建议
+
+```python
+import cv2, numpy as np
+
+# semantic / duv：必须无损 RGB 读
+cap = cv2.VideoCapture("seg_000000/proxy/semantic.mp4")
+ok, bgr = cap.read()
+ids = bgr[:, :, 0]          # OpenCV 是 BGR，所以 B 在 0 号通道
+
+# depth：读灰度再反解
+cap = cv2.VideoCapture("seg_000000/proxy/depth.mp4")
+ok, bgr = cap.read()
+gray = bgr[:, :, 0].astype(np.float64)
+metres = np.exp(np.log(256) - gray / 255 * (np.log(256) - np.log(0.1)))
+metres[gray == 0] = 0        # 天空 / 无效
+```
+
+仓库里的等价实现是 `proxy_extract.proxy` 的 `encode_depth_frame` /
+`decode_depth_frame` / `encode_semantic_frame` / `compose_proxy_frame`。
+
+交付格式设计上就是不能直视的：semantic 播出来近乎全黑，depth 是一片平灰。要人眼
+过一遍用
+
+```
+python -m proxy_extract scenes-preview --scene <dataset_root>/seg_000000 --out /tmp/sheet.png
+```

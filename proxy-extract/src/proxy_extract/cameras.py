@@ -101,8 +101,8 @@ def from_json(path: Path) -> CameraTrack:
     return CameraTrack(cam2world=poses, intrinsics=intrinsics, metric=bool(payload.get("metric", True)))
 
 
-def from_abot_json(path: Path) -> CameraTrack:
-    """Load the handpick29 `camera/<clip>.json` format.
+def from_sidecar_json(path: Path) -> CameraTrack:
+    """Load a pre-solved `camera/<clip>.json` sidecar.
 
     These come from a COLMAP sparse reconstruction of the *source* clip, so the
     poses are self-consistent but the world unit is arbitrary — hence
@@ -121,8 +121,8 @@ def from_abot_json(path: Path) -> CameraTrack:
     return CameraTrack(cam2world=poses, intrinsics=intrinsics, metric=False)
 
 
-def from_abot_npz(path: Path) -> CameraTrack:
-    """Load the handpick29 `camera/<clip>.npz` sidecar (same data as the JSON)."""
+def from_sidecar_npz(path: Path) -> CameraTrack:
+    """Load a pre-solved `camera/<clip>.npz` sidecar (same data as the JSON)."""
     with np.load(Path(path)) as data:
         fx, fy, cx, cy = np.asarray(data["intrinsics"], dtype=np.float64)[:4]
         return CameraTrack(
@@ -138,20 +138,20 @@ def load(path: Path) -> CameraTrack:
     if path.suffix == ".npz":
         with np.load(path) as data:
             keys = set(data.files)
-        return from_abot_npz(path) if "c2w" in keys else from_npz(path)
+        return from_sidecar_npz(path) if "c2w" in keys else from_npz(path)
     if path.suffix == ".json":
         payload = json.loads(path.read_text())
         intrinsics = payload.get("intrinsics")
-        is_abot = isinstance(intrinsics, dict) and "fx" in intrinsics
-        return from_abot_json(path) if is_abot else from_json(path)
+        is_sidecar = isinstance(intrinsics, dict) and "fx" in intrinsics
+        return from_sidecar_json(path) if is_sidecar else from_json(path)
     raise ValueError(f"unsupported camera track format: {path.suffix}")
 
 
 # ------------------------------------------------------------ COLMAP text
-# What ABot-World-Explorer-500h actually ships, inside each episode's
-# annotations.tar as sparse/0/{cameras,images,points3D}.txt. The existing
-# from_abot_* loaders read a preprocessed sidecar that only the handpick29
-# subset had.
+# What ABot-World-Explorer actually ships, inside each episode's
+# annotations.tar as sparse/0/{cameras,images,points3D}.txt. The from_sidecar_*
+# loaders above read an already-solved model instead, for corpora that supply
+# one.
 
 
 def _colmap_intrinsics(model: str, width: int, height: int, params: list[float]) -> np.ndarray:

@@ -215,14 +215,15 @@ def to_coarse6(cwm_labels: np.ndarray) -> np.ndarray:
     return lut[np.clip(np.asarray(cwm_labels), 0, NUM_CLASSES - 1)]
 
 
-# ------------------------------------------------ the 11-class gta-web standard
+# ------------------------------------------------------ the 11-class standard
 # The delivered output schema, fixed by DATA_F.md. IDs are that document's, not
-# ours, and must not be renumbered: the engine writes them into the semantic
-# video's blue channel and any downstream reader assumes them.
+# ours, and must not be renumbered: they go into the semantic video's blue
+# channel and any downstream reader assumes them.
 #
 # Unlike coarse6 this is not a compromise with what a segmenter can predict —
-# it is what the engine emits. Two of the eleven therefore cannot be reproduced
-# from an image at all; see ROAD_GROUND_IS_FUNCTIONAL below.
+# it was defined by a renderer that had the scene graph. Two of the eleven
+# therefore cannot be reproduced from an image at all; see
+# ROAD_GROUND_IS_FUNCTIONAL below.
 
 S11_SKY = 0
 S11_PLAYER = 1

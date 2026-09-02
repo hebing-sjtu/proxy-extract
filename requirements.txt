@@ -3,9 +3,8 @@
 # breaking-change majors, and the semantic backend reads `id2label` off the
 # checkpoint config, which transformers has moved before.
 #
-# One file for both deployment paths — `scripts/setup_venv.sh` and the image
-# install from it — so a venv and a container cannot drift into disagreeing
-# about the versions the measurements in RUNBOOK.md were taken on.
+# `scripts/setup_venv.sh` installs from this file, so it is the single record of
+# the versions the measurements in RUNBOOK.md were taken on.
 
 # --- core, needed for contract / taxonomy / QC / encoding (no GPU) ---
 numpy==2.5.1
@@ -36,11 +35,6 @@ transformers==5.16.1
 accelerate==1.14.0
 safetensors==0.8.0
 huggingface-hub==1.29.0
-
-# --- experiments/fig_*.py only; harmless in the runtime image and it makes
-# --- the figures reproducible inside the container instead of only on a laptop
-matplotlib==3.11.1
-scipy==1.18.1
 
 # --- tests ---
 pytest==9.1.1

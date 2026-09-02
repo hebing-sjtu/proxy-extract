@@ -51,9 +51,9 @@ def read_frames(
 ) -> list[np.ndarray]:
     """Decode sequentially to a list of RGB (or gray) uint8 arrays.
 
-    Sequential decode rather than seeking: these clips are short, and seeking
-    on H.264 without an exact-frame index silently lands on the nearest
-    keyframe, which would desynchronise the high/low comparison.
+    Sequential decode rather than seeking: seeking on H.264 without an
+    exact-frame index silently lands on the nearest keyframe, and the whole
+    value of the delivered set is that its streams are frame-aligned.
     """
     frames = [
         frame

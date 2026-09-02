@@ -1,14 +1,30 @@
 # proxy-extract
 
-Extracts the Depth + Semantic-ID proxy conditions for the v2v dataset, writing a
-`condition_root` directory that `code-world-model`'s `prepare` step consumes
-unmodified. No changes to the inference repo are needed.
+Predicts depth and semantics for RGB-only video corpora, and writes them in the
+two formats downstream needs.
 
 > First time here? Read [`../RUNBOOK.md`](../RUNBOOK.md) instead — it is the
-> step-by-step version, in Chinese, with a Docker path. This file is the design
-> rationale: why each piece is the way it is.
+> step-by-step version, in Chinese. This file is the design rationale: why each
+> piece is the way it is.
 
-## What the output has to look like
+## Two deliverables
+
+They share every model and every post-processing stage; only the resolution and
+the on-disk form differ. Confusing them is the most common source of trouble.
+
+| | `scenes` → `seg_NNNNNN` | `extract` → `condition_root` |
+| --- | --- | --- |
+| Consumer | the delivered dataset, per `../DATA_F.md` | `code-world-model`'s `prepare`, unmodified |
+| Resolution | 1280x720 | 336x192 |
+| On disk | four mp4s under `proxy/` + `annotations.tar` | `NNNNNN.depth.f32` + `NNNNNN.semantic_id.png` |
+| Length | the whole episode | truncated to `124 + 90k` to fit the window |
+| Code | `delivery.py` | `pipeline.py` |
+
+`scenes` deliberately does **not** apply the 336x192 reduction. It throws away
+93% of the pixels and is cheap to redo from the delivered videos later, so doing
+it at delivery time would only mean the grid could never be revisited.
+
+### The condition_root contract
 
 `code-world-model` does not leave this format open. Per source-frame ordinal:
 
@@ -28,114 +44,85 @@ code = (ln(256) - ln(d)) / (ln(256) - ln(0.3)) * 65535
 ```
 
 That has a useful consequence. A **global scale error is a uniform code offset**,
-not a geometric distortion - a 2x error costs 10.3% of full range. So one
+not a geometric distortion — a 2x error costs 10.3% of full range. So one
 well-estimated scale per clip is enough, and chasing per-frame absolute metric
 accuracy is not worth it.
 
 ## Install
 
 ```bash
-pip install -e .                 # contract, QC, encoding, preview - no GPU needed
-pip install -e ".[depth]"        # MapAnything
+pip install -e .                 # contract, taxonomy, encoding, preview — no GPU
+pip install -e ".[depth]"        # model backends
 pip install -e ".[semantic]"     # transformers segmentation
 pip install -e ".[sam3]"         # SAM 3 concept refinement
 ```
 
-Model backends are imported lazily, so the contract, taxonomy, QC and encoding
-layers work on a laptop.
+Model backends are imported lazily, so the contract, taxonomy and encoding layers
+work on a laptop. In practice use `../scripts/setup_venv.sh`, which installs the
+pinned `../requirements.txt` these measurements were taken on.
 
 **The stages cannot share one environment.** SAM 3 needs Python >= 3.12 and
 torch >= 2.7; `code-world-model` pins Python 3.10 and torch 2.9.1. Run extraction
-separately and hand over the written `condition_root`.
+separately and hand over what it wrote.
 
 ## Use
 
 ```bash
-# 1. Screen high/low pairs for geometric drift
-proxy-extract qc --dataset handpick29_high_low --report qc_report.json
+# The delivery run. See RUNBOOK section 3; ../scripts/run_scenes.sh wraps this
+# with sharding, resume and a preflight.
+proxy-extract scenes --video <corpus>/data --recursive --out <dataset_root> \
+    --semantic-backend standard11 --depth-backend depth_anything_v3 \
+    --resume --keep-going
+proxy-extract scenes-audit --out <dataset_root>
+proxy-extract scenes-preview --scene <dataset_root>/seg_000000 --out sheet.png
 
-# 2. Extract. Outputs land at <out>/<track>/<clip>/, so high and low do not collide.
-proxy-extract extract \
-    --video handpick29_high_low/low/26_trevor_seg_0004.mp4 \
-    --out conditions --depth-backend mapanything --semantic-backend ade20k
-
-# 3. Look at what came out
-proxy-extract preview --condition-root conditions/low/26_trevor_seg_0004 --out duv.mp4
-
-# 4. Re-read it with every check the consumer applies
-proxy-extract validate --condition-root conditions/low/26_trevor_seg_0004 --expect-frames 124
+# The condition_root run.
+proxy-extract extract --video <corpus>/data --recursive --out <out> \
+    --semantic-backend coarse6 --depth-backend depth_anything --chunk-frames 124
+proxy-extract preview  --condition-root <out>/<clip> --out duv.mp4
+proxy-extract validate --condition-root <out>/<clip> --expect-frames 124
 ```
-
-Then point a `code-world-model` config's `condition_root` at that directory.
 
 ## Stages
 
-1. **Decode** to 1344x768, an exact 4x multiple of the 336x192 condition grid.
-2. **Depth** - MapAnything over the whole clip at once.
-3. **Calibrate** - scale from the GT camera baseline where available, otherwise
+1. **Decode** to 1344x768 (`extract`) or 1280x720 (`scenes`). The former is an
+   exact 4x multiple of the condition grid, which lets the reducers use clean
+   block reductions instead of resampling; the latter is exactly 2/3 of ABot's
+   1920x1080, so it introduces no aspect distortion.
+2. **Depth** — a metric backend, per batch of frames.
+3. **Calibrate** — scale from a GT camera baseline where one exists, otherwise
    the backend's own metric estimate. Recorded in the report either way.
-4. **Semantic** - a closed-set ADE20K or Cityscapes model projected onto the 12
-   classes, optionally refined by SAM 3 for the classes those sets cannot express.
-5. **Reduce** to 336x192. Depth by block median, labels by block majority vote -
-   averaging depth across a discontinuity invents surfaces, and nearest-neighbour
-   sampling of labels keeps or drops thin structures at random.
+4. **Semantic** — a closed-set ADE20K or Cityscapes model projected onto the
+   target taxonomy, optionally refined by SAM 3 for classes those sets cannot
+   express.
+5. **Reduce** to 336x192 (`extract` only). Depth by block median, labels by block
+   majority vote — averaging depth across a discontinuity invents surfaces, and
+   nearest-neighbour sampling of labels keeps or drops thin structures at random.
 6. **Stabilise** temporally, flow-compensated.
-7. **Encode and validate** by reading the result back.
+7. **Split the protagonist** out of the person class, then **encode**.
 
 ## Backend choices
 
-**Depth: MapAnything.** It predicts metric scale natively and can ingest known
-calibration. VGGT is up-to-scale only. VGGT-Omega scores better but its weights
-are gated behind an automated approval that often refuses, and Meta flagged
-possible benchmark contamination in the released 1B checkpoint on 2026-08-18.
+**Depth.** The binding constraint is not accuracy: it is whether the weights can
+be obtained on the node at all, and whether the backend will declare itself
+metric. `scenes` refuses up-to-scale depth outright, because the delivery videos
+encode absolute metres and a COLMAP sparse model — the only geometry the corpus
+ships — is itself defined only up to a similarity. `depth_anything_v3` is the
+default because it is the one that carries its DINOv2 backbone inside its own
+checkpoint; `mapanything` pulls that backbone through `torch.hub` from a host
+most egress allowlists do not cover, and hangs silently where it is blocked.
+RUNBOOK section 5 has the full comparison.
 
-**Semantic: closed-set trunk, SAM 3 for the gaps.** Six of the twelve classes are
-"stuff" - unbounded regions with no instances - which is where concept detectors
-are weakest and ADE20K models are strongest. SAM 3 is prompted only for `animal`
-and `prop`, which no closed-set label set expresses, and for extra
-`infrastructure` detail. SAM 2 cannot do this job at all: it is class-agnostic and
-produces masks without labels.
+**Semantic: closed-set trunk, SAM 3 for the gaps.** Six of the twelve CWM classes
+are "stuff" — unbounded regions with no instances — which is where concept
+detectors are weakest and ADE20K models are strongest. SAM 3 is prompted only for
+`animal` and `prop`, which no closed-set label set expresses, and for extra
+`infrastructure` detail. SAM 2 cannot do this job at all: it is class-agnostic
+and produces masks without labels.
 
 Mappings are written by source-class **name**, not index, and resolved against
 each checkpoint's own `id2label`. A checkpoint with a permuted label order would
 otherwise silently relabel the whole dataset.
-
-## Quality control
-
-Two commands, and `camera-qc` is the one to use where GT tracks exist.
-
-**`camera-qc` (preferred).** Tracks sparse features and measures how far they
-fall from the epipolar lines the known poses predict — a Sampson distance in
-pixels. Because the poses are independently trustworthy (median 0.43 px across
-the 29 high renders), a large residual is evidence about the *render*, not about
-the measurement. Tiers are `keep <= 1 px`, `review <= 3 px`, `drop > 3 px`.
-
-On handpick29 the two tracks separate sharply, which is the whole argument for
-extracting from the high render:
-
-| track | keep | review | drop |
-| --- | --- | --- | --- |
-| high | 28 | 1 | 0 |
-| low | 10 | 11 | 8 |
-
-**`qc` (fallback, no cameras needed).** The low-poly track is an AI restyle, not
-a re-render of the same 3D scene, so it is free to reinvent geometry. Art styles
-differ too much to compare pixels, so this compares each clip's **own optical
-flow field**: flow comes from camera motion and scene depth, so a restyle that
-kept the geometry must reproduce it.
-
-The grade is `EPE / motion`, with cosine reported alongside but not used to
-decide. Flat, low-texture scenes produce near-random flow directions and tank
-cosine even when alignment is fine - `26_trevor_seg_0004` scores cos 0.803 but
-EPE/motion 0.209 and is visibly well aligned.
-
-| Tier | EPE/motion | handpick29 |
-| --- | --- | --- |
-| keep | <= 0.22 | 12 |
-| review | <= 0.45 | 9 |
-| drop | > 0.45 | 8 |
-
-Urban scenes hold up; natural ones (trees, rocks) drift most.
 
 ## Two things worth knowing before changing the code
 
@@ -145,9 +132,10 @@ holds one more copy of that pixel's own class, so the vote re-elects the flicker
 That is why `temporal.py` runs a second short-run suppression pass, and why
 `test_a_majority_vote_alone_cannot_remove_it` exists.
 
-**Output paths.** The high and low renders of a pair share a file name, so the
-track directory is part of the output path. Keying on the stem alone silently
-overwrote half the dataset.
+**Output paths.** ABot names every episode `video.mp4` and distinguishes them by
+the directory above it, so the parent directory is part of both the scene's
+`sample_id` and the condition_root's path. Keying on the stem alone collapses the
+whole corpus onto one output.
 
 ## Tests
 
@@ -155,8 +143,13 @@ overwrote half the dataset.
 pytest
 ```
 
-131 tests, no GPU required. The important ones import the real
-`cwm_h3_inference.duv` loader and make it read our output, so the contract is
-checked against its actual consumer rather than against this README. The
-`synthetic` depth and semantic backends exist to run the full pipeline on a real
-clip without a GPU; they are placeholders and must never be used for real data.
+No GPU and no corpus required — the fixtures synthesise their own footage. The
+important ones import the real `cwm_h3_inference.duv` loader and make it read our
+output, so the contract is checked against its actual consumer rather than
+against this README, and the packaging ones assert that `../RUNBOOK.md`,
+`../DATA_F.md` and `../Makefile` still describe the layout the code writes.
+
+The `synthetic` depth and semantic backends exist to run the full pipeline
+without a GPU. They are placeholders whose output is structurally
+indistinguishable from real output, so every run that uses them says so in its
+own `extraction_report.json`; they must never be used for real data.

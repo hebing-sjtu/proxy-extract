@@ -205,10 +205,15 @@ def render_scene_preview(
 
     from . import proxy
 
+    from .delivery import proxy_dir_for
+
     scene_dir, out_path = Path(scene_dir), Path(out_path)
-    colour_path = scene_dir / "color.mp4"
+    # Accept either the scene or its proxy/ directory, because both are things
+    # a reviewer plausibly has in hand after an ls.
+    proxy_dir = scene_dir if (scene_dir / "color.mp4").exists() else proxy_dir_for(scene_dir)
+    colour_path = proxy_dir / "color.mp4"
     if not colour_path.exists():
-        raise FileNotFoundError(f"{scene_dir} has no color.mp4; is it a delivered scene?")
+        raise FileNotFoundError(f"{scene_dir} has no proxy/color.mp4; is it a delivered scene?")
 
     total = int(cv2.VideoCapture(str(colour_path)).get(cv2.CAP_PROP_FRAME_COUNT))
     sheet = out_path.suffix.lower() == ".png"
@@ -219,8 +224,8 @@ def render_scene_preview(
     )
 
     colour = _read_video_rgb(colour_path, picks)
-    semantic = _read_video_rgb(scene_dir / "semantic.mp4", picks)
-    depth = _read_video_rgb(scene_dir / "depth.mp4", picks)
+    semantic = _read_video_rgb(proxy_dir / "semantic.mp4", picks)
+    depth = _read_video_rgb(proxy_dir / "depth.mp4", picks)
     count = min(len(colour), len(semantic), len(depth))
     if count == 0:
         raise ValueError(f"{scene_dir} decoded to no frames")

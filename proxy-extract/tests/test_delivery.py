@@ -51,7 +51,7 @@ def episode(tmp_path):
 
 @pytest.fixture
 def scene(episode, tmp_path):
-    out = tmp_path / "seg_long_000000"
+    out = tmp_path / "seg_000000"
     report = delivery.extract_scene(
         episode,
         out,
@@ -83,13 +83,15 @@ def decode_rgb(path, *, limit=None):
     return np.stack(frames)
 
 
-def test_scene_holds_the_five_delivery_files(scene):
+def test_the_four_videos_live_under_proxy_and_the_source_tar_beside_it(scene):
+    """What we derived goes in `proxy/`; what the corpus gave us stays out of it."""
     out, _ = scene
 
     for name in ("color.mp4", "depth.mp4", "semantic.mp4", "duv.mp4"):
-        assert (out / name).is_file(), name
-        assert (out / name).stat().st_size > 0, name
-    assert (out / "annotation.tar").read_bytes() == b"not-a-real-tar-but-copied-verbatim"
+        assert (out / "proxy" / name).is_file(), name
+        assert (out / "proxy" / name).stat().st_size > 0, name
+        assert not (out / name).exists(), f"{name} must not also sit in the scene root"
+    assert (out / "annotations.tar").read_bytes() == b"not-a-real-tar-but-copied-verbatim"
     assert (out / "extraction_report.json").is_file()
 
 
@@ -99,7 +101,7 @@ def test_every_frame_is_delivered_at_the_requested_size(scene):
     assert report["frames"] == 24, "no windowing: the whole episode is delivered"
     assert report["size"] == list(SIZE)
     for name in ("color.mp4", "depth.mp4", "semantic.mp4", "duv.mp4"):
-        info = probe(out / name)
+        info = probe(out / "proxy" / name)
         assert info.frames == 24, name
         assert (info.width, info.height) == SIZE, name
 
@@ -112,7 +114,7 @@ def test_source_frame_rate_is_preserved(scene):
 
 def test_semantic_ids_survive_the_encode_bit_exactly(scene):
     out, report = scene
-    decoded = decode_rgb(out / "semantic.mp4")
+    decoded = decode_rgb(out / "proxy" / "semantic.mp4")
 
     assert decoded.shape == (24, SIZE[1], SIZE[0], 3)
     assert not decoded[:, :, :, 0].any(), "R must be 0; a non-zero R means a YUV decode"
@@ -128,7 +130,7 @@ def test_depth_round_trips_within_the_quantiser_step(scene):
     out, _ = scene
     import cv2
 
-    capture = cv2.VideoCapture(str(out / "depth.mp4"))
+    capture = cv2.VideoCapture(str(out / "proxy" / "depth.mp4"))
     ok, frame = capture.read()
     capture.release()
     assert ok
@@ -218,8 +220,8 @@ def test_semantic_ids_round_trip_through_the_real_encoder(tmp_path):
 
 def test_proxy_marks_sky_with_the_reserved_red_code(scene):
     out, _ = scene
-    proxy_frames = decode_rgb(out / "duv.mp4", limit=1)
-    semantic_frames = decode_rgb(out / "semantic.mp4", limit=1)
+    proxy_frames = decode_rgb(out / "proxy" / "duv.mp4", limit=1)
+    semantic_frames = decode_rgb(out / "proxy" / "semantic.mp4", limit=1)
 
     red = proxy_frames[0, :, :, 0]
     ids = semantic_frames[0, :, :, 2]
@@ -273,7 +275,7 @@ def test_scenes_are_numbered_by_sample_id_not_discovery_order():
     ]
     assigned = delivery.assign_scenes(episodes)
 
-    assert [item.scene for item in assigned] == ["seg_long_000000", "seg_long_000001", "seg_long_000002"]
+    assert [item.scene for item in assigned] == ["seg_000000", "seg_000001", "seg_000002"]
     assert [item.sample_id for item in assigned] == ["aaa", "mmm", "zzz"]
 
 
@@ -297,9 +299,9 @@ def test_directory_naming_leaves_room_for_the_whole_corpus():
     """Six digits, because ABot ships 30,969 episodes and four would wrap."""
     from pathlib import Path
 
-    assert delivery.scene_dir_for(Path("/out"), 0).name == "seg_long_000000"
-    assert delivery.scene_dir_for(Path("/out"), 1999).name == "seg_long_001999"
-    assert delivery.scene_dir_for(Path("/out"), 30968).name == "seg_long_030968"
+    assert delivery.scene_dir_for(Path("/out"), 0).name == "seg_000000"
+    assert delivery.scene_dir_for(Path("/out"), 1999).name == "seg_001999"
+    assert delivery.scene_dir_for(Path("/out"), 30968).name == "seg_030968"
 
 
 def test_duplicate_sample_ids_are_refused():
@@ -336,7 +338,7 @@ def test_manifest_records_provenance_for_every_scene(tmp_path):
     payload = json.loads(path.read_text())
 
     assert payload["count"] == 1
-    assert payload["scenes"][0]["scene"] == "seg_long_000000"
+    assert payload["scenes"][0]["scene"] == "seg_000000"
     assert payload["scenes"][0]["sample_id"] == "bbb"
     assert payload["scenes"][0]["source_video"] == "/data/bbb/video.mp4"
 
@@ -358,8 +360,8 @@ def test_resume_survives_a_video_it_cannot_even_open(scene):
     exception would lose a whole shard over one damaged directory.
     """
     out, _ = scene
-    payload = (out / "duv.mp4").read_bytes()
-    (out / "duv.mp4").write_bytes(payload[: len(payload) // 3])
+    payload = (out / "proxy" / "duv.mp4").read_bytes()
+    (out / "proxy" / "duv.mp4").write_bytes(payload[: len(payload) // 3])
 
     assert delivery.already_done(out) is False
 
@@ -378,8 +380,8 @@ def test_audit_counts_missing_and_damaged_without_raising(scene, tmp_path):
             ]
         ),
     )
-    payload = (out / "color.mp4").read_bytes()
-    (out / "color.mp4").write_bytes(payload[:512])
+    payload = (out / "proxy" / "color.mp4").read_bytes()
+    (out / "proxy" / "color.mp4").write_bytes(payload[:512])
 
     summary = delivery.audit(root)
 
@@ -387,7 +389,7 @@ def test_audit_counts_missing_and_damaged_without_raising(scene, tmp_path):
     assert summary["complete"] == 0
     assert summary["incomplete"] == 1, "the damaged scene is incomplete, not missing"
     assert summary["missing"] == 1
-    assert summary["incomplete_scenes"] == ["seg_long_000000"]
+    assert summary["incomplete_scenes"] == ["seg_000000"]
 
 
 def test_a_placeholder_run_says_so_in_its_own_report(scene):
@@ -407,7 +409,7 @@ def test_a_placeholder_run_warns_while_it_writes(episode, tmp_path):
     with pytest.warns(delivery.PlaceholderOutput, match="must not be delivered"):
         delivery.extract_scene(
             episode,
-            tmp_path / "seg_long_000000",
+            tmp_path / "seg_000000",
             config=delivery.DeliveryConfig(
                 depth_backend="synthetic",
                 semantic_backend="synthetic",
@@ -466,7 +468,7 @@ def test_the_scene_preview_also_writes_a_video(scene, tmp_path):
 def test_the_scene_preview_refuses_a_directory_that_is_not_a_scene(tmp_path):
     from proxy_extract.preview import render_scene_preview
 
-    with pytest.raises(FileNotFoundError, match="no color.mp4"):
+    with pytest.raises(FileNotFoundError, match="no proxy/color.mp4"):
         render_scene_preview(tmp_path, tmp_path / "sheet.png")
 
 

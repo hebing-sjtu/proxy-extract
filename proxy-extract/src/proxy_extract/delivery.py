@@ -1,4 +1,4 @@
-"""Predict a gta-web style delivery scene from a plain RGB episode.
+"""Predict a delivery scene from a plain RGB episode.
 
 `pipeline.extract_clip` writes the `condition_root` that code-world-model
 consumes: raw float32 depth and 8-bit IDs on the 336x192 grid its windows are
@@ -6,13 +6,19 @@ cut to. This module writes the other deliverable, the one DATA_F.md specifies �
 four aligned videos at 1280x720, full episode length, plus the source
 annotations:
 
-    seg_long_000000/
-        color.mp4           RGB, libx264 / yuv420p
-        depth.mp4           inverted log-z, 8-bit grey, lossless
-        semantic.mp4        (R, G, B) = (0, 0, id), lossless RGB
-        duv.mp4             R = log-z, G/B = semantic colour, lossless RGB
-        annotation.tar      the episode's own annotations, verbatim
+    seg_000000/
+        proxy/
+            color.mp4       RGB, libx264 / yuv420p
+            depth.mp4       inverted log-z, 8-bit grey, lossless
+            semantic.mp4    (R, G, B) = (0, 0, id), lossless RGB
+            duv.mp4         R = log-z, G/B = semantic colour, lossless RGB
+        annotations.tar     the episode's own annotations, verbatim
         extraction_report.json
+
+The four videos sit under `proxy/` because they are all derived: predicted or
+composed by this pipeline at a reduced resolution. What came with the corpus
+stays beside that directory, not inside it, so a reader can tell at a glance
+which half of a scene is the dataset's own claim and which half is ours.
 
 The 336x192 reduction is deliberately *not* applied here. It throws away 93% of
 the pixels and it is cheap to redo from these videos later, so doing it now
@@ -21,8 +27,8 @@ held back: every decoded frame is delivered, at the source frame rate.
 
 1280x720 is exactly two-thirds of ABot's 1920x1080, so the resize introduces no
 aspect distortion, and it is the resolution `semantic.player`'s priors were
-fitted at on the real gta-web corpus — so the protagonist split runs on native
-pixels here rather than on a proxy grid.
+fitted at — so the protagonist split runs on native pixels here rather than on
+a reduced grid.
 
 The colour video is encoded from the same decoded frames the models saw, rather
 than by handing the source file to ffmpeg separately. Two resamplers do not
@@ -79,11 +85,15 @@ VIDEO_NAMES = {
 # `cwm_h3_inference.duv` reads a condition_root, not this file.
 _ENCODER_KIND = {"color": "color", "depth": "depth", "semantic": "semantic", "duv": "proxy"}
 
-ANNOTATION_NAME = "annotation.tar"
+# Everything this pipeline derives goes here; everything the corpus supplied
+# stays in the scene root next to it.
+PROXY_DIRNAME = "proxy"
+
+ANNOTATION_NAME = "annotations.tar"
 REPORT_NAME = "extraction_report.json"
 
 # Long-form segments: one directory per episode, full length, no window cutting.
-SCENE_PREFIX = "seg_long_"
+SCENE_PREFIX = "seg_"
 
 _TAXONOMY_OF_BACKEND = {"coarse6": "coarse6", "standard11": "standard11"}
 
@@ -179,7 +189,8 @@ def extract_scene(
     config = config or DeliveryConfig()
     video, out_dir = Path(video), Path(out_dir)
     started = time.time()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    proxy_dir = proxy_dir_for(out_dir)
+    proxy_dir.mkdir(parents=True, exist_ok=True)
 
     info = probe(video)
     fps = config.fps or (info.fps if info.fps and info.fps > 0 else 24.0)
@@ -196,7 +207,7 @@ def extract_scene(
 
     inferred = _infer(
         video,
-        out_dir / VIDEO_NAMES["color"],
+        proxy_dir / VIDEO_NAMES["color"],
         config,
         fps=fps,
         depth_backend=depth_backend,
@@ -232,7 +243,7 @@ def extract_scene(
     )
 
     written = _encode(
-        out_dir,
+        proxy_dir,
         depth,
         labels,
         fps=fps,
@@ -240,7 +251,7 @@ def extract_scene(
         driving=bool(hero_info.get("driving", False)),
         inverted_duv_depth=config.inverted_duv_depth,
     )
-    written["color"] = str(out_dir / VIDEO_NAMES["color"])
+    written["color"] = str(proxy_dir / VIDEO_NAMES["color"])
 
     annotation = _copy_annotation(video, out_dir, annotations)
 
@@ -376,7 +387,7 @@ def _infer(
 
 
 def _encode(
-    out_dir: Path,
+    proxy_dir: Path,
     depth: np.ndarray,
     labels: np.ndarray,
     *,
@@ -391,7 +402,7 @@ def _encode(
 
     encoders = {
         stream: proxy.open_encoder(
-            out_dir / VIDEO_NAMES[stream], width, height, fps, kind=_ENCODER_KIND[stream]
+            proxy_dir / VIDEO_NAMES[stream], width, height, fps, kind=_ENCODER_KIND[stream]
         )
         for stream in ("depth", "semantic", "duv")
     }
@@ -418,7 +429,7 @@ def _encode(
         if errors:
             raise proxy.EncodeError("; ".join(errors))
 
-    return {stream: str(out_dir / VIDEO_NAMES[stream]) for stream in encoders}
+    return {stream: str(proxy_dir / VIDEO_NAMES[stream]) for stream in encoders}
 
 
 def _copy_annotation(video: Path, out_dir: Path, annotations: Path | None) -> str | None:
@@ -438,6 +449,11 @@ def _copy_annotation(video: Path, out_dir: Path, annotations: Path | None) -> st
 
 def scene_dir_for(output_root: Path, index: int) -> Path:
     return Path(output_root) / f"{SCENE_PREFIX}{index:06d}"
+
+
+def proxy_dir_for(scene_dir: Path) -> Path:
+    """Where a scene's four derived videos live."""
+    return Path(scene_dir) / PROXY_DIRNAME
 
 
 # ------------------------------------------------------------------- batching
@@ -460,7 +476,7 @@ class SceneAssignment:
 def assign_scenes(
     episodes: list[tuple[str, Path, Path | None]],
 ) -> list[SceneAssignment]:
-    """Number episodes `seg_long_000000` upward, ordered by sample id.
+    """Number episodes `seg_000000` upward, ordered by sample id.
 
     Sorting by sample id rather than by discovery order makes the numbering a
     function of the input set alone. Two consequences matter: sharded workers
@@ -570,7 +586,8 @@ def audit(output_root: Path, assignments: list[SceneAssignment] | None = None) -
             continue
         if already_done(scene_dir):
             complete.append(item.scene)
-            total_bytes += sum(p.stat().st_size for p in scene_dir.iterdir() if p.is_file())
+            # rglob, not iterdir: the videos are a directory down from here.
+            total_bytes += sum(p.stat().st_size for p in scene_dir.rglob("*") if p.is_file())
             try:
                 total_frames += int(json.loads((scene_dir / REPORT_NAME).read_text())["frames"])
             except (ValueError, OSError, KeyError):
@@ -677,8 +694,9 @@ def already_done(scene_dir: Path) -> bool:
         report = json.loads(report_path.read_text())
         expected = int(report["frames"])
 
+        proxy_dir = proxy_dir_for(scene_dir)
         for name in VIDEO_NAMES.values():
-            path = scene_dir / name
+            path = proxy_dir / name
             if not path.is_file() or path.stat().st_size == 0:
                 return False
             if probe(path).frames != expected:

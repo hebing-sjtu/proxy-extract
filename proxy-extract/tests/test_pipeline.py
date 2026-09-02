@@ -16,7 +16,6 @@ import pytest
 
 from proxy_extract import contract
 from proxy_extract.pipeline import ExtractionConfig, extract_clip
-from proxy_extract.qc import score_pair, tier_for
 from proxy_extract.video import probe, read_frames
 
 SYNTHETIC = ExtractionConfig(
@@ -34,11 +33,6 @@ def extracted(sample_clip, tmp_path_factory):
 
 
 class TestDecode:
-    def test_sample_clip_is_the_expected_shape(self, sample_clip):
-        info = probe(sample_clip)
-        assert (info.width, info.height) == (1344, 768)
-        assert info.frames == contract.WINDOW_FRAMES
-
     def test_frames_are_rgb_uint8_at_the_requested_size(self, sample_clip):
         frames = read_frames(sample_clip, size=(336, 192), limit=3)
         assert len(frames) == 3
@@ -109,19 +103,19 @@ class TestEndToEnd:
 
 
 class TestOutputPaths:
-    def test_the_source_track_is_part_of_the_path(self, tmp_path):
+    def test_the_source_directory_is_part_of_the_path(self, tmp_path):
         from proxy_extract.pipeline import condition_dir_for
 
-        assert condition_dir_for(tmp_path, Path("data/low/clip_a.mp4")) == tmp_path / "low" / "clip_a"
+        assert condition_dir_for(tmp_path, Path("data/00/clip_a.mp4")) == tmp_path / "00" / "clip_a"
 
-    def test_high_and_low_of_one_pair_do_not_collide(self, tmp_path):
+    def test_same_named_clips_in_different_directories_do_not_collide(self, tmp_path):
         from proxy_extract.pipeline import condition_dir_for
 
-        # A same-named pair overwriting itself would silently halve a dataset
-        # built by extracting both tracks.
-        high = condition_dir_for(tmp_path, Path("data/high/26_trevor.mp4"))
-        low = condition_dir_for(tmp_path, Path("data/low/26_trevor.mp4"))
-        assert high != low
+        # ABot names every episode `video.mp4` and distinguishes them by the
+        # directory above, so collapsing that would silently collapse the set.
+        first = condition_dir_for(tmp_path, Path("data/00/sample_a/video.mp4"))
+        second = condition_dir_for(tmp_path, Path("data/00/sample_b/video.mp4"))
+        assert first != second
 
 
 class TestPreview:
@@ -132,34 +126,3 @@ class TestPreview:
         path = render_preview(out, tmp_path / "preview.mp4")
         assert path.stat().st_size > 0
         assert probe(path).frames == contract.WINDOW_FRAMES
-
-
-class TestQualityControl:
-    @pytest.mark.parametrize(
-        "epe_rel,expected", [(0.0, "keep"), (0.22, "keep"), (0.23, "review"), (0.45, "review"), (0.9, "drop")]
-    )
-    def test_tier_boundaries(self, epe_rel, expected):
-        assert tier_for(epe_rel) == expected
-
-    def test_a_well_aligned_pair_scores_keep(self):
-        from .conftest import SAMPLE_DATA
-
-        high = SAMPLE_DATA / "high" / "32_trevor_seg_0085.mp4"
-        low = SAMPLE_DATA / "low" / "32_trevor_seg_0085.mp4"
-        if not high.is_file():
-            pytest.skip("sample data not available")
-        assert score_pair(high, low).tier == "keep"
-
-    def test_a_drifted_pair_scores_drop(self):
-        from .conftest import SAMPLE_DATA
-
-        high = SAMPLE_DATA / "high" / "07_john_marston_seg_0074.mp4"
-        low = SAMPLE_DATA / "low" / "07_john_marston_seg_0074.mp4"
-        if not high.is_file():
-            pytest.skip("sample data not available")
-        assert score_pair(high, low).tier == "drop"
-
-    def test_a_clip_compared_against_itself_is_perfectly_aligned(self, sample_clip):
-        report = score_pair(sample_clip, sample_clip)
-        assert report.epe_rel < 1e-6
-        assert report.flow_cos == pytest.approx(1.0, abs=1e-3)

@@ -14,7 +14,7 @@ from proxy_extract.cli import resolve_videos
 class TestResolveVideos:
     @pytest.fixture
     def clip_dir(self, tmp_path) -> Path:
-        directory = tmp_path / "high"
+        directory = tmp_path / "clips"
         directory.mkdir()
         for name in ("b.mp4", "a.mp4", "c.MP4", "notes.txt", "cams.json"):
             (directory / name).touch()
@@ -90,7 +90,7 @@ class TestResume:
             contract.write_frame(root, ordinal, depth.astype(np.float32), labels)
 
     def test_a_complete_root_is_recognised(self, tmp_path):
-        clip = Path("low/clip.mp4")
+        clip = Path("01/clip.mp4")
         root = pipeline.condition_dir_for(tmp_path, clip)
         self.write_condition(root, contract.WINDOW_FRAMES)
         (root / "extraction_report.json").write_text("{}")
@@ -98,17 +98,17 @@ class TestResume:
         assert pipeline.already_done(tmp_path, clip) is True
 
     def test_an_untouched_output_is_not_done(self, tmp_path):
-        assert pipeline.already_done(tmp_path, Path("low/clip.mp4")) is False
+        assert pipeline.already_done(tmp_path, Path("01/clip.mp4")) is False
 
     def test_a_root_without_its_report_is_redone(self, tmp_path):
         """The report is written last, so its absence means the run was cut short."""
-        clip = Path("low/clip.mp4")
+        clip = Path("01/clip.mp4")
         self.write_condition(pipeline.condition_dir_for(tmp_path, clip), contract.WINDOW_FRAMES)
 
         assert pipeline.already_done(tmp_path, clip) is False
 
     def test_a_truncated_root_is_redone_rather_than_trusted(self, tmp_path):
-        clip = Path("low/clip.mp4")
+        clip = Path("01/clip.mp4")
         root = pipeline.condition_dir_for(tmp_path, clip)
         self.write_condition(root, contract.WINDOW_FRAMES)
         (root / "extraction_report.json").write_text("{}")
@@ -117,7 +117,7 @@ class TestResume:
         assert pipeline.already_done(tmp_path, clip) is False
 
     def test_a_corrupt_file_is_redone_rather_than_trusted(self, tmp_path):
-        clip = Path("low/clip.mp4")
+        clip = Path("01/clip.mp4")
         root = pipeline.condition_dir_for(tmp_path, clip)
         self.write_condition(root, contract.WINDOW_FRAMES)
         (root / "extraction_report.json").write_text("{}")
@@ -125,14 +125,14 @@ class TestResume:
 
         assert pipeline.already_done(tmp_path, clip) is False
 
-    def test_high_and_low_resume_independently(self, tmp_path):
-        high, low = Path("high/clip.mp4"), Path("low/clip.mp4")
-        root = pipeline.condition_dir_for(tmp_path, high)
+    def test_same_named_clips_resume_independently(self, tmp_path):
+        first, second = Path("00/clip.mp4"), Path("01/clip.mp4")
+        root = pipeline.condition_dir_for(tmp_path, first)
         self.write_condition(root, contract.WINDOW_FRAMES)
         (root / "extraction_report.json").write_text("{}")
 
-        assert pipeline.already_done(tmp_path, high) is True
-        assert pipeline.already_done(tmp_path, low) is False
+        assert pipeline.already_done(tmp_path, first) is True
+        assert pipeline.already_done(tmp_path, second) is False
 
 
 class TestCoarseTaxonomy:

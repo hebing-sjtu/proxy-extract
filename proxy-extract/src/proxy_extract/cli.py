@@ -1,8 +1,9 @@
-"""Command line entry point for the extraction and scoring commands.
+"""Command line entry point for the extraction commands.
 
-Two groups. `qc`, `camera-qc`, `extract`, `validate` and `preview` build and
-check a condition_root. `gtaweb-probe` and `player-bench` score against
-gta-web's engine ground truth and need neither a GPU nor a model.
+Two deliverables, two groups. `scenes` and `scenes-audit` write and check the
+1280x720 segments DATA_F.md specifies, which is what a delivery run produces.
+`extract`, `videos`, `validate` and `preview` build and check the 336x192
+`condition_root` that code-world-model consumes.
 """
 
 from __future__ import annotations
@@ -16,7 +17,6 @@ from . import cameras as camera_io
 from . import contract
 from .pipeline import ExtractionConfig, condition_dir_for, extract_clip, extract_dataset, shard
 from .proxy import DEFAULT_COLOR_CRF
-from .qc import score_dataset, score_pair, write_report
 
 DEPTH_BACKENDS = ("mapanything", "depth_anything", "depth_anything_v3", "synthetic")
 SEMANTIC_BACKENDS = ("ade20k", "cityscapes", "coarse6", "standard11", "synthetic")
@@ -26,23 +26,6 @@ REFINERS = ("none", "sam3")
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="proxy-extract", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-
-    qc = sub.add_parser("qc", help="score high/low clip pairs for geometric drift")
-    qc.add_argument("--dataset", type=Path, required=True, help="directory holding high/ and low/")
-    qc.add_argument("--high-dir", default="high")
-    qc.add_argument("--low-dir", default="low")
-    qc.add_argument("--report", type=Path, help="write the per-clip JSON report here")
-
-    camera_qc = sub.add_parser(
-        "camera-qc",
-        help="score each render against GT cameras (preferred over `qc` when tracks exist)",
-    )
-    camera_qc.add_argument("--dataset", type=Path, required=True)
-    camera_qc.add_argument("--camera-dir", default="camera")
-    camera_qc.add_argument(
-        "--track", default="low", help="which render subdirectory to score, e.g. high or low"
-    )
-    camera_qc.add_argument("--report", type=Path)
 
     extract = sub.add_parser("extract", help="write a condition_root for one or more clips")
     extract.add_argument(
@@ -96,7 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     scenes = sub.add_parser(
         "scenes",
-        help="write DATA_F.md delivery segments (1280x720 color/depth/semantic/duv + annotation)",
+        help="write DATA_F.md delivery segments (1280x720 color/depth/semantic/duv + annotations)",
     )
     scenes.add_argument(
         "--video", type=Path, nargs="+", required=True,
@@ -107,7 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="search directories recursively, for datasets that nest one dir per episode",
     )
-    scenes.add_argument("--out", type=Path, required=True, help="root to hold seg_long_NNNNNN/")
+    scenes.add_argument("--out", type=Path, required=True, help="root to hold seg_NNNNNN/")
     scenes.add_argument("--depth-backend", choices=DEPTH_BACKENDS, default="mapanything")
     scenes.add_argument(
         "--depth-backend-option", action="append", default=[], metavar="KEY=VALUE",
@@ -171,7 +154,7 @@ def build_parser() -> argparse.ArgumentParser:
         "scenes-preview",
         help="render a delivered scene to a viewable contact sheet or MP4",
     )
-    scene_preview.add_argument("--scene", type=Path, required=True, help="a seg_long_NNNNNN dir")
+    scene_preview.add_argument("--scene", type=Path, required=True, help="a seg_NNNNNN dir")
     scene_preview.add_argument(
         "--out", type=Path, required=True, help=".png for a contact sheet, else an MP4"
     )
@@ -201,106 +184,7 @@ def build_parser() -> argparse.ArgumentParser:
         "(near 0, far 254, sky 255), which is what keeps the sky sentinel unambiguous",
     )
 
-    probe = sub.add_parser(
-        "gtaweb-probe",
-        help="check that a gta-web clip decodes the way DATA_F.md says it does",
-    )
-    probe.add_argument("--clips-dir", type=Path, required=True)
-    probe.add_argument("--limit", type=int, default=3, help="how many clips to sample")
-
-    bench = sub.add_parser(
-        "player-bench",
-        help="score the player/ped split against gta-web's own labels (CPU only)",
-    )
-    bench.add_argument("--clips-dir", type=Path, required=True)
-    bench.add_argument("--limit", type=int, help="stop after this many clips")
-    bench.add_argument("--report", type=Path)
-    bench.add_argument(
-        "--sweep",
-        action="store_true",
-        help="grid the screen anchor instead of scoring the default once",
-    )
-
     return parser
-
-
-def _run_qc(args: argparse.Namespace) -> int:
-    reports = score_dataset(args.dataset, high_dir=args.high_dir, low_dir=args.low_dir)
-    width = max(len(r.clip) for r in reports)
-    header = f"{'clip':{width}s} {'tier':>7s} {'EPE/motion':>11s} {'flow cos':>9s}"
-    print(header)
-    print("-" * len(header))
-    for report in sorted(reports, key=lambda r: r.epe_rel):
-        print(f"{report.clip:{width}s} {report.tier:>7s} {report.epe_rel:11.3f} {report.flow_cos:9.3f}")
-
-    summary = {tier: sum(1 for r in reports if r.tier == tier) for tier in ("keep", "review", "drop")}
-    print(f"\n{len(reports)} clips: " + ", ".join(f"{v} {k}" for k, v in summary.items()))
-    if args.report:
-        write_report(reports, args.report)
-        print(f"report written to {args.report}")
-    return 0
-
-
-def _run_camera_qc(args: argparse.Namespace) -> int:
-    import numpy as np
-
-    from .camera_qc import fidelity_tier, verify_track
-    from .video import read_frames
-
-    tracks = sorted((args.dataset / args.camera_dir).glob("*.json"))
-    if not tracks:
-        raise SystemExit(f"no camera tracks under {args.dataset / args.camera_dir}")
-
-    rows = []
-    for path in tracks:
-        video_path = args.dataset / args.track / f"{path.stem}.mp4"
-        if not video_path.exists():
-            print(f"{path.stem}: no {args.track} render, skipped")
-            continue
-
-        track = camera_io.load(path)
-        frames = read_frames(video_path, grayscale=True)
-        # The delivered intrinsics target the 1280x720 high render; retarget
-        # them if this render was delivered at another size.
-        height, width = frames[0].shape
-        if (width, height) != (1280, 720):
-            focal = track.intrinsics[0, 0] * height / 720.0
-            retargeted = np.array(
-                [[focal, 0.0, width / 2], [0.0, focal, height / 2], [0.0, 0.0, 1.0]]
-            )
-            track = camera_io.CameraTrack(track.cam2world, retargeted, metric=track.metric)
-
-        verdict = verify_track(frames, track, path.stem)
-        rows.append(verdict)
-        print(
-            f"{verdict.clip:32s} poses:{verdict.tier:<9s} fidelity:{fidelity_tier(verdict.sampson_median):<8s}"
-            f" sampson {verdict.sampson_median:7.2f} px  inlier {verdict.inlier_fraction:5.2f}"
-        )
-
-    summary = {
-        tier: sum(1 for r in rows if fidelity_tier(r.sampson_median) == tier)
-        for tier in ("keep", "review", "drop")
-    }
-    print(f"\n{len(rows)} clips: " + ", ".join(f"{v} {k}" for k, v in summary.items()))
-    if args.report:
-        args.report.write_text(
-            json.dumps(
-                [
-                    {
-                        "clip": r.clip,
-                        "sampson_median": r.sampson_median,
-                        "inlier_fraction": r.inlier_fraction,
-                        "pose_tier": r.tier,
-                        "fidelity_tier": fidelity_tier(r.sampson_median),
-                        "note": r.note,
-                    }
-                    for r in rows
-                ],
-                indent=2,
-            )
-        )
-        print(f"report written to {args.report}")
-    return 0
 
 
 VIDEO_SUFFIXES = (".mp4", ".mov", ".mkv", ".webm")
@@ -532,97 +416,9 @@ def _run_videos(args: argparse.Namespace) -> int:
     return 0
 
 
-def _gtaweb_clips(clips_dir: Path, limit: int | None):
-    """Pair each `clips.json` entry with its semantic file, skipping incomplete ones."""
-    from .datasets import gtaweb
-
-    entries = gtaweb.load_clips(clips_dir)
-    for clip in entries[:limit] if limit else entries:
-        if clip.semantic and (clips_dir / clip.semantic).exists():
-            yield clip
-
-
-def _run_gtaweb_probe(args: argparse.Namespace) -> int:
-    """Answer "does this corpus read the way the docs claim" before a batch run."""
-    from .datasets import gtaweb
-
-    clips = list(_gtaweb_clips(args.clips_dir, args.limit))
-    if not clips:
-        raise SystemExit(f"no clips with a semantic file under {args.clips_dir}")
-
-    failures = 0
-    for clip in clips:
-        depth_path = args.clips_dir / clip.depth if clip.depth else None
-        report = gtaweb.probe_decode(depth_path, args.clips_dir / clip.semantic)
-        print(f"\n{clip.semantic}  tag={clip.tag}")
-        for stream, result in report.items():
-            if result.get("ok"):
-                print(f"  {stream:9s} ok  " + json.dumps({k: v for k, v in result.items() if k != "ok"}))
-            else:
-                failures += 1
-                print(f"  {stream:9s} FAILED  {result['error']}")
-
-        if depth_path is not None and report.get("depth", {}).get("ok"):
-            depth = gtaweb.decode_depth(depth_path, limit=8)
-            suspicion = gtaweb.lossy_depth_suspicion(depth)
-            verdict = "lossless" if suspicion["lossless"] else "LOSSY — values were interpolated"
-            print(f"  depth compression: {verdict} ({suspicion['distinct_values']} distinct values)")
-
-    print(f"\n{len(clips)} clips probed, {failures} stream(s) failed")
-    return 1 if failures else 0
-
-
-def _run_player_bench(args: argparse.Namespace) -> int:
-    from .benchmark import player_bench
-    from .datasets import gtaweb
-
-    clips = list(_gtaweb_clips(args.clips_dir, args.limit))
-    if not clips:
-        raise SystemExit(f"no clips with a semantic file under {args.clips_dir}")
-
-    loaded = []
-    for clip in clips:
-        try:
-            loaded.append((gtaweb.decode_semantic(args.clips_dir / clip.semantic), clip.tag))
-        except gtaweb.DecodeError as error:
-            print(f"{clip.semantic}: {error}")
-
-    if not loaded:
-        raise SystemExit("no clip decoded; run `gtaweb-probe` to see why")
-
-    if args.sweep:
-        anchors = [(x / 20, y / 20) for x in range(8, 13) for y in range(9, 14)]
-        rows = player_bench.sweep_anchor(loaded, anchors)
-        rows.sort(key=lambda row: row["accuracy"], reverse=True)
-        print(f"{'anchor':>14s} {'accuracy':>9s} {'decided':>8s}")
-        for row in rows:
-            print(
-                f"  ({row['anchor'][0]:.2f}, {row['anchor'][1]:.2f}) "
-                f"{row['accuracy']:9.3f} {row['decided_fraction']:8.3f}"
-            )
-        payload: dict = {"sweep": rows}
-    else:
-        measured = player_bench.measure_anchor([truth for truth, _ in loaded])
-        scores = [player_bench.score_clip(truth, tag=tag) for truth, tag in loaded]
-        summary = player_bench.aggregate(scores)
-
-        print("\nwhere the protagonist actually sits:")
-        print(json.dumps(measured, indent=2))
-        print("\nsplit accuracy:")
-        print(json.dumps(summary, indent=2))
-        payload = {"measured_anchor": measured, **summary}
-
-    if args.report:
-        args.report.write_text(json.dumps(payload, indent=2))
-        print(f"\nreport written to {args.report}")
-    return 0
-
-
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     handlers = {
-        "qc": _run_qc,
-        "camera-qc": _run_camera_qc,
         "extract": _run_extract,
         "scenes": _run_scenes,
         "scenes-audit": _run_scenes_audit,
@@ -630,8 +426,6 @@ def main(argv: list[str] | None = None) -> int:
         "preview": _run_preview,
         "scenes-preview": _run_scenes_preview,
         "videos": _run_videos,
-        "gtaweb-probe": _run_gtaweb_probe,
-        "player-bench": _run_player_bench,
     }
     return handlers[args.command](args)
 
