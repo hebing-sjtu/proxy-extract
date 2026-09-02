@@ -94,6 +94,8 @@ echo "=== self-check ==="
 "$py" -m pytest "$here/proxy-extract/tests" -q || die "the test suite does not pass in this venv"
 
 "$py" - <<'PY'
+import shutil
+
 import proxy_extract
 from proxy_extract.proxy import EncodeError, ffmpeg_binary
 
@@ -106,7 +108,19 @@ try:
     import torch
 
     print(f"torch            {torch.__version__}")
-    print(f"cuda available   {torch.cuda.is_available()} ({torch.cuda.device_count()} device(s))")
+    available = torch.cuda.is_available()
+    print(f"cuda available   {available} ({torch.cuda.device_count() if available else 0} device(s))")
+    # Worth saying loudly here rather than leaving it to the first run: the
+    # wheel PyPI serves for this version is built against CUDA 13, and a node
+    # whose driver is 12.x gets no GPUs from it, quietly.
+    if not available and shutil.which("nvidia-smi"):
+        print(
+            f"\nwarning: this node has nvidia-smi but torch cannot use it. torch was built\n"
+            f"against CUDA {torch.version.cuda}; if the driver is older, install the matching\n"
+            "build, e.g. for CUDA 12.6:\n"
+            "  pip install --index-url https://download.pytorch.org/whl/cu126 \\\n"
+            "      torch==2.13.0+cu126 torchvision==0.28.0+cu126"
+        )
 except ImportError:
     print("torch            not installed (EXTRAS=core)")
 PY

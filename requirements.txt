@@ -18,7 +18,18 @@ imageio-ffmpeg==0.6.0
 
 # --- model backends ---
 # On linux/x86_64 the default PyPI torch wheel already bundles CUDA, so no
-# extra index is needed. For a different CUDA minor, see docker/README.md.
+# extra index is needed — but which CUDA it bundles is PyPI's choice, and for
+# this version it is 13.0, which needs a 580+ driver. CUDA is only compatible
+# across minor versions, so on a node whose driver is 12.x that wheel cannot
+# see the GPUs at all: torch.cuda.is_available() is False and everything falls
+# back to the CPU behind a single UserWarning. Same versions, built for 12.6:
+#
+#   pip install --index-url https://download.pytorch.org/whl/cu126 \
+#       torch==2.13.0+cu126 torchvision==0.28.0+cu126
+#
+# The `+cu126` matters: plain `torch==2.13.0` is already satisfied by the cu130
+# build, so pip would do nothing. run_scenes.sh refuses to launch if this is
+# wrong; `nvidia-smi --query-gpu=driver_version --format=csv` says which it is.
 torch==2.13.0
 torchvision==0.28.0
 transformers==5.16.1
