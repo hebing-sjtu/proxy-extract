@@ -23,6 +23,57 @@
 
 ---
 
+## 0. 整条管线长什么样
+
+两条产出路线，**共用同一套模型和后处理**，只有分辨率和落盘格式不同。搞混这两条是
+最常见的困惑来源：
+
+| | `extract` → condition_root | `scenes` → seg_long_NNNNNN |
+| --- | --- | --- |
+| 给谁用 | CWM 训练直接吃 | 按 `DATA_F.md` 交付 |
+| 分辨率 | 336×192 | 1280×720 |
+| 落盘 | 每帧 `.depth.f32` + `.semantic_id.png` | 四个 mp4 + `annotation.tar` |
+| 深度方向 | **反向**（近 = 高码值） | 正向（近 0，远 254，天空 255） |
+| 代码 | `pipeline.py` | `delivery.py` |
+| 说明 | 第 4 节 | 第 12 节 |
+
+ABot 那 2000 条子集走的是**右边这条**（`scenes`）。一条 episode 的处理顺序是：
+
+```
+data/<shard>/<sample_id>/video.mp4  (1920x1080, ~1800 帧)
+        │
+        │  video.iter_frames  解码 + resize 到 1280x720，按 64 帧一批
+        ▼
+   ┌─ 每批 ─────────────────────────────────────────┐
+   │  color.mp4 边解码边写出（所以它最先出现）        │
+   │  depth 后端   → 米制深度       (GPU)            │
+   │  semantic 后端 → 11 类 ID 图   (GPU)            │
+   └────────────────────────────────────────────────┘
+        │   全片的 depth / labels / 灰度 guide 攒在内存（~20 GB 峰值）
+        ▼
+   temporal.stabilize_pair    光流补偿的中值 + 多数投票   (CPU，最慢的一段)
+        ▼
+   semantic.people.split_people   从人物掩码里挑出主角，其余为 NPC
+        ▼
+   depth.scale.apply_range_guard  截断到 0.1 / 8000 m
+        ▼
+   delivery._encode   一次写出 depth.mp4 / semantic.mp4 / duv.mp4
+        ▼
+seg_long_000123/{color,depth,semantic,duv}.mp4 + annotation.tar
+                + extraction_report.json
+```
+
+关键的时序含义：**跑到一半只有 `color.mp4` 是正常的**，另外三个是最后一次性写出的。
+每条 episode 的时间构成见第 14 节。
+
+外层的编排是 `scripts/run_scenes.sh`：按 `--shard i/N` 把 episode 列表无重叠切开，
+每个 worker 一个进程绑一张卡，`--resume` 让重跑只补缺的，`--keep-going` 让一条坏
+episode 只损失一条。最后跑 `scenes-audit` 统计完整度。
+
+上手顺序：第 2 节装 venv → `make doctor` 一次查完所有前置条件 → 第 12 节起跑。
+
+---
+
 ## 1. 这东西是干什么的
 
 把一段游戏视频，变成 [code-world-model](code-world-model/)（下称 CWM）能吃的
@@ -665,6 +716,20 @@ DA3 也支持多帧联合重建（它是 any-view 模型）：
 ---
 
 ## 8. 出错了怎么办
+
+**先跑体检**。`run_scenes.sh` 的前置检查是遇到第一个问题就退出（对启动器是对的：
+用错的 torch 起跑会白烧几个小时），代价是新节点上每修一个问题要来回一轮。体检脚本
+把所有前置条件一次查完并各自给出修法，不中途退出：
+
+```bash
+make doctor
+# 或者:  DATA_DIR=... OUT_DIR=... .venv/bin/python scripts/doctor.py
+```
+
+它检查 python 版本与是否在 venv 内、`proxy_extract` 能否导入、ffmpeg 解析到哪个二进制、
+torch 版本与 `torch.cuda.is_available()`（对上 nvidia-smi 的驱动号）、torchaudio 是否
+装了但加载不了、两个后端的包在不在、权重是否已在 HF 缓存里、DATA_DIR 有几条 episode、
+OUT_DIR 空间够不够、主机内存能放几个 worker。它不改任何东西也不下权重。
 
 venv 相关的先看这几条：
 

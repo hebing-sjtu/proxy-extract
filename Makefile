@@ -30,7 +30,7 @@ CLIP ?= 26_trevor_seg_0004
 VENV   ?= $(CURDIR)/.venv
 VPY    := $(VENV)/bin/python
 
-.PHONY: help venv venv-core venv-test venv-fetch scenes scenes-audit \
+.PHONY: help venv venv-core venv-test venv-fetch doctor scenes scenes-audit \
         image version build buildx push pull save load test fetch qc extract \
         convert preview gallery shards
 
@@ -43,6 +43,7 @@ help:
 	@echo "  make venv-core   同上但不装 torch（只跑合约/分类/QC/编码）"
 	@echo "  make venv-test   在 .venv 里跑测试（应看到 378 passed）"
 	@echo "  make venv-fetch  用 .venv 拉权重"
+	@echo "  make doctor      一次查完所有前置条件，不中途退出"
 	@echo
 	@echo "交付数据（RUNBOOK 第 12/13 节）"
 	@echo "  make scenes       多卡跑 720p 交付场景，DATA_DIR= OUT_DIR= 覆盖路径"
@@ -78,6 +79,9 @@ venv-test:
 
 venv-fetch:
 	$(VPY) scripts/fetch_models.py --set default
+
+doctor:
+	$(VPY) scripts/doctor.py
 
 scenes:
 	scripts/run_scenes.sh
