@@ -49,7 +49,7 @@ from .semantic import get_backend as get_semantic_backend
 from .semantic import get_refiner
 from .semantic.people import split_people
 from .taxonomy import NAMES_OF_TAXONOMY
-from .temporal import flicker_rate, stabilize_depth, stabilize_labels
+from .temporal import flicker_rate, stabilize_pair
 from .video import iter_frames, probe
 
 DELIVERY_WIDTH = 1280
@@ -214,13 +214,8 @@ def extract_scene(
     depth, labels, guide = inferred.depth, inferred.labels, inferred.guide
     flicker_before = flicker_rate(labels)
 
-    depth = stabilize_depth(
+    depth, labels = stabilize_pair(
         depth,
-        guide_frames=guide,
-        radius=config.temporal_radius,
-        flow_downscale=config.flow_downscale,
-    )
-    labels = stabilize_labels(
         labels,
         guide_frames=guide,
         radius=config.temporal_radius,

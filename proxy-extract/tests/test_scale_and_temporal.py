@@ -15,6 +15,7 @@ from proxy_extract.temporal import (
     flicker_rate,
     stabilize_depth,
     stabilize_labels,
+    stabilize_pair,
     suppress_short_runs,
 )
 
@@ -293,3 +294,98 @@ class TestFlowDownscale:
         _, guide = self._panning_clip()
         with pytest.raises(ValueError, match="downscale must be"):
             _flow_between(guide[0], guide[1], downscale=0)
+
+
+class TestSharedFlow:
+    """`stabilize_pair` exists only to stop paying for the same flow twice.
+
+    So the thing to pin down is that it is genuinely only that: the outputs must
+    match what the two single-stack functions produce, exactly, while the number
+    of Farneback solves halves.
+    """
+
+    @staticmethod
+    def _clip(frames=10, height=64, width=96, shift=3):
+        rng = np.random.default_rng(11)
+        texture = rng.integers(0, 255, (height, width * 2), dtype=np.uint8)
+        guide, labels, depth = [], [], []
+        for index in range(frames):
+            offset = index * shift
+            guide.append(texture[:, offset : offset + width].copy())
+            board = np.full((height, width), tx.SKY, dtype=np.uint8)
+            board[:, : width // 2] = tx.TERRAIN
+            if index % 2:
+                board[20:30, 20:30] = tx.VEGETATION
+            labels.append(board)
+            surface = np.linspace(2.0, 40.0, width, dtype=np.float32)[None, :]
+            surface = np.repeat(surface, height, axis=0)
+            if index % 3 == 0:
+                surface[10:20, 10:20] = 0.0  # an invalid patch, so NaN paths run
+            depth.append(surface)
+        return np.stack(depth), np.stack(labels), guide
+
+    def test_sharing_the_flow_changes_neither_output(self):
+        depth, labels, guide = self._clip()
+
+        apart_depth = stabilize_depth(depth, guide_frames=guide, radius=2, flow_downscale=2)
+        apart_labels = stabilize_labels(labels, guide_frames=guide, radius=2, flow_downscale=2)
+        together_depth, together_labels = stabilize_pair(
+            depth, labels, guide_frames=guide, radius=2, flow_downscale=2
+        )
+
+        assert np.array_equal(together_depth, apart_depth)
+        assert np.array_equal(together_labels, apart_labels)
+
+    def test_it_solves_each_flow_once_instead_of_twice(self, monkeypatch):
+        import proxy_extract.temporal as temporal
+
+        depth, labels, guide = self._clip()
+        calls = []
+        real = temporal._flow_between
+
+        def counted(*args, **kwargs):
+            calls.append(1)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(temporal, "_flow_between", counted)
+
+        stabilize_depth(depth, guide_frames=guide, radius=2)
+        stabilize_labels(labels, guide_frames=guide, radius=2)
+        apart = len(calls)
+
+        calls.clear()
+        stabilize_pair(depth, labels, guide_frames=guide, radius=2)
+        together = len(calls)
+
+        assert apart > 0
+        assert together * 2 == apart, f"{together} flows against {apart} for the same work"
+
+    def test_without_a_guide_there_is_nothing_to_share_but_it_still_agrees(self):
+        depth, labels, _ = self._clip()
+
+        together_depth, together_labels = stabilize_pair(depth, labels, radius=2)
+
+        assert np.array_equal(together_depth, stabilize_depth(depth, radius=2))
+        assert np.array_equal(together_labels, stabilize_labels(labels, radius=2))
+
+    def test_the_degenerate_cases_answer_the_same_way_the_singles_do(self):
+        depth, labels, guide = self._clip(frames=2)
+
+        # Too short to stabilise: depth passes through, labels still get their
+        # runs suppressed. Deferring to the singles is what keeps these aligned.
+        pair_depth, pair_labels = stabilize_pair(depth, labels, radius=2)
+        assert np.array_equal(pair_depth, stabilize_depth(depth, radius=2))
+        assert np.array_equal(pair_labels, stabilize_labels(labels, radius=2))
+
+        depth, labels, guide = self._clip()
+        pair_depth, pair_labels = stabilize_pair(depth, labels, guide_frames=guide, radius=0)
+        assert np.array_equal(pair_depth, stabilize_depth(depth, radius=0))
+        assert np.array_equal(pair_labels, stabilize_labels(labels, radius=0))
+
+    def test_mismatched_stacks_are_refused_rather_than_broadcast(self):
+        depth, labels, _ = self._clip()
+
+        with pytest.raises(ValueError, match="depth maps against"):
+            stabilize_pair(depth[:-1], labels, radius=2)
+        with pytest.raises(ValueError, match="but labels are"):
+            stabilize_pair(depth, labels[:, :-1, :], radius=2)

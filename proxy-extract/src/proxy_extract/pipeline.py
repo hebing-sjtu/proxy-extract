@@ -19,7 +19,7 @@ from .semantic import get_backend as get_semantic_backend
 from .semantic import get_refiner
 from .semantic.people import split_people
 from .taxonomy import NAMES_OF_TAXONOMY
-from .temporal import flicker_rate, stabilize_depth, stabilize_labels
+from .temporal import flicker_rate, stabilize_pair
 from .video import iter_frames, read_frames
 
 # Which label set a backend emits.
@@ -250,8 +250,9 @@ def extract_clip(
         )
 
     flicker_before = flicker_rate(small_labels)
-    stable_depth = stabilize_depth(small_depth, guide_frames=guide, radius=config.temporal_radius)
-    stable_labels = stabilize_labels(small_labels, guide_frames=guide, radius=config.temporal_radius)
+    stable_depth, stable_labels = stabilize_pair(
+        small_depth, small_labels, guide_frames=guide, radius=config.temporal_radius
+    )
 
     stable_labels, hero_info = split_people(
         stable_labels, taxonomy=config.taxonomy, enabled=config.split_hero

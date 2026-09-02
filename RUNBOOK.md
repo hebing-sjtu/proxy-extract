@@ -174,7 +174,7 @@ GPU 节点是 x86_64，而**捆绑 CUDA 的 torch wheel 只有 linux/x86_64 版�
 ```bash
 git clone <repo> && cd fastvideo_datapipe
 make build          # 节点本身就是 amd64，普通 build 就够
-make test           # 期望 373 passed
+make test           # 期望 378 passed
 ```
 
 第一次构建大约 10–20 分钟，绝大部分时间花在下载 torch（约 2.5 GB）。
@@ -328,7 +328,7 @@ handpick29_high_low/
 
 ```bash
 .venv/bin/python -m pytest proxy-extract/tests -q
-# 期望：373 passed
+# 期望：378 passed
 ```
 
 `setup_venv.sh` 结尾已经跑过一次。单独重跑是在改完代码之后。
@@ -689,7 +689,8 @@ venv 相关的先看这几条：
 | `no such video: ...` | 路径不对；ABot 那种嵌套目录要加 `--recursive` | 见第 11 节 |
 | `no camera tracks under ...` | `camera/` 目录不在或没有 json | 检查数据集目录结构 |
 | 跑到一半，scene 目录里只有 `color.mp4` | 正常，不是卡住。`_infer` 单次解码时一边写 color 一边把 depth/labels 攒在内存，之后还要做全片光流稳定，`depth/semantic/duv` 是最后一次性写出的 | 等这条 episode 结束；想看进度就看 `color.mp4` 在不在变大 |
-| GPU 显存只占了零头、利用率断断续续 | 一条 episode 里只有模型前向是 GPU，解码、光流稳定、ffmpeg 编码都是 CPU，而深度模型一次只吃一帧 | `WORKERS_PER_GPU=3`，用别的 worker 的前向填上这些空档。上限由主机内存决定（每 worker 约 40 GiB），不是显存 |
+| GPU 显存只占了零头、利用率断断续续 | 一条 episode 里只有模型前向是 GPU，解码、光流稳定、ffmpeg 编码都是 CPU，而深度模型一次只吃一帧 | `WORKERS_PER_GPU=3`，用别的 worker 的前向填上这些空档。上限由主机内存决定（每 worker 约 40 GiB），不是显存。时间都花在哪见第 14 节 |
+| 觉得瓶颈是磁盘 / 想先把视频拆成帧再喂模型 | 解码在整条 episode 里只占 4 秒，见第 14 节实测。预拆帧优化的是这 4 秒，代价是每条 episode 多写多读 5 GB（720p 原始帧 2.76 MB × 1800），净变慢 | 不要这么做；按第 14 节的顺序调 |
 | clip 少于 124 帧 | CWM 窗口就是 124 帧 | 这条 clip 用不了，不是 bug |
 | preview 颜色不对 | 手动指定了错的调色板 | 别传，让它自己从 report 读 |
 | 交付的语义看着完全不对 | 很可能用了 `synthetic` 占位后端 | 查 report 的 `deliverable` 字段，见第 13 节 |
@@ -1048,3 +1049,37 @@ python -m proxy_extract scenes-preview \
 代价要写明：ADE20K 只有**一个** `animal` 标签，分不出马、鹿、狗、鸟，所以这个映射
 连带把野生动物也算作 vehicle。要把坐骑和野生动物分开需要实例掩码，映射表做不到。
 实测两条 episode 共 24 帧里 `animal` 命中 0 像素，所以这个代价的实际暴露面很小。
+
+## 14. 一条 episode 的时间花在哪
+
+问过一次「效率太低，是不是卡 IO，要不要先把视频拆成帧再打包喂模型」。答案是**不是
+IO，也不要预拆帧**。下面是本机（macOS，CPU 单机）在真实 ABot episode 上实测的、按
+1800 帧折算的时间构成。绝对值和服务器不可比，比例可以参考。
+
+| 阶段 | 秒 / 1800 帧 | 设备 |
+| --- | --- | --- |
+| 解码 + resize 到 1280x720 | 4 | CPU |
+| `color.mp4` 编码（x264 CRF 16 medium） | 59 | CPU |
+| 时序稳定（radius 2, flow_downscale 2） | 382 | CPU |
+| `depth`/`semantic`/`duv` 三路编码 | ~30 | CPU |
+| 深度 + 语义前向 | ~720 | GPU |
+
+CPU 侧合计约 475 秒，占整条 episode 的四成，这段时间 GPU 是空的——这就是显存只占零头、
+算力断断续续的原因。
+
+**为什么不预拆帧**：解码只占 4 秒。把 1800 帧 720p 写成文件再读回来是 5 GB 的额外写 +
+5 GB 的额外读（原始帧 1280×720×3 = 2.76 MB），换的是那 4 秒里的一部分。方向是反的。
+
+**按性价比该调什么**：
+
+1. `WORKERS_PER_GPU=3`。不缩短单条 episode，但让别的 worker 的前向填进那 475 秒空档，
+   吞吐提升最直接，且不改变任何输出。上限是主机内存（每 worker 约 40 GiB），不是显存。
+2. 光流共享（已默认生效）。`stabilize_depth` 和 `stabilize_labels` 原来各算一遍**完全
+   相同**的 Farneback 光流，现在 `stabilize_pair` 只算一遍。实测 483 → 382 秒，省 21%，
+   输出逐位一致（`TestSharedFlow` 钉住了这一点）。
+3. 剩下的都是取舍，默认没开：
+   - `--temporal-radius 1`：稳定化再省一半左右，但时序平滑窗口从 ±2 缩到 ±1，去闪烁减弱。
+   - `--flow-downscale 4`：光流成本降到 1/4（光流占稳定化的四成），运动边界精度下降。
+   - color 换 `-preset veryfast`：59 → 19 秒，实测 PSNR 从 38.20 掉到 37.48 dB。不是白捡。
+
+第 3 组要改再说，前两条已经覆盖了大头。

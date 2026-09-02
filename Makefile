@@ -41,7 +41,7 @@ help:
 	@echo "venv（维护的主路径，见 RUNBOOK 第 2 节）"
 	@echo "  make venv        建 .venv，装死 pin 的依赖，跑自检"
 	@echo "  make venv-core   同上但不装 torch（只跑合约/分类/QC/编码）"
-	@echo "  make venv-test   在 .venv 里跑测试（应看到 373 passed）"
+	@echo "  make venv-test   在 .venv 里跑测试（应看到 378 passed）"
 	@echo "  make venv-fetch  用 .venv 拉权重"
 	@echo
 	@echo "交付数据（RUNBOOK 第 12/13 节）"
@@ -57,7 +57,7 @@ help:
 	@echo "  make load      导入上面那个 tar"
 	@echo
 	@echo "容器里跑"
-	@echo "  make test      不需要 GPU / 权重的自检（应看到 373 passed）"
+	@echo "  make test      不需要 GPU / 权重的自检（应看到 378 passed）"
 	@echo "  make fetch     下载权重到 $(HF_CACHE_DIR)"
 	@echo "  make qc        对 high 渲染做相机 QC"
 	@echo "  make extract   抽一条 clip（CLIP=$(CLIP)）"

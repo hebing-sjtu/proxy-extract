@@ -95,6 +95,48 @@ def _neighbour_flows(
     return flows
 
 
+def _vote_at(
+    labels: np.ndarray, index: int, offsets: range, flows: dict[int, np.ndarray]
+) -> np.ndarray:
+    """The weighted majority vote for one frame, given its neighbours' flows."""
+    votes = np.zeros((*labels.shape[1:], NUM_CLASSES), dtype=np.int16)
+    for offset in offsets:
+        other = index + offset
+        if not 0 <= other < len(labels):
+            continue
+        patch = labels[other]
+        if other in flows:
+            patch = _warp(patch, flows[other], nearest=True)
+        weight = 2 if offset == 0 else 1
+        # Accumulate class-by-class rather than scattering into `votes` with
+        # fancy indexing: 12 vectorised comparisons beat a per-pixel
+        # np.add.at by orders of magnitude at this frame count.
+        for cls in range(NUM_CLASSES):
+            votes[..., cls] += weight * (patch == cls)
+    return votes.argmax(axis=2).astype(np.uint8)
+
+
+def _median_at(
+    depth: np.ndarray, index: int, offsets: range, flows: dict[int, np.ndarray]
+) -> np.ndarray:
+    """The temporal median for one frame, given its neighbours' flows."""
+    stack = []
+    for offset in offsets:
+        other = index + offset
+        if not 0 <= other < len(depth):
+            continue
+        patch = depth[other]
+        if other in flows:
+            patch = _warp(patch, flows[other], nearest=False)
+        stack.append(np.where(patch > 0, patch, np.nan))
+    # A pixel invalid across the whole window reduces to NaN, which is the
+    # right answer (it becomes 0), not something to warn about.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        merged = np.nanmedian(np.stack(stack), axis=0)
+    return np.nan_to_num(merged, nan=0.0).astype(np.float32)
+
+
 def suppress_short_runs(labels: np.ndarray, *, min_run: int = DEFAULT_MIN_RUN) -> np.ndarray:
     """Erase label runs shorter than `min_run` frames along the time axis.
 
@@ -166,26 +208,12 @@ def stabilize_labels(
     offsets = range(-radius, radius + 1)
     out = np.empty_like(labels)
     for index in range(len(labels)):
-        votes = np.zeros((*shape, NUM_CLASSES), dtype=np.int16)
         flows = (
             _neighbour_flows(guide, index, offsets, downscale=flow_downscale)
             if guide is not None
             else {}
         )
-        for offset in offsets:
-            other = index + offset
-            if not 0 <= other < len(labels):
-                continue
-            patch = labels[other]
-            if other in flows:
-                patch = _warp(patch, flows[other], nearest=True)
-            weight = 2 if offset == 0 else 1
-            # Accumulate class-by-class rather than scattering into `votes` with
-            # fancy indexing: 12 vectorised comparisons beat a per-pixel
-            # np.add.at by orders of magnitude at this frame count.
-            for cls in range(NUM_CLASSES):
-                votes[..., cls] += weight * (patch == cls)
-        out[index] = votes.argmax(axis=2).astype(np.uint8)
+        out[index] = _vote_at(labels, index, offsets, flows)
     return suppress_short_runs(out, min_run=min_run)
 
 
@@ -219,22 +247,68 @@ def stabilize_depth(
             if guide is not None
             else {}
         )
-        stack = []
-        for offset in offsets:
-            other = index + offset
-            if not 0 <= other < len(depth):
-                continue
-            patch = depth[other]
-            if other in flows:
-                patch = _warp(patch, flows[other], nearest=False)
-            stack.append(np.where(patch > 0, patch, np.nan))
-        # A pixel invalid across the whole window reduces to NaN, which is the
-        # right answer (it becomes 0), not something to warn about.
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            merged = np.nanmedian(np.stack(stack), axis=0)
-        out[index] = np.nan_to_num(merged, nan=0.0).astype(np.float32)
+        out[index] = _median_at(depth, index, offsets, flows)
     return out
+
+
+def stabilize_pair(
+    depth: np.ndarray,
+    labels: np.ndarray,
+    *,
+    guide_frames: list[np.ndarray] | None = None,
+    radius: int = DEFAULT_RADIUS,
+    min_run: int = DEFAULT_MIN_RUN,
+    flow_downscale: int = 1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Stabilise both stacks in one pass, solving each frame's flow once.
+
+    The two single-stack functions ask `_neighbour_flows` for byte-identical
+    fields — same guide, same offsets, same downscale — and Farneback is 95% of
+    what a pass costs, so running them back to back paid for every flow twice.
+    Sharing them changes nothing about the result; the warps differ (nearest for
+    labels, linear for depth) but they are cheap and still done separately.
+    """
+    depth = np.asarray(depth, dtype=np.float32)
+    labels = np.asarray(labels, dtype=np.uint8)
+    if len(depth) != len(labels):
+        raise ValueError(f"{len(depth)} depth maps against {len(labels)} label maps")
+
+    # The two disagree about what to do in the degenerate cases — a short stack
+    # still gets its runs suppressed, for instance — so let each answer for
+    # itself rather than restating the rules here and drifting from them.
+    if len(depth) < 3 or radius < 1:
+        return (
+            stabilize_depth(
+                depth, guide_frames=guide_frames, radius=radius, flow_downscale=flow_downscale
+            ),
+            stabilize_labels(
+                labels,
+                guide_frames=guide_frames,
+                radius=radius,
+                min_run=min_run,
+                flow_downscale=flow_downscale,
+            ),
+        )
+
+    shape = depth.shape[1:]
+    if labels.shape[1:] != shape:
+        raise ValueError(f"depth is {shape} but labels are {labels.shape[1:]}")
+    guide = _gray_stack(guide_frames, shape) if guide_frames is not None else None
+    if guide is not None and len(guide) != len(depth):
+        raise ValueError(f"guide has {len(guide)} frames for {len(depth)} depth maps")
+
+    offsets = range(-radius, radius + 1)
+    steady_depth = np.empty_like(depth)
+    steady_labels = np.empty_like(labels)
+    for index in range(len(depth)):
+        flows = (
+            _neighbour_flows(guide, index, offsets, downscale=flow_downscale)
+            if guide is not None
+            else {}
+        )
+        steady_depth[index] = _median_at(depth, index, offsets, flows)
+        steady_labels[index] = _vote_at(labels, index, offsets, flows)
+    return steady_depth, suppress_short_runs(steady_labels, min_run=min_run)
 
 
 def flicker_rate(labels: np.ndarray) -> float:
