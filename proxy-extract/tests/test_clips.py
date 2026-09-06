@@ -96,6 +96,14 @@ def delivered(tmp_path_factory):
 
 
 def _write_source(path, *, frames_count: int, fps: float) -> None:
+    """An episode whose frames can be told apart from their neighbours.
+
+    A wide bar moving a quarter of its own width per frame, rather than the
+    gentle gradient this used to be: telling a correct decimation from one that
+    slipped a frame means comparing a clip frame against the source frames
+    either side of the one it claims, and that comparison says nothing on
+    footage where consecutive frames are nearly identical.
+    """
     import cv2
 
     writer = cv2.VideoWriter(
@@ -104,6 +112,8 @@ def _write_source(path, *, frames_count: int, fps: float) -> None:
     rng = np.random.default_rng(0)
     for index in range(frames_count):
         frame = np.full((144, 256, 3), index % 251, dtype=np.uint8)
+        left = (index * 24) % 256
+        frame[:, left : left + 64] = 255
         frame[:40, :40] = rng.integers(0, 255, (40, 40, 3), dtype=np.uint8)
         writer.write(frame)
     writer.release()
@@ -150,6 +160,51 @@ def test_the_anchor_is_the_targets_own_first_frame(delivered, tmp_path):
     # The anchor is lossless PNG and the target is x264, so they differ by the
     # codec and nothing else: same picture, not the same bytes.
     assert np.abs(anchor.astype(int) - first.astype(int)).mean() < 12
+
+
+def test_clip_frame_k_is_the_source_frame_its_report_claims(delivered, tmp_path):
+    """The one check that catches an off-by-one in the frame dropping.
+
+    Everything else about a mis-timed clip looks right: the frame count, the
+    rate in the container, the geometry, every individual picture. Only the
+    correspondence between a clip frame and the episode frame it says it is can
+    tell a correct decimation from one that slipped, and it is checked against
+    the neighbours rather than in isolation - a match is only evidence if the
+    frames either side are a worse match.
+    """
+    import cv2
+
+    from proxy_extract import frames as frame_store
+    from proxy_extract.video import read_frames
+
+    reports = _cut_one(delivered, tmp_path)
+    clip = tmp_path / reports[0]["clip"]
+    ordinals = reports[0]["source_ordinals"]
+    cut = read_frames(clip / clips.TARGET_DIRNAME / clips.TARGET_NAME)
+
+    def delivered_at(ordinal):
+        image = frame_store.read_image(delivered, "color", ordinal)
+        return cv2.resize(
+            image, (clips.TARGET_WIDTH, clips.TARGET_HEIGHT), interpolation=cv2.INTER_LANCZOS4
+        )
+
+    for k in (0, len(cut) // 2, len(cut) - 1):
+        claimed = ordinals[k]
+        errors = {
+            delta: np.abs(
+                cut[k].astype(np.int16) - delivered_at(claimed + delta).astype(np.int16)
+            ).mean()
+            for delta in (-1, 0, 1)
+            if 0 <= claimed + delta
+        }
+        assert min(errors, key=errors.get) == 0, (
+            f"clip frame {k} says it is source frame {claimed} but matches "
+            f"{claimed + min(errors, key=errors.get)} better: {errors}"
+        )
+        assert errors[0] * 4 < min(errors[d] for d in errors if d), (
+            f"clip frame {k} matches its neighbours nearly as well as its own "
+            f"frame, so this proves nothing: {errors}"
+        )
 
 
 def test_the_duv_only_ever_shows_codes_that_were_predicted(delivered, tmp_path):
