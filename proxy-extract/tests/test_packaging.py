@@ -178,6 +178,36 @@ def test_the_launcher_keeps_streams_the_cli_knows():
 
 
 @needs_checkout
+def test_the_clip_launcher_asks_for_the_shape_the_code_defaults_to():
+    """A launcher default that drifts from the code silently changes the corpus.
+
+    Frame count and rate especially: 124 at 24 is one window at real speed, and
+    any other pair is a corpus that looks identical and is not.
+    """
+    from proxy_extract import clips
+
+    launcher = (ROOT / "scripts" / "run_clips.sh").read_text()
+
+    assert f'PER_SCENE="${{PER_SCENE:-{clips.CLIPS_PER_SCENE}}}"' in launcher
+    assert f'FRAMES="${{FRAMES:-{clips.CLIP_FRAMES}}}"' in launcher
+    assert f'FPS="${{FPS:-{clips.CLIP_FPS:g}}}"' in launcher
+    assert f"PER_SCENE ?= {clips.CLIPS_PER_SCENE}" in (ROOT / "Makefile").read_text()
+
+
+@needs_checkout
+def test_the_docs_state_the_clip_geometry_the_code_writes():
+    runbook = (ROOT / "RUNBOOK.md").read_text()
+    from proxy_extract import clips
+
+    assert f"{clips.TARGET_WIDTH}×{clips.TARGET_HEIGHT}" in runbook
+    assert f"{clips.DUV_WIDTH}×{clips.DUV_HEIGHT}" in runbook
+    # The 4x relation is the reason the target is built from the delivered
+    # frames rather than re-decoded, so it is not an implementation detail.
+    assert clips.TARGET_WIDTH // clips.DUV_WIDTH == clips.TARGET_HEIGHT // clips.DUV_HEIGHT == 4
+    assert "4×4" in runbook
+
+
+@needs_checkout
 def test_the_launcher_budgets_the_memory_a_worker_actually_takes():
     """Both numbers decide whether a 2000-episode run survives; keep them paired.
 

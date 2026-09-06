@@ -169,7 +169,7 @@ make scenes
 
 ```bash
 DATA_DIR=/data/binghe/datasets/ABot-World-Explorer-subset2000/data \
-OUT_DIR=/data/binghe/datasets/ABot-seg-long-2000 \
+OUT_DIR=/data/binghe/datasets/ABot-sub-2000 \
 scripts/run_scenes.sh
 ```
 
@@ -768,7 +768,76 @@ torch 版本与 `torch.cuda.is_available()`（对上 nvidia-smi 的驱动号）�
 
 ---
 
-## 8. 已知限制
+## 8. 切短片：交付段 → SFT clips
+
+交付出来的是整段 episode，按源帧率。训练要的是定长定帧率的短片，所以有第二步：
+
+```bash
+make clips                              # 默认 5 段 × 124 帧 @ 24fps
+make clips LIMIT=4                      # 先在 4 条上看结果
+make clips CLIPS_DIR=/data/.../clips    # 换落盘位置
+make clips-audit
+```
+
+**纯 CPU，不占显卡，可以和 `make scenes` 同时跑。** 它只读 `scenes-audit --list
+complete` 认可的段——半截的段的帧还会变，切出来的片是个中间状态的快照，事后分不出
+来。所以正常用法是每落一批 episode 就再跑一次,`--resume` 会跳过切好的。
+
+2000 条 episode × 5 = 10000 片，磁盘大约 80 GiB(`MIB_PER_CLIP=8` 的估算，preflight
+只用来挡「盘满了」这种错，不是精确预算)。
+
+### 一片长什么样
+
+```
+clip_000000_0/
+├── target/rgb.mp4        1344×768，124 帧，24fps —— 要 VAE 编码的那路
+├── target/anchor.png     1344×768，无损，就是 rgb.mp4 的第 0 帧
+├── proxy/duv.mp4         336×192，同样 124 帧，无损
+├── annotations/          这一片自己的那份标注
+└── clip_report.json      来自哪段、哪些源帧、所有设置
+```
+
+`clip_000123_2` = `seg_000123` 的第 2 片。保留段号而不是全局重新编号，是因为对一片
+最常问的问题是「它是哪条 episode 的」。
+
+### 三个决定，出了问题先看这三条
+
+**帧率是抽出来的，不是改标签改出来的。** 源 30fps、片 24fps，所以第 k 帧取源片第
+`round(k × 30/24)` 帧——五帧丢一帧。直接连着取 124 帧再标成 24fps 会让每一片都是
+1.25 倍慢放：逐帧看完全正常，学动力学的东西全毁。`clip_report.json` 里的
+`source_ordinals` 是完整的源帧号列表,拿它对一遍就能确认。
+
+**DUV 是在 336×192 重新合成的，不是把 1280×720 的 `duv.mp4` 缩过去。** DUV 的 R 是
+log 深度码、GB 是类别调色板，插值会把码值平均成没有含义的中间值、把类别涂成分割器
+从没预测过的颜色。这里走的是深度取中值、类别取多数票。
+
+**一个 DUV 像素正好是 target 的一个 4×4 块。** 两路都从同一批交付帧出发，用最近邻
+到 1344×768(不产生新数值)，DUV 再精确降 4 倍。这也是为什么 target 用交付的
+1280×720 上采 5% 而不是回源片 1920×1080 重解——后者更锐，但 target 和它自己的控制
+信号就不再走同一条重采样链了，`DATA_F.md` 明说这个对齐比锐度值钱。想要另一头：
+`TARGET_FROM=source`，需要原始语料还挂着。
+
+### annotations 怎么裁的
+
+按「这句话是在说什么」分三种，不是一刀切:
+
+| 成员 | 处理 | 为什么 |
+| --- | --- | --- |
+| `action.json` | 按帧裁到这一片的源帧 | 逐帧的，能裁 |
+| `caption.json` | 整份复制 | 说的是整条 episode，对其中 5 秒也成立 |
+| COLMAP `sparse/0/` | **不复制**，改出 `cameras.npz` | 见下 |
+
+COLMAP 是对整条 episode 解的一个重建，几 MB，重写成每片一份的文本模型等于让本管线
+变成一份它没有解算过的几何的第二个真值来源。片里给的是这 124 帧自己的位姿轨迹，本
+包自己的格式，`metric=False`（稀疏重建只定到一个相似变换，不能和米制深度混用）。
+原始模型在源 episode 的 `annotations.tar` 里，`clip_report.json` 记了路径。
+
+注册不保证是全的——COLMAP 会丢掉解不出来的帧——所以 `cameras.npz` 里同时存了
+`source_ordinals`，是实际有位姿的那些帧，不要假设它等于片的 124 帧。
+
+---
+
+## 9. 已知限制
 
 写在前面，免得当成 bug 去查。
 

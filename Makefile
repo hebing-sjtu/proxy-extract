@@ -27,7 +27,12 @@ KEEP_FRAMES ?= color,depth,semantic,duv
 # proved before thousands of episodes are committed to it.
 LIMIT ?=
 
-.PHONY: help venv venv-core venv-test venv-fetch doctor scenes scenes-audit preview
+# Where the short SFT clips go, and their shape: 5 per segment, 124 frames each
+# at 24 fps, reached by dropping source frames. See RUNBOOK section 8.
+CLIPS_DIR ?= $(OUT_DIR)-clips
+PER_SCENE ?= 5
+
+.PHONY: help venv venv-core venv-test venv-fetch doctor scenes scenes-audit preview clips clips-audit
 
 help:
 	@echo "VENV     = $(VENV)"
@@ -45,6 +50,10 @@ help:
 	@echo "  make scenes         多卡跑 720p 交付场景"
 	@echo "  make scenes-audit   统计 complete/incomplete/missing"
 	@echo "  make preview        把 SCENE= 渲成可看的 contact sheet"
+	@echo
+	@echo "切短片（RUNBOOK 第 8 节）"
+	@echo "  make clips          把交付好的长段切成 $(PER_SCENE) 段 124 帧 / 24fps 短片"
+	@echo "  make clips-audit    统计切完的 / 半截的"
 	@echo
 	@echo "路径用 DATA_DIR= 和 OUT_DIR= 覆盖，worker 数用 WORKERS_PER_GPU=。"
 	@echo "换节点先试几条：make scenes LIMIT=4，编号与全量一致，见 RUNBOOK 第 3 节。"
@@ -74,6 +83,15 @@ scenes:
 
 scenes-audit:
 	$(VPY) -m proxy_extract scenes-audit --out $(OUT_DIR)
+
+# CPU only, and safe to run while `make scenes` is still going: it reads only
+# the segments the audit calls complete.
+clips:
+	OUT_DIR=$(OUT_DIR) CLIPS_DIR=$(CLIPS_DIR) PER_SCENE=$(PER_SCENE) LIMIT=$(LIMIT) \
+	  scripts/run_clips.sh
+
+clips-audit:
+	$(VPY) -m proxy_extract clips-audit --clips-out $(CLIPS_DIR)
 
 # The delivery format is unviewable by construction, so this is the only way to
 # judge a run by eye. See RUNBOOK section 4.

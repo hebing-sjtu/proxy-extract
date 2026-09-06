@@ -15,6 +15,7 @@ from pathlib import Path
 
 from . import accel
 from . import cameras as camera_io
+from . import clips as clip_defaults
 from . import contract
 from .frames import STREAMS as FRAME_STREAMS
 from .pipeline import ExtractionConfig, condition_dir_for, extract_clip, extract_dataset, shard
@@ -197,6 +198,57 @@ def build_parser() -> argparse.ArgumentParser:
         "complete means all four videos hold every frame the report claims, so the list "
         "is safe to hand to rsync while the run is still going",
     )
+
+    clips = sub.add_parser(
+        "clips",
+        help="cut short SFT clips out of delivered segments",
+        description="Cut each delivered segment into short, disjoint clips: a 1344x768 "
+        "target video, its own first frame as the anchor, and the 336x192 DUV proxy for "
+        "the same frames. The frame rate is changed by dropping frames, so the motion "
+        "runs at the speed it was recorded at.",
+    )
+    clips.add_argument("--out", type=Path, required=True, help="the delivered dataset root")
+    clips.add_argument("--clips-out", type=Path, required=True, help="where the clips go")
+    clips.add_argument(
+        "--per-scene", type=int, default=clip_defaults.CLIPS_PER_SCENE, metavar="N",
+        help="clips per segment, evenly spread and never adjacent (default: %(default)s)",
+    )
+    clips.add_argument(
+        "--frames", type=int, default=clip_defaults.CLIP_FRAMES, metavar="N",
+        help="frames per clip; the default is one code-world-model window (default: %(default)s)",
+    )
+    clips.add_argument(
+        "--fps", type=float, default=clip_defaults.CLIP_FPS, metavar="RATE",
+        help="clip frame rate, reached by dropping source frames (default: %(default)s)",
+    )
+    clips.add_argument(
+        "--color-crf", type=int, default=None, metavar="N",
+        help=f"x264 quality for the target video (default: {DEFAULT_COLOR_CRF})",
+    )
+    clips.add_argument(
+        "--target-from", choices=("frames", "source"), default="frames",
+        help="'frames' upscales the delivered 1280x720 colour, which shares its "
+        "resampling with the DUV; 'source' re-decodes the 1920x1080 original, which is "
+        "sharper but needs the corpus mounted (default: %(default)s)",
+    )
+    clips.add_argument("--shard", metavar="INDEX/COUNT", help="process only this worker's slice")
+    clips.add_argument("--resume", action="store_true", help="skip clips already whole")
+    clips.add_argument("--keep-going", action="store_true", help="log and continue on failure")
+    clips.add_argument("--limit", type=int, default=None, metavar="N", help="first N segments only")
+    clips.add_argument("--quiet", action="store_true", help="do not report progress")
+    clips.add_argument(
+        "--threads", type=int, default=None, metavar="N",
+        help=f"cap CPU thread pools; defaults to ${accel.THREAD_VARIABLE}",
+    )
+
+    clips_audit = sub.add_parser(
+        "clips-audit", help="count complete/short clips under a --clips-out root"
+    )
+    clips_audit.add_argument("--clips-out", type=Path, required=True)
+    clips_audit.add_argument(
+        "--frames", type=int, default=clip_defaults.CLIP_FRAMES, metavar="N"
+    )
+    clips_audit.add_argument("--report", type=Path, help="also write the JSON here")
 
     validate = sub.add_parser("validate", help="re-read a condition_root and check it")
     validate.add_argument("--condition-root", type=Path, required=True)
@@ -492,6 +544,77 @@ def _run_scenes_audit(args: argparse.Namespace) -> int:
     return 0 if summary["complete"] == summary["expected"] else 1
 
 
+def _run_clips(args: argparse.Namespace) -> int:
+    from . import clips, delivery
+
+    accel.limit_threads(args.threads)
+    say = (lambda _line: None) if args.quiet else _say
+
+    # Only finished segments, and read from the delivery root rather than by
+    # globbing: a segment still being written has frames that will change, and
+    # a clip cut from it would be a snapshot of an intermediate state.
+    scenes = delivery.list_scenes(args.out, "complete")
+    if not scenes:
+        print(f"error: no complete segments under {args.out}", file=sys.stderr)
+        return 1
+    if args.limit is not None:
+        scenes = scenes[: args.limit]
+
+    label = "all"
+    if args.shard:
+        index, count = args.shard.split("/")
+        scenes = shard(scenes, int(index), int(count))
+        label = f"{index}/{count}"
+
+    say(
+        f"cutting {args.per_scene} x {args.frames} frames at {args.fps:g} fps "
+        f"({clips.seconds_per_clip(args.frames, args.fps):g}s) from {len(scenes)} "
+        f"segments -> {clips.expected_total(len(scenes), args.per_scene)} clips [{label}]"
+    )
+
+    reports: list[dict] = []
+    failed = 0
+    for position, scene in enumerate(scenes, start=1):
+        say(f"[{position}/{len(scenes)}] {scene}")
+        try:
+            reports.extend(
+                clips.cut_scene(
+                    args.out / scene,
+                    args.clips_out,
+                    count=args.per_scene,
+                    length=args.frames,
+                    fps=args.fps,
+                    color_crf=args.color_crf if args.color_crf is not None else DEFAULT_COLOR_CRF,
+                    target_from_source=args.target_from == "source",
+                    resume=args.resume,
+                    progress=say,
+                )
+            )
+        except Exception as error:  # one bad segment must not end the shard
+            if not args.keep_going:
+                raise
+            failed += 1
+            print(f"error: {scene}: {error}", file=sys.stderr)
+
+    # Every shard writes a manifest, so the name has to carry the shard: they
+    # finish within seconds of each other and a shared name would have them
+    # overwriting each other's halves of the list.
+    name = None if label == "all" else f"clips_manifest.{label.replace('/', '-of-')}.json"
+    manifest = clips.write_clips_manifest(args.clips_out, reports, name=name)
+    say(f"{len(reports)} clips, {failed} segments failed, manifest at {manifest}")
+    return 1 if failed else 0
+
+
+def _run_clips_audit(args: argparse.Namespace) -> int:
+    from . import clips
+
+    summary = clips.audit_clips(args.clips_out, args.frames)
+    print(json.dumps(summary, indent=2))
+    if args.report:
+        args.report.write_text(json.dumps(summary, indent=2))
+    return 0 if summary["incomplete"] == 0 else 1
+
+
 def _run_validate(args: argparse.Namespace) -> int:
     summary = contract.validate_condition_root(args.condition_root, expected_frames=args.expect_frames)
     print(json.dumps(summary, indent=2))
@@ -536,6 +659,8 @@ def main(argv: list[str] | None = None) -> int:
         "extract": _run_extract,
         "scenes": _run_scenes,
         "scenes-audit": _run_scenes_audit,
+        "clips": _run_clips,
+        "clips-audit": _run_clips_audit,
         "validate": _run_validate,
         "preview": _run_preview,
         "scenes-preview": _run_scenes_preview,
