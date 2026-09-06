@@ -32,7 +32,7 @@ LIMIT ?=
 CLIPS_DIR ?= $(OUT_DIR)-clips
 PER_SCENE ?= 5
 
-.PHONY: help venv venv-core venv-test venv-fetch doctor scenes scenes-audit preview clips clips-audit
+.PHONY: help venv venv-core venv-test venv-fetch doctor scenes scenes-audit preview clips clip-episodes clips-audit
 
 help:
 	@echo "VENV     = $(VENV)"
@@ -53,6 +53,7 @@ help:
 	@echo
 	@echo "切短片（RUNBOOK 第 8 节）"
 	@echo "  make clips          把交付好的长段切成 $(PER_SCENE) 段 124 帧 / 24fps 短片"
+	@echo "  make clip-episodes  不要长段时用这条：直接从语料切，模型只算留下的帧"
 	@echo "  make clips-audit    统计切完的 / 半截的"
 	@echo
 	@echo "路径用 DATA_DIR= 和 OUT_DIR= 覆盖，worker 数用 WORKERS_PER_GPU=。"
@@ -89,6 +90,12 @@ scenes-audit:
 clips:
 	OUT_DIR=$(OUT_DIR) CLIPS_DIR=$(CLIPS_DIR) PER_SCENE=$(PER_SCENE) LIMIT=$(LIMIT) \
 	  scripts/run_clips.sh
+
+# The one-pass route: no long segments, about a third of the model work, and
+# the target is resampled once instead of twice. See RUNBOOK section 8.
+clip-episodes:
+	DATA_DIR=$(DATA_DIR) CLIPS_DIR=$(CLIPS_DIR) PER_SCENE=$(PER_SCENE) LIMIT=$(LIMIT) \
+	  WORKERS_PER_GPU=$(WORKERS_PER_GPU) scripts/run_clip_episodes.sh
 
 clips-audit:
 	$(VPY) -m proxy_extract clips-audit --clips-out $(CLIPS_DIR)

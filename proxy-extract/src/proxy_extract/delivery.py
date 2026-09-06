@@ -312,6 +312,8 @@ def extract_scene(
     depth_backend=None,
     semantic_backend=None,
     refiner=None,
+    select: tuple[int, ...] | None = None,
+    encode: bool = True,
 ) -> dict:
     """Write one scene directory from one RGB episode, in resumable stages.
 
@@ -333,9 +335,21 @@ def extract_scene(
 
     Backends may be passed in already constructed so a batch run loads each
     model once rather than once per episode.
+
+    `select` names the source frames to work on, by ordinal, and makes this a
+    scene of exactly those frames renumbered from zero. Everything downstream
+    then treats them as a shorter episode, which is what it wants: a caller
+    cutting five short windows out of an hour of footage pays for the frames it
+    keeps rather than for the ones it is about to drop. The rest of the episode
+    is still decoded - see `iter_frames` - but never resampled or predicted.
+
+    `encode=False` stops after the frames are written, for a caller that is
+    going to write its own videos out of them at its own sizes. The report has
+    no `videos` field in that case, and the frame directories are the output.
     """
     config = config or DeliveryConfig()
     video, out_dir = Path(video), Path(out_dir)
+    select = None if select is None else tuple(int(o) for o in select)
     started = time.time()
 
     info = probe(video)
@@ -354,7 +368,7 @@ def extract_scene(
     out_dir.mkdir(parents=True, exist_ok=True)
     proxy_dir_for(out_dir).mkdir(parents=True, exist_ok=True)
     frames.make_dirs(out_dir)
-    state = _open_state(out_dir, _fingerprint(config, video, fps))
+    state = _open_state(out_dir, _fingerprint(config, video, fps, select))
 
     progress = _Progress(config, out_dir.name)
     progress.say(f"infer: {video}")
@@ -367,7 +381,8 @@ def extract_scene(
         semantic_backend=semantic_backend,
         refiner=refiner,
         progress=progress,
-        source_frames=info.frames or None,
+        source_frames=len(select) if select is not None else (info.frames or None),
+        select=select,
     )
     if not state["metric"]:
         raise DeliveryError(
@@ -378,9 +393,19 @@ def extract_scene(
         )
 
     progress.say(f"derive: {state['frames']} frames")
-    state = _stage_derive(out_dir, config, state=state, progress=progress)
-    progress.say("encode: four videos")
-    written = _stage_encode(out_dir, config, fps=fps, state=state)
+    state = _stage_derive(
+        out_dir,
+        config,
+        state=state,
+        progress=progress,
+        write_duv=encode or "duv" in config.keep_frames,
+    )
+    if encode:
+        progress.say("encode: four videos")
+        written = _stage_encode(out_dir, config, fps=fps, state=state)
+    else:
+        progress.say("encode: skipped, the caller writes its own")
+        written = None
     annotation = _copy_annotation(video, out_dir, annotations)
 
     placeholders = placeholder_backends(depth_backend, semantic_backend, config)
@@ -397,6 +422,10 @@ def extract_scene(
         "scene": out_dir.name,
         "source_video": str(video),
         "source_size": [info.width, info.height],
+        # Which source frames these are, when they are not simply all of them.
+        # Without it the scene says 124 frames at 24 fps and there is no way
+        # left to find out where in the episode they came from.
+        "source_ordinals": list(select) if select is not None else None,
         "frames": state["frames"],
         "size": [width, height],
         "fps": fps,
@@ -424,7 +453,7 @@ def extract_scene(
         "duv_depth_inverted": config.inverted_duv_depth,
         "placeholder_backends": placeholders,
         "deliverable": not placeholders,
-        "videos": written,
+        "videos": written if written is not None else {},
         "frames_kept": sorted(config.keep_frames),
         "annotation": annotation,
         "elapsed_seconds": round(time.time() - started, 2),
@@ -452,7 +481,9 @@ def _state_path(scene_dir: Path) -> Path:
     return frames.stage_dir_for(scene_dir) / STATE_NAME
 
 
-def _fingerprint(config: DeliveryConfig, video: Path, fps: float) -> str:
+def _fingerprint(
+    config: DeliveryConfig, video: Path, fps: float, select: tuple[int, ...] | None = None
+) -> str:
     """What has to match for frames already on disk to be reusable.
 
     Deliberately not everything in the config. `chunk_frames`,
@@ -465,6 +496,10 @@ def _fingerprint(config: DeliveryConfig, video: Path, fps: float) -> str:
         "video": str(video),
         "fps": fps,
         "size": list(config.size),
+        # Frame 7 of a scene is a different picture under a different
+        # selection, so a run that changes the window cannot keep the frames
+        # the last one wrote - and nothing about them would look wrong.
+        "select": list(select) if select is not None else None,
         "depth_backend": config.depth_backend,
         "depth_backend_options": config.depth_backend_options,
         "semantic_backend": config.semantic_backend,
@@ -532,6 +567,7 @@ def _stage_infer(
     refiner,
     progress: "_Progress | None" = None,
     source_frames: int | None = None,
+    select: tuple[int, ...] | None = None,
 ) -> dict:
     """Decode once, predict, stabilise, and write colour and depth frames.
 
@@ -611,7 +647,9 @@ def _stage_infer(
 
         decoding = iter(
             prefetch(
-                iter_frames(video, size=config.size, chunk=config.chunk_frames),
+                iter_frames(
+                    video, size=config.size, chunk=config.chunk_frames, select=select
+                ),
                 depth=config.prefetch_batches,
             )
         )
@@ -728,6 +766,7 @@ def _stage_derive(
     *,
     state: dict,
     progress: "_Progress | None" = None,
+    write_duv: bool = True,
 ) -> dict:
     """Finish the labels, then write the semantic and duv frames.
 
@@ -737,6 +776,11 @@ def _stage_derive(
     before it can say which is the protagonist. Both read labels only, so this
     holds a byte per pixel per frame - 1.7 GB for a 1800-frame episode - rather
     than the depth stack that used to dominate.
+
+    `write_duv=False` for a caller that neither keeps the DUV frames nor lets
+    this write the videos. The DUV is the one stream that is fully implied by
+    the other two, so composing it for nobody costs a lossless PNG per frame
+    written and deleted, plus the depth read that feeds it.
     """
     if state["stage"] not in {"derive", "encode"}:
         raise DeliveryError(f"cannot derive from stage {state['stage']!r}")
@@ -766,8 +810,9 @@ def _stage_derive(
         }
         del labels
 
-        done = frames.complete_through(scene_dir, ("semantic", "duv"))
-        for stream in ("semantic", "duv"):
+        written_here = ("semantic", "duv") if write_duv else ("semantic",)
+        done = frames.complete_through(scene_dir, written_here)
+        for stream in written_here:
             frames.discard_from(scene_dir, stream, done)
 
         clock = _Phases()
@@ -777,19 +822,20 @@ def _stage_derive(
                     f"derive {ordinal}/{count} frames, "
                     f"{_pace(ordinal - done, count, clock, writer.blocked)}"
                 )
-                with clock.timing("read"):
-                    metres = frames.read_array(scene_dir, "depth", ordinal)
                 writer.array("semantic", ordinal, standard11[ordinal])
-                writer.image(
-                    "duv",
-                    ordinal,
-                    proxy.compose_proxy_frame(
-                        metres,
-                        standard11[ordinal],
-                        driving=driving,
-                        inverted_depth=config.inverted_duv_depth,
-                    ),
-                )
+                if write_duv:
+                    with clock.timing("read"):
+                        metres = frames.read_array(scene_dir, "depth", ordinal)
+                    writer.image(
+                        "duv",
+                        ordinal,
+                        proxy.compose_proxy_frame(
+                            metres,
+                            standard11[ordinal],
+                            driving=driving,
+                            inverted_depth=config.inverted_duv_depth,
+                        ),
+                    )
 
         state = {**state, "stage": "encode"}
         _save_state(scene_dir, state)

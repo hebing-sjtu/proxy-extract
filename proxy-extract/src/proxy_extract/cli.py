@@ -21,7 +21,7 @@ from .frames import STREAMS as FRAME_STREAMS
 from .pipeline import ExtractionConfig, condition_dir_for, extract_clip, extract_dataset, shard
 from .proxy import DEFAULT_COLOR_CRF
 from .streaming import DEFAULT_BLOCK
-from .temporal import DEFAULT_MIN_RUN
+from .temporal import DEFAULT_MIN_RUN, DEFAULT_RADIUS
 
 DEPTH_BACKENDS = ("mapanything", "depth_anything", "depth_anything_v3", "synthetic")
 SEMANTIC_BACKENDS = ("ade20k", "cityscapes", "coarse6", "standard11", "synthetic")
@@ -240,6 +240,65 @@ def build_parser() -> argparse.ArgumentParser:
         "--threads", type=int, default=None, metavar="N",
         help=f"cap CPU thread pools; defaults to ${accel.THREAD_VARIABLE}",
     )
+
+    episodes = sub.add_parser(
+        "clip-episodes",
+        help="cut clips straight from the corpus, without delivering the episodes",
+        description="The one-pass route: plan each episode's windows first, then predict "
+        "depth and semantics only for the frames the clips keep, at the size they are kept "
+        "at. Produces exactly what `scenes` followed by `clips` produces, for about a third "
+        "of the model work and without the 720p round trip. Use this when the long delivered "
+        "segments are not themselves wanted.",
+    )
+    episodes.add_argument(
+        "--video", type=Path, nargs="+", required=True,
+        help="episode files, or directories to take every .mp4 from",
+    )
+    episodes.add_argument("--recursive", action="store_true")
+    episodes.add_argument("--clips-out", type=Path, required=True)
+    episodes.add_argument(
+        "--per-scene", type=int, default=clip_defaults.CLIPS_PER_SCENE, metavar="N"
+    )
+    episodes.add_argument("--frames", type=int, default=clip_defaults.CLIP_FRAMES, metavar="N")
+    episodes.add_argument("--fps", type=float, default=clip_defaults.CLIP_FPS, metavar="RATE")
+    episodes.add_argument(
+        "--work-size", default=f"{clip_defaults.TARGET_WIDTH}x{clip_defaults.TARGET_HEIGHT}",
+        metavar="WxH",
+        help="what the models see and the target is written at; must be 4x the DUV "
+        "(default: %(default)s)",
+    )
+    episodes.add_argument(
+        "--halo", type=int, default=None, metavar="N",
+        help="extra frames predicted either side of a window so its first and last "
+        "frames are stabilised against as much context as its middle (default: the "
+        "temporal radius)",
+    )
+    episodes.add_argument("--depth-backend", choices=DEPTH_BACKENDS, default="depth_anything_v3")
+    episodes.add_argument("--depth-backend-option", action="append", default=[], metavar="KEY=VALUE")
+    episodes.add_argument("--semantic-backend", choices=SEMANTIC_BACKENDS, default="standard11")
+    episodes.add_argument(
+        "--semantic-backend-option", action="append", default=[], metavar="KEY=VALUE"
+    )
+    episodes.add_argument("--refiner", choices=REFINERS, default="none")
+    episodes.add_argument("--chunk-frames", type=int, default=None, metavar="N")
+    episodes.add_argument("--color-crf", type=int, default=None, metavar="N")
+    episodes.add_argument("--temporal-radius", type=int, default=DEFAULT_RADIUS)
+    episodes.add_argument("--temporal-min-run", type=int, default=DEFAULT_MIN_RUN, metavar="N")
+    episodes.add_argument("--no-flow-compensate", action="store_true")
+    episodes.add_argument("--flow-downscale", type=int, default=1, metavar="N")
+    episodes.add_argument("--no-hero-split", action="store_true")
+    episodes.add_argument("--writer-threads", type=int, default=4, metavar="N")
+    episodes.add_argument(
+        "--keep-work", action="store_true",
+        help="leave each clip's .work/ directory, which holds the predicted frames",
+    )
+    episodes.add_argument("--shard", metavar="INDEX/COUNT")
+    episodes.add_argument("--resume", action="store_true")
+    episodes.add_argument("--keep-going", action="store_true")
+    episodes.add_argument("--limit", type=int, default=None, metavar="N")
+    episodes.add_argument("--quiet", action="store_true")
+    episodes.add_argument("--progress-interval", type=float, default=30.0, metavar="SECONDS")
+    episodes.add_argument("--threads", type=int, default=None, metavar="N")
 
     clips_audit = sub.add_parser(
         "clips-audit", help="count complete/short clips under a --clips-out root"
@@ -605,6 +664,109 @@ def _run_clips(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def _run_clip_episodes(args: argparse.Namespace) -> int:
+    from . import clips, delivery
+
+    accel.limit_threads(args.threads)
+    say = (lambda _line: None) if args.quiet else _say
+
+    width, _, height = args.work_size.partition("x")
+    size = (int(width), int(height))
+    if size[0] % clip_defaults.DUV_WIDTH or size[1] % clip_defaults.DUV_HEIGHT:
+        # Not a preference. The DUV is a block reduction of this grid, and a
+        # non-integer factor sends it down the nearest-neighbour path, which
+        # samples one pixel per block and calls it a median.
+        print(
+            f"error: --work-size {args.work_size} is not a whole multiple of the "
+            f"{clip_defaults.DUV_WIDTH}x{clip_defaults.DUV_HEIGHT} DUV grid",
+            file=sys.stderr,
+        )
+        return 2
+
+    videos = resolve_videos(args.video, recursive=args.recursive)
+    # Numbered exactly as `scenes` numbers them, so a clip's name says which
+    # episode it came from whichever route produced it, and a corpus cut by
+    # both routes is still one corpus.
+    assignments = delivery.assign_scenes(delivery.episodes_from_videos(videos))
+    if args.limit:
+        assignments = assignments[: args.limit]
+
+    label = "all"
+    if args.shard:
+        index, _, count = args.shard.partition("/")
+        assignments = shard(assignments, int(index), int(count))
+        label = f"{index}/{count}"
+        if not assignments:
+            return 0
+
+    config = delivery.DeliveryConfig(
+        depth_backend=args.depth_backend,
+        depth_backend_options=parse_backend_options(args.depth_backend_option),
+        semantic_backend=args.semantic_backend,
+        semantic_backend_options=parse_backend_options(args.semantic_backend_option),
+        semantic_refiner=args.refiner,
+        size=size,
+        chunk_frames=args.chunk_frames,
+        writer_threads=args.writer_threads,
+        temporal_radius=args.temporal_radius,
+        temporal_min_run=args.temporal_min_run,
+        flow_compensate=not args.no_flow_compensate,
+        flow_downscale=args.flow_downscale,
+        split_hero=not args.no_hero_split,
+        progress=None if args.quiet else _say,
+        progress_interval=args.progress_interval,
+        **({"color_crf": args.color_crf} if args.color_crf is not None else {}),
+    )
+
+    say(
+        f"{len(assignments)} episodes -> {args.per_scene} x {args.frames} frames at "
+        f"{args.fps:g} fps, models at {size[0]}x{size[1]} [{label}]"
+    )
+
+    # Loaded once for the whole shard rather than once per episode: at five
+    # windows an episode this would otherwise be ten thousand model loads.
+    depth = delivery.get_depth_backend(args.depth_backend, **config.depth_backend_options)
+    semantic = delivery.get_semantic_backend(
+        args.semantic_backend, **config.semantic_backend_options
+    )
+    refiner = delivery.get_refiner(args.refiner)
+
+    reports: list[dict] = []
+    failed = 0
+    for position, item in enumerate(assignments, start=1):
+        say(f"[{position}/{len(assignments)}] {item.scene} <- {item.video}")
+        try:
+            reports.extend(
+                clips.cut_episode(
+                    item.video,
+                    args.clips_out,
+                    scene=item.scene,
+                    annotations=item.annotations,
+                    config=config,
+                    count=args.per_scene,
+                    length=args.frames,
+                    fps=args.fps,
+                    halo=args.halo,
+                    depth_backend=depth,
+                    semantic_backend=semantic,
+                    refiner=refiner,
+                    resume=args.resume,
+                    keep_work=args.keep_work,
+                    progress=say,
+                )
+            )
+        except Exception as error:  # one bad episode must not end the shard
+            if not args.keep_going:
+                raise
+            failed += 1
+            print(f"error: {item.scene}: {error}", file=sys.stderr)
+
+    name = None if label == "all" else f"clips_manifest.{label.replace('/', '-of-')}.json"
+    manifest = clips.write_clips_manifest(args.clips_out, reports, name=name)
+    say(f"{len(reports)} clips, {failed} episodes failed, manifest at {manifest}")
+    return 1 if failed else 0
+
+
 def _run_clips_audit(args: argparse.Namespace) -> int:
     from . import clips
 
@@ -660,6 +822,7 @@ def main(argv: list[str] | None = None) -> int:
         "scenes": _run_scenes,
         "scenes-audit": _run_scenes_audit,
         "clips": _run_clips,
+        "clip-episodes": _run_clip_episodes,
         "clips-audit": _run_clips_audit,
         "validate": _run_validate,
         "preview": _run_preview,

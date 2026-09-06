@@ -319,6 +319,116 @@ def test_the_command_cuts_only_the_segments_that_are_finished(delivered, tmp_pat
     assert cut == ["clip_000000_0", "clip_000000_1"], "an unfinished segment was cut"
 
 
+# ---------------------------------------------- straight from the source
+
+
+def _direct(video, out, **kwargs):
+    return clips.cut_episode(
+        video,
+        out,
+        scene="seg_000000",
+        config=delivery.DeliveryConfig(
+            depth_backend="synthetic",
+            semantic_backend="synthetic",
+            size=(clips.TARGET_WIDTH, clips.TARGET_HEIGHT),
+            chunk_frames=16,
+            stabilise_block=8,
+        ),
+        count=2,
+        length=8,
+        fps=24.0,
+        **kwargs,
+    )
+
+
+def test_the_source_route_writes_the_same_shape_as_the_delivered_one(delivered, tmp_path):
+    """Nothing downstream may be able to tell which route a clip took."""
+    from proxy_extract.video import probe
+
+    source = delivered.parent / "video.mp4"
+    direct = _direct(source, tmp_path / "direct")
+    sliced = _cut_one(delivered, tmp_path / "sliced")
+
+    assert [item["clip"] for item in direct] == [item["clip"] for item in sliced][: len(direct)]
+    for item in direct:
+        clip = tmp_path / "direct" / item["clip"]
+        target = probe(clip / clips.TARGET_DIRNAME / clips.TARGET_NAME)
+        duv = probe(clip / clips.PROXY_DIRNAME / clips.DUV_NAME)
+        assert target.frames == duv.frames == 8
+        assert (target.width, target.height) == (clips.TARGET_WIDTH, clips.TARGET_HEIGHT)
+        assert (duv.width, duv.height) == (clips.DUV_WIDTH, clips.DUV_HEIGHT)
+        assert (clip / clips.TARGET_DIRNAME / clips.ANCHOR_NAME).is_file()
+
+
+def test_both_routes_pick_the_same_source_frames(delivered, tmp_path):
+    """The window arithmetic is shared, so this is a guard against it forking."""
+    source = delivered.parent / "video.mp4"
+    direct = _direct(source, tmp_path / "direct")
+    sliced = _cut_one(delivered, tmp_path / "sliced")
+
+    for a, b in zip(direct, sliced):
+        assert a["source_ordinals"] == b["source_ordinals"]
+
+
+def test_only_the_frames_the_clips_keep_are_predicted(delivered, tmp_path, monkeypatch):
+    """The whole point of this route, and it is invisible in the output.
+
+    A clip that was cut correctly out of a full-episode pass looks exactly like
+    one that only ever predicted its own frames, so the saving has to be
+    asserted where it happens: the number of frames handed to the models.
+    """
+    from proxy_extract.depth import synthetic as depth_synthetic
+
+    seen = []
+    original = depth_synthetic.SyntheticDepthBackend.estimate
+
+    def counting(self, batch, **kwargs):
+        seen.append(len(batch))
+        return original(self, batch, **kwargs)
+
+    monkeypatch.setattr(depth_synthetic.SyntheticDepthBackend, "estimate", counting)
+    _direct(delivered.parent / "video.mp4", tmp_path / "direct", halo=2)
+
+    # Two windows of eight, plus at most two halo frames at each end of each.
+    assert sum(seen) <= 2 * (8 + 4)
+    assert sum(seen) >= 2 * 8
+    episode = delivery.probe(delivered.parent / "video.mp4").frames
+    assert sum(seen) < episode / 4, f"predicted {sum(seen)} of {episode} frames"
+
+
+def test_the_halo_is_predicted_and_then_dropped(delivered, tmp_path):
+    from proxy_extract.video import probe
+
+    source = delivered.parent / "video.mp4"
+    reports = _direct(source, tmp_path / "direct", halo=2)
+
+    clip = tmp_path / "direct" / reports[0]["clip"]
+    assert reports[0]["halo_frames"] == 2
+    assert probe(clip / clips.TARGET_DIRNAME / clips.TARGET_NAME).frames == 8
+
+
+def test_the_working_directory_does_not_outlive_the_clip(delivered, tmp_path):
+    reports = _direct(delivered.parent / "video.mp4", tmp_path / "direct")
+    for item in reports:
+        assert not (tmp_path / "direct" / item["clip"] / clips.WORK_DIRNAME).exists()
+
+
+def test_a_clip_cut_from_the_source_records_its_own_diagnosis(delivered, tmp_path):
+    """Per clip rather than per episode, because the tracker ran per clip."""
+    reports = _direct(delivered.parent / "video.mp4", tmp_path / "direct")
+    assert reports[0]["route"] == "source"
+    assert reports[0]["semantic"]["hero_split"] is not None
+    assert "flicker_after" in reports[0]["semantic"]
+
+
+def test_the_selection_stops_at_the_episodes_edges():
+    window = clips.Window(scene="seg_000000", index=0, ordinals=tuple(range(10)))
+    select, offset = clips.selection_for(window, source_frames=12, halo=3, step=1.0)
+    assert offset == 0, "there is nothing before frame 0 to take"
+    assert select[0] == 0
+    assert select[-1] == 11, "only two of the three trailing halo frames exist"
+
+
 def test_the_actions_are_cut_to_the_frames_the_clip_kept():
     window = clips.Window(scene="seg_000000", index=0, ordinals=(0, 2, 4))
     payload = [{"frame": index} for index in range(10)]

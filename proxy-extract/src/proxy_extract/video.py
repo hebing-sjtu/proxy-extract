@@ -8,7 +8,7 @@ preserve the two functions below.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -72,6 +72,7 @@ def iter_frames(
     limit: int | None = None,
     grayscale: bool = False,
     chunk: int = 128,
+    select: Collection[int] | None = None,
 ) -> "Iterator[list[np.ndarray]]":
     """Decode in batches of `chunk` frames, yielding one list at a time.
 
@@ -80,22 +81,42 @@ def iter_frames(
     held as one list, and the full-resolution depth and label stacks derived
     from it are larger still; nothing downstream of the per-frame reduction
     needs more than one batch resident at a time.
+
+    `select` names the source frames to keep, by ordinal. Everything else is
+    decoded and dropped before it is resampled or colour-converted, and the
+    decode stops after the last one asked for. This is what lets a caller that
+    wants a fifth of an episode pay for a fifth of the pixel work rather than
+    reducing the whole thing and throwing most of it away - and the frames that
+    come out are renumbered from zero, so what a consumer sees is simply a
+    shorter episode.
+
+    It is not a seek. Decoding is still sequential from frame zero, because
+    seeking H.264 without an exact-frame index lands on the nearest keyframe,
+    and a clip that is silently three frames off is worse than a slow one.
     """
     import cv2
 
     if chunk < 1:
         raise ValueError(f"chunk must be >= 1, got {chunk}")
+    wanted = None if select is None else set(select)
+    last = max(wanted) if wanted else -1
 
     capture = cv2.VideoCapture(str(path))
     if not capture.isOpened():
         raise FileNotFoundError(f"cannot open video: {path}")
     decoded = 0
+    source = -1
     batch: list[np.ndarray] = []
     try:
         while limit is None or decoded < limit:
             ok, bgr = capture.read()
             if not ok:
                 break
+            source += 1
+            if wanted is not None and source not in wanted:
+                if source > last:
+                    break
+                continue
             if size is not None and (bgr.shape[1], bgr.shape[0]) != size:
                 shrinking = size[0] * size[1] < bgr.shape[0] * bgr.shape[1]
                 bgr = cv2.resize(

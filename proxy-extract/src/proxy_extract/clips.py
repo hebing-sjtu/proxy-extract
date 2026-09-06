@@ -44,14 +44,19 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from . import contract, frames, proxy
 from .video import probe
+
+if TYPE_CHECKING:  # `delivery` imports enough to be worth keeping out of import time
+    from . import delivery
 
 CLIP_PREFIX = "clip_"
 CLIPS_PER_SCENE = 5
@@ -568,6 +573,230 @@ def cut_scene(
             )
         )
     return reports
+
+
+# ------------------------------------------------- straight from the source
+
+WORK_DIRNAME = ".work"
+
+
+def selection_for(
+    window: Window, *, source_frames: int, halo: int, step: float
+) -> tuple[tuple[int, ...], int]:
+    """The source frames to predict for one window, and where the clip starts.
+
+    A window's own 124 frames plus a few more at each end, sampled at the same
+    stride. The stabiliser looks `temporal_radius` frames either side of every
+    frame it settles, and without the halo the first and last few frames of
+    every clip would be settled against less context than the ones in the
+    middle - a seam at both ends of all ten thousand clips, in the same place
+    every time, which is the kind of defect a model learns rather than ignores.
+
+    They are dropped again after `derive`, so they cost prediction and nothing
+    else. Near the start or end of an episode there may be no frames to take,
+    and then the clip simply has the context the episode has.
+    """
+    before = [window.start - round(k * step) for k in range(halo, 0, -1)]
+    after = [window.ordinals[-1] + round(k * step) for k in range(1, halo + 1)]
+    lead = [o for o in before if o >= 0]
+    tail = [o for o in after if o < source_frames]
+    return (*lead, *window.ordinals, *tail), len(lead)
+
+
+def cut_episode(
+    video: Path,
+    clips_root: Path,
+    *,
+    scene: str,
+    annotations: Path | None = None,
+    config: "delivery.DeliveryConfig | None" = None,
+    count: int = CLIPS_PER_SCENE,
+    length: int = CLIP_FRAMES,
+    fps: float = CLIP_FPS,
+    source_fps: float | None = None,
+    halo: int | None = None,
+    depth_backend=None,
+    semantic_backend=None,
+    refiner=None,
+    resume: bool = False,
+    keep_work: bool = False,
+    progress=None,
+) -> list[dict]:
+    """Cut one episode's clips without delivering the episode first.
+
+    The two-step route - deliver the whole episode, then slice it - predicts
+    depth and semantics for every frame and then throws two thirds of them
+    away, and reaches 1344x768 by way of 1280x720, so the target is an upscale
+    of a downscale. This asks the models for the frames the clips keep, at the
+    size they are kept at, and nothing else.
+
+    Each window is its own small episode, and that is not only an optimisation.
+    The protagonist splitter builds person tracks across consecutive frames, so
+    run it over five windows minutes apart and it will happily connect a person
+    at the end of one to a different person at the start of the next. Per
+    window it decides from the frames the clip actually contains, which is the
+    right scope for a training sample anyway.
+
+    What comes out is byte-for-byte the same layout `cut_scene` produces, so
+    nothing downstream can tell which route a clip took.
+    """
+    from . import delivery
+
+    video, clips_root = Path(video), Path(clips_root)
+    config = config or delivery.DeliveryConfig()
+    halo = config.temporal_radius if halo is None else halo
+    say = progress or (lambda _line: None)
+
+    info = probe(video)
+    # The rate the episode was recorded at, which is what the frame dropping is
+    # computed from. `config.fps` is the rate a delivered scene is *labelled*
+    # with, and here that is the clip's 24 - reading the source rate off it
+    # would make the stride 1.0 and every clip a slow motion.
+    if source_fps is None:
+        source_fps = info.fps if info.fps and info.fps > 0 else fps
+    step = source_fps / fps
+    windows = plan_windows(
+        scene, info.frames, source_fps=source_fps, count=count, length=length, fps=fps
+    )
+
+    reports = []
+    for window in windows:
+        clip_dir = clips_root / clip_name(scene, window.index)
+        if resume and already_cut(clip_dir, length):
+            existing = clip_dir / CLIP_REPORT_NAME
+            reports.append(
+                json.loads(existing.read_text())
+                if existing.is_file()
+                else {"clip": clip_dir.name, "skipped": "already cut"}
+            )
+            shutil.rmtree(clip_dir / WORK_DIRNAME, ignore_errors=True)
+            continue
+
+        select, offset = selection_for(
+            window, source_frames=info.frames, halo=halo, step=step
+        )
+        say(
+            f"{clip_dir.name} <- {scene} frames {window.start}..{window.stop} "
+            f"({len(select)} predicted, {length} kept)"
+        )
+        work = clip_dir / WORK_DIRNAME
+        # The colour and the two arrays, and no DUV: this composes its own at
+        # 336x192 from the arrays, so a 1344x768 one would be written and
+        # deleted 10,000 times over.
+        scene_report = delivery.extract_scene(
+            video,
+            work,
+            config=replace(config, keep_frames=("color", "depth", "semantic"), fps=fps),
+            depth_backend=depth_backend,
+            semantic_backend=semantic_backend,
+            refiner=refiner,
+            select=select,
+            encode=False,
+        )
+        reports.append(
+            _assemble_clip(
+                work,
+                clip_dir,
+                window,
+                scene_report,
+                offset=offset,
+                length=length,
+                fps=fps,
+                annotations=annotations,
+                color_crf=config.color_crf,
+            )
+        )
+        if not keep_work:
+            shutil.rmtree(work, ignore_errors=True)
+    return reports
+
+
+def _assemble_clip(
+    work: Path,
+    clip_dir: Path,
+    window: Window,
+    scene_report: dict,
+    *,
+    offset: int,
+    length: int,
+    fps: float,
+    annotations: Path | None,
+    color_crf: int,
+) -> dict:
+    """Turn one window's predicted frames into the clip's three outputs.
+
+    `offset` skips the halo: the frames are numbered from the first one
+    predicted, and the clip starts at the first one kept.
+    """
+    import cv2
+
+    (clip_dir / TARGET_DIRNAME).mkdir(parents=True, exist_ok=True)
+    (clip_dir / PROXY_DIRNAME).mkdir(parents=True, exist_ok=True)
+
+    driving = bool(scene_report.get("semantic", {}).get("hero_split", {}).get("driving", False))
+    inverted = bool(scene_report.get("duv_depth_inverted", False))
+    width, height = scene_report["size"]
+
+    rgb = proxy.open_encoder(
+        clip_dir / TARGET_DIRNAME / TARGET_NAME, width, height, fps, kind="color", crf=color_crf
+    )
+    duv = proxy.open_encoder(
+        clip_dir / PROXY_DIRNAME / DUV_NAME, DUV_WIDTH, DUV_HEIGHT, fps, kind="proxy"
+    )
+    anchor = None
+    try:
+        for index in range(offset, offset + length):
+            colour = frames.read_image(work, "color", index)
+            if anchor is None:
+                anchor = colour
+            rgb.write(colour)
+            duv.write(
+                proxy.compose_proxy_frame(
+                    contract.downsample_depth(
+                        frames.read_array(work, "depth", index).astype(np.float32)
+                    ),
+                    contract.downsample_semantic(
+                        frames.read_array(work, "semantic", index).astype(np.uint8)
+                    ),
+                    driving=driving,
+                    inverted_depth=inverted,
+                )
+            )
+    finally:
+        rgb.close()
+        duv.close()
+
+    ok, buffer = cv2.imencode(".png", anchor[:, :, ::-1])
+    if not ok:
+        raise ClipError(f"failed to PNG-encode the anchor for {clip_dir.name}")
+    (clip_dir / TARGET_DIRNAME / ANCHOR_NAME).write_bytes(buffer.tobytes())
+
+    written = {
+        "clip": clip_dir.name,
+        "scene": window.scene,
+        "route": "source",
+        "source_video": scene_report.get("source_video"),
+        "window": window.index,
+        "source_ordinals": list(window.ordinals),
+        "source_fps": scene_report.get("config", {}).get("fps"),
+        "frames": length,
+        "fps": fps,
+        "target_size": [width, height],
+        "target_from": "the source video, resampled once",
+        "duv_size": [DUV_WIDTH, DUV_HEIGHT],
+        "duv_depth_inverted": inverted,
+        "halo_frames": offset,
+        # The per-window diagnostics, which are per-clip here rather than per
+        # episode: whether the protagonist was resolved and how much the labels
+        # flicker are properties of these 124 frames, not of the hour they came
+        # from, and this is the only place they are recorded.
+        "depth": scene_report.get("depth"),
+        "semantic": scene_report.get("semantic"),
+        "deliverable": scene_report.get("deliverable", True),
+        "annotations": _write_annotations(annotations, window, clip_dir, scene_report),
+    }
+    _atomic_json(clip_dir / CLIP_REPORT_NAME, written)
+    return written
 
 
 def write_clips_manifest(
