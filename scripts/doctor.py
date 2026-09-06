@@ -27,7 +27,7 @@ REPO = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(
     os.environ.get("DATA_DIR", "/data/binghe/datasets/ABot-World-Explorer-subset2000/data")
 )
-OUT_DIR = Path(os.environ.get("OUT_DIR", "/data/binghe/datasets/ABot-seg-long-2000"))
+OUT_DIR = Path(os.environ.get("OUT_DIR", "/data/binghe/datasets/ABot-sub-2000"))
 
 # Kept equal to run_scenes.sh, which sizes the run with them.
 GIB_PER_WORKER = 11

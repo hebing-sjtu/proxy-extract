@@ -72,7 +72,7 @@ def test_the_launcher_and_the_makefile_agree_on_the_corpus_paths():
 
     for text in (launcher, makefile):
         assert "/data/binghe/datasets/ABot-World-Explorer-subset2000/data" in text
-        assert "/data/binghe/datasets/ABot-seg-long-2000" in text
+        assert "/data/binghe/datasets/ABot-sub-2000" in text
 
 
 @needs_checkout

@@ -1,4 +1,4 @@
-# ABot-seg-long-2000 数据格式
+# ABot-sub-2000 数据格式
 
 交付集的格式说明。怎么把它跑出来见 `RUNBOOK.md`。
 
@@ -8,7 +8,7 @@ COLMAP 稀疏模型 —— **没有深度，也没有语义**。这两路都是�
 
 | | 源 | 交付 |
 |---|---|---|
-| 路径 | `/data/binghe/datasets/ABot-World-Explorer-subset2000/` | `/data/binghe/datasets/ABot-seg-long-2000/` |
+| 路径 | `/data/binghe/datasets/ABot-World-Explorer-subset2000/` | `/data/binghe/datasets/ABot-sub-2000/` |
 | 布局 | `data/<prefix>/<sample_id>/{video.mp4, annotations.tar}` | `seg_NNNNNN/` |
 | 分辨率 | 1920×1080 | 1280×720（正好 2/3，不引入形变） |
 | 长度 | 整段，约 1800 帧 | 同上，**不切窗、不截断** |

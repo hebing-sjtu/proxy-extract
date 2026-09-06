@@ -1,6 +1,6 @@
 # Runbook
 
-把 **ABot-World-Explorer-subset2000**（只有 RGB）跑成 **ABot-seg-long-2000**
+把 **ABot-World-Explorer-subset2000**（只有 RGB）跑成 **ABot-sub-2000**
 （RGB + 深度 + 语义 + DUV）的操作手册。不需要先读源码。
 
 交付格式本身在 `DATA_F.md`，这里只讲怎么跑、看什么、怎样算对、出错了怎么办。
@@ -261,7 +261,7 @@ RuntimeError: expected scalar type Float but found BFloat16
 .venv/bin/python -m proxy_extract scenes \
   --video /data/binghe/datasets/ABot-World-Explorer-subset2000/data \
   --recursive \
-  --out /data/binghe/datasets/ABot-seg-long-2000 \
+  --out /data/binghe/datasets/ABot-sub-2000 \
   --semantic-backend standard11 \
   --depth-backend depth_anything_v3 \
   --resume --keep-going
@@ -280,7 +280,7 @@ RuntimeError: expected scalar type Float but found BFloat16
 
 ```bash
 LIMIT=4 N_GPUS=2 WORKERS_PER_GPU=2 HEARTBEAT_SECONDS=30 \
-  OUT_DIR=/data/binghe/datasets/ABot-seg-trial make scenes
+  OUT_DIR=/data/binghe/datasets/ABot-sub-trial make scenes
 ```
 
 要看的三件事，按顺序：
@@ -321,7 +321,7 @@ LIMIT=4 N_GPUS=2 WORKERS_PER_GPU=2 HEARTBEAT_SECONDS=30 \
 `HEARTBEAT_SECONDS=0` 关掉心跳。要看细节就跟一个 shard 的日志：
 
 ```bash
-tail -f /data/binghe/datasets/ABot-seg-long-2000/logs/shard-0.log
+tail -f /data/binghe/datasets/ABot-sub-2000/logs/shard-0.log
 make scenes-audit
 ```
 
@@ -409,7 +409,7 @@ KEEP_FRAMES=none  make scenes    # 只要四路视频，回到 465 MiB/段
 
 ```bash
 .venv/bin/python -m proxy_extract scenes-audit \
-  --out /data/binghe/datasets/ABot-seg-long-2000 --list complete
+  --out /data/binghe/datasets/ABot-sub-2000 --list complete
 ```
 
 一行一个 `seg_NNNNNN`，只有名字，是给管道用的（`--list incomplete` / `missing` 看
@@ -419,10 +419,10 @@ KEEP_FRAMES=none  make scenes    # 只要四路视频，回到 465 MiB/段
 
 ```bash
 ssh node '/workspace/proxy-extract/.venv/bin/python -m proxy_extract scenes-audit \
-    --out /data/binghe/datasets/ABot-seg-long-2000 --list complete' > done.txt
+    --out /data/binghe/datasets/ABot-sub-2000 --list complete' > done.txt
 
 rsync -ar --files-from=done.txt --exclude 'frames/' \
-  node:/data/binghe/datasets/ABot-seg-long-2000/ ./scenes/
+  node:/data/binghe/datasets/ABot-sub-2000/ ./scenes/
 ```
 
 两个地方会咬人：
@@ -442,7 +442,7 @@ rsync -ar --files-from=done.txt --exclude 'frames/' \
 
 ```bash
 .venv/bin/python -m proxy_extract scenes-preview \
-  --scene /data/binghe/datasets/ABot-seg-long-2000/seg_000000 \
+  --scene /data/binghe/datasets/ABot-sub-2000/seg_000000 \
   --out /tmp/sheet.png --frames 6
 ```
 
@@ -465,7 +465,7 @@ rsync -ar --files-from=done.txt --exclude 'frames/' \
 验收任何一批数据，先：
 
 ```bash
-grep -L '"deliverable": true' /data/binghe/datasets/ABot-seg-long-2000/*/extraction_report.json
+grep -L '"deliverable": true' /data/binghe/datasets/ABot-sub-2000/*/extraction_report.json
 ```
 
 ### 会拒绝什么
@@ -746,7 +746,7 @@ torch 版本与 `torch.cuda.is_available()`（对上 nvidia-smi 的驱动号）�
 | 跑了几个小时，帧在慢慢出，但一条 episode 都没完成，GPU 利用率 0、load 也低 | 机器在等，不在算。这种「哪儿都不忙」的组合基本上就是存储：几十个 worker 同时往共享盘写逐帧目录，一帧 3 个文件、约 2.8 MiB | 看 shard 日志心跳括号里的百分比，`write` 高就是它。先减 `WORKERS_PER_GPU`，再考虑 `KEEP_FRAMES=depth`（少写两路）或把 `OUT_DIR` 换到本地盘。想立刻量一下当前速率：`d=$(ls -dt $OUT_DIR/seg_*/frames/color \| head -1); a=$(ls $d \| wc -l); sleep 60; b=$(ls $d \| wc -l); echo $((b-a)) frames/min` |
 | `nvidia-smi` 里的进程数少于自己开的 worker 数（心跳的 `shards alive` 也少） | 有 worker 在起步阶段就死了，日志里是 traceback，但它被淹在几十个日志文件中间 | `head -20 $OUT_DIR/logs/shard-*.log` 一次看全部开头。2026-09 之前的版本有一个必踩的：所有 shard 抢同一个 manifest 临时文件，64 路里能死掉一批，`git pull` 即可 |
 | `nvidia-smi` 里的进程数多于自己开的 worker 数 | 上一轮 worker 没退干净，显存和核都还被它们占着，新一轮于是挤在剩下的卡上 —— 「每张卡 worker 数不一样」通常就是这么来的 | `comm -23 <(nvidia-smi --query-compute-apps=pid --format=csv,noheader \| sort -u) <(pgrep -f "proxy_extract scenes" \| sort -u)` 列出没人认领的 pid，确认后 `kill -9`。下一轮起来前 `nvidia-smi` 应该是干净的 |
-| `scenes-audit` 报 `no scenes_manifest.json` | manifest 在模型加载之前就写了，所以这个 `--out` 下没有 worker 跑过 | 核对 `OUT_DIR` 和 audit 的 `--out` 是不是同一个路径（`ls -d /data/binghe/datasets/ABot-seg-*`） |
+| `scenes-audit` 报 `no scenes_manifest.json` | manifest 在模型加载之前就写了，所以这个 `--out` 下没有 worker 跑过 | 核对 `OUT_DIR` 和 audit 的 `--out` 是不是同一个路径（`ls -d /data/binghe/datasets/ABot-*`） |
 | `semantic backend 'standard11' failed: ImportError: Mask2FormerLoss requires the scipy library` | Mask2Former 的 `__init__` 无条件构造训练损失，那个损失在构造时就要 scipy（匈牙利匹配用）。本管线不训练也从不调它，但模型加载不过去 | `pip install scipy`。已经写进 `requirements.txt`，老 venv 补装即可 |
 
 模型和数据相关：

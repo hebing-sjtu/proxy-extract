@@ -24,7 +24,7 @@
 set -euo pipefail
 
 DATA_DIR="${DATA_DIR:-/data/binghe/datasets/ABot-World-Explorer-subset2000/data}"
-OUT_DIR="${OUT_DIR:-/data/binghe/datasets/ABot-seg-long-2000}"
+OUT_DIR="${OUT_DIR:-/data/binghe/datasets/ABot-sub-2000}"
 SEMANTIC="${SEMANTIC:-standard11}"
 # depth_anything_v3, because it is the only one of the three that both reports
 # metres and can be obtained on a node whose egress stops at the hub. mapanything

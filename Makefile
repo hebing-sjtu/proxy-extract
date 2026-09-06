@@ -12,7 +12,7 @@ VPY  := $(VENV)/bin/python
 # scripts/run_scenes.sh and scripts/doctor.py carry, restated here so that
 # `make scenes DATA_DIR=...` reads the way it looks like it should.
 DATA_DIR ?= /data/binghe/datasets/ABot-World-Explorer-subset2000/data
-OUT_DIR  ?= /data/binghe/datasets/ABot-seg-long-2000
+OUT_DIR  ?= /data/binghe/datasets/ABot-sub-2000
 
 # A worker peaks near 11 GiB of host RAM, so this is still bounded by MemTotal
 # rather than by VRAM; run_scenes.sh checks it and warns.

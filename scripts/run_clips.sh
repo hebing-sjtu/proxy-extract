@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-OUT_DIR="${OUT_DIR:-/data/binghe/datasets/ABot-seg-long-2000}"
+OUT_DIR="${OUT_DIR:-/data/binghe/datasets/ABot-sub-2000}"
 CLIPS_DIR="${CLIPS_DIR:-${OUT_DIR}-clips}"
 
 # 5 clips of 124 frames at 24 fps: one code-world-model window each, 5.17
