@@ -13,6 +13,12 @@
 每片    124 帧 @ 24 fps，恰好一个 CWM 窗口
 ```
 
+**124 不是挑出来的，是 H3 那条推理路径的固定几何**（`cwm_h3_inference/constants.py`
+开头就写着 frozen geometry）：一个窗口 124 帧，续跑重叠 34 帧，每续一次多 90 帧新的，
+所以 n 个窗口是 `124 + 90 * (n - 1)` 帧。切成正好一个窗口，是为了让**一片就是一个
+训练样本**，下游不用再开窗——一旦一片是 1.5 个窗口，切窗的规则就得在每个 loader 里
+各写一遍，而它们不会写得一样。第 0 帧是给定的初始条件，见第 2 节 `anchor.png`。
+
 ---
 
 ## 1. 目录结构
@@ -29,6 +35,7 @@ ABot-sub-2000-clips/
             action.json
             caption.json
             cameras.npz
+            prompt.json               # 逐秒 caption，另一条管线写的，见第 5 节
         clip_report.json              # 这一片的全部元数据
     clip_000000_1/
     ...
@@ -71,6 +78,17 @@ ABot-sub-2000-clips/
 
 1344x768 无损 PNG，内容就是 `rgb.mp4` 的第 0 帧。单独存一份是因为它要走无损路径进
 VAE，而 rgb.mp4 是有损的——**两者不是逐像素相同的**，anchor 是权威版本。
+
+它单独存在还有个更具体的理由：**它就是模型的初始条件，而且是一帧，不是几帧。**
+`cwm_h3_inference` 把这张图编成一个时间长度为 1 的 latent，放在视频 latent 的时间
+索引 0 上，denoise mask 记的是 `0_fixed_1_regenerate` —— 索引 0 冻住，其余全部重新
+生成。所以一片 124 帧里，**第 0 帧是给定的，第 1..123 帧是要生成的**。
+
+这只对窗口 0 成立。多窗口续跑（`Retake34`）时，下一个窗口的初始条件是**上一个窗口
+最后 34 帧**重新编码出来的前 10 个 latent，被按住不去噪。切片语料每片只有一个窗口，
+所以走的是前一种。
+
+`duv.mp4` 不是初始条件，它是**整个 124 帧的控制信号**，别把两者混成一个概念。
 
 ---
 
@@ -203,6 +221,11 @@ def duv_classes(frame: np.ndarray) -> np.ndarray:
 **整个目录可能不存在**，取决于源 episode 有没有 `annotations.tar`。三个文件各自也
 可能单独缺席。`clip_report.json → annotations` 记录了实际写了什么。
 
+那三个是**语料自己的说法**，逐字节或逐帧地从 `annotations.tar` 裁下来的。
+`prompt.json` 不是——它是本仓库另一条管线事后写进来的，第 5.4 节单独讲。混在一个
+目录里是因为「关于这一片已知什么」的东西读的人只会去一个地方找；要分清哪半边是谁
+说的，看 `clip_report.json → annotations`（只记前三个）和 `prompt.json → provenance`。
+
 ### action.json
 
 按帧切好的，只含这一片的 124 帧，顺序与 `source_ordinals` 一致。原文件如果是个 list
@@ -236,6 +259,77 @@ def duv_classes(frame: np.ndarray) -> np.ndarray:
 所以 **DUV 的米制深度和这里的位姿不在同一个尺度上，直接混用是错的**，除非你自己解出
 那个尺度因子——本管线没有解。原始 COLMAP 模型的路径记在 `clip_report.json →
 annotations.source`，需要完整重建就去那里取。
+
+### 5.4 prompt.json —— 逐秒 caption
+
+**不是语料带的，是 `clip-prompts/` 用 VLM 写的。** 格式是 `contract: "timeline"`
+v4，完整说明在 `clip-prompts/README.md`，这里只讲读它要知道的。
+
+跟另外三个的区别，写接口时会踩到的有三条：
+
+**它的有无和 `annotations.tar` 无关。** 那三个文件缺席是因为源 episode 没带标注；
+`prompt.json` 缺席是因为这一片还没 caption 过，或者 caption 失败了。所以
+`annotations/` 目录可能只有 `prompt.json` 一个文件——`clip-prompts` 在目录不存在时
+会建它。反过来，`clip_report.json → annotations` 里**不会**出现 `prompt.json`，那个
+字段记的是从 tar 里裁了什么。
+
+**它描述的是这 124 帧，不是整条 episode。** 这一点上它和 `caption.json` 正好相反：
+`caption.json` 是整段级原样复制的（见 5.2），拿它当这 5 秒的描述会系统性地跑偏。
+
+**时间轴按 1 秒切，不是按帧。** 124 帧 @ 24fps 是 5.1667 秒，所以是 **5 个 bin 而不
+是 6 个**：最后 0.1667 秒只有 4 帧，不够描述任何东西，并进前一个 bin，于是末尾那个
+bin 是 1.1667 秒。尾巴既不四舍五入也不丢掉，`timeline.bins[]` 里同时写了它真实的秒
+区间和帧区间：
+
+```python
+{"index": 4, "t": [4.0, 5.167], "frames": [96, 124]}
+```
+
+**要逐帧对齐就读 `frames`，不要拿 `t` 乘 fps 再取整**——那是第 4 节
+`source_ordinals` 那条规矩的同一件事。
+
+顶层字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `contract` / `version` | `"timeline"` / `4`。不匹配就直接拒，别猜 |
+| `compiler` | 渲染文本的规则版本。文本变了它变，可以据此挑片重编 |
+| `window` | 这一片是谁的哪一段；切窗后还有 `t0` / `frame_offset` |
+| `timeline` | bin 网格，秒和帧两套边界 |
+| `scene` / `entities` / `events` | 结构化的观察，`events` 分 `subject` / `camera` 两个 channel |
+| `evidence` | **从这一片自己的 `duv.mp4` 实测的**逐秒事实，没有模型参与 |
+| `checks` | `evidence` 和 caption 对不上的地方，分 `fail` / `warn` |
+| `compiled` | 拿去训练的文本：`lean` / `rich` / `timed` / `conditioning` |
+| `provenance` | 模型、后端、重试次数、token、`score`、时间 |
+
+**要过滤语料就看 `checks.fail` 和 `provenance.score`。** `fail` 非空表示 caption 说
+了 DUV 直接打脸的东西（凭空的车、不在场的主角），那是幻觉；`warn` 是有无辜解释的
+分歧，不该为它丢片。`score` 是「平均置信度扣掉警告」，不是标定过的概率，只用来排序。
+
+**`compiled.conditioning.card` 是个指针，不是文本。** 描述 DUV 编码含义的那段话是整
+个语料共用的一句，存在 `clip_prompts/conditioning.py` 里，每片只留 id；逐片不同的那
+半句在 `contents` 里。要拼回完整段落用 `conditioning.full_text()`。
+
+**默认的时间戳写法和 H3 自己的一样。** `code-world-model/examples/` 里那份多窗口配置
+的窗口 prompt 就是 `"[0.00s-5.17s] ..."` 和 `"[3.75s-8.92s] ..."`——两位小数，时间是
+**整段输出的绝对时间**，不是窗口内相对时间。所以：
+
+```
+[0.00s-1.00s] ...
+[1.00s-2.00s] ...
+[4.00s-5.17s] ...       ← 五行的并集正好是上游那个 [0.00s-5.17s]
+```
+
+逐秒 caption 是在**把 H3 已经见过的约定切细**，不是教它一套新记号。`script` 会把
+`window.t0` 加进去（`timed.offset` 记着加了多少），而 `timed.bins[].t` 保持片内相对，
+结构化的那份才是真值。换别的标记是 `render.script(marker=...)` 一个参数，不用重跑
+VLM。
+
+`compiled.lean.global` / `rich.global` 是**不带时间戳**的整段描述，建议按比例混进
+训练集，免得模型变成没有时间戳就不会写。
+
+还有一条来自 `INFERENCE.md`：**prompt 在进 Qwen 之前行尾会被规范成 CRLF**。导出训练
+样本时按同一条规矩来，否则编辑器把 CRLF 存成 LF 就会改掉实际消费的 token。
 
 ---
 
@@ -343,7 +437,8 @@ def load_clip(clip_dir: Path):
 
 6. **1344x768 是 1.75 宽高比**，相对源片横向压了 1.6%。
 
-7. **`caption.json` 描述的是整条 60 秒 episode**，不是这 124 帧。
+7. **`caption.json` 描述的是整条 60 秒 episode**，不是这 124 帧。要这 124 帧自己的
+   描述用 `prompt.json`（第 5.4 节），但它不是语料带的，而且不保证每片都有。
 
 8. **主角（`player`）可能没判出来**，那一片的所有人会落进 `ped`。查
    `semantic.hero_split.resolved`——但那个字段只有一趟管线产出的报告里才有，两步产的
