@@ -219,19 +219,65 @@ def test_load_env_reports_which_files_it_read(tmp_path):
     assert llm_env.load_env(tmp_path, tmp_path / "absent") == [tmp_path / ".env"]
 
 
-def test_an_incomplete_service_account_names_the_variable_to_set(monkeypatch):
-    for name in (
-        "VERTEX_SA_JSON",
-        "GOOGLE_APPLICATION_CREDENTIALS",
-        "VERTEX_PROJECT_ID",
-        "VERTEX_PROJECT",
-        "VERTEX_CLIENT_EMAIL",
-        "VERTEX_PRIVATE_KEY",
-        "VERTEXT_KEY",
-    ):
+VERTEX_VARS = (
+    "VERTEX_SA_JSON",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "VERTEX_PROJECT_ID",
+    "VERTEX_PROJECT",
+    "VERTEX_CLIENT_EMAIL",
+    "VERTEX_PRIVATE_KEY",
+    "VERTEXT_KEY",
+)
+
+
+@pytest.fixture
+def no_vertex_env(monkeypatch):
+    for name in VERTEX_VARS:
         monkeypatch.delenv(name, raising=False)
+
+
+def test_an_incomplete_service_account_names_the_variable_to_set(no_vertex_env):
     with pytest.raises(vertex.VertexAuthError, match="VERTEX_CLIENT_EMAIL"):
         vertex.load_service_account()
+
+
+def test_the_error_names_the_alias_spellings_too(no_vertex_env):
+    """The sibling repo's template says VERTEX_PROJECT, so people have that one."""
+    with pytest.raises(vertex.VertexAuthError) as caught:
+        vertex.load_service_account()
+    assert "VERTEX_PROJECT_ID (or VERTEX_PROJECT)" in str(caught.value)
+    assert "VERTEXT_KEY" in str(caught.value)
+    assert "VERTEX_SA_JSON" in str(caught.value)
+
+
+def test_a_half_filled_environment_says_which_half_arrived(no_vertex_env, monkeypatch):
+    """Moving credentials between machines one variable at a time is the common case."""
+    monkeypatch.setenv("VERTEX_PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----x")
+    with pytest.raises(vertex.VertexAuthError) as caught:
+        vertex.load_service_account()
+    message = str(caught.value)
+    assert "already set: VERTEX_PRIVATE_KEY" in message
+    assert "VERTEX_CLIENT_EMAIL" in message
+    # The one that arrived must not also be listed as missing.
+    assert "missing: VERTEX_PROJECT_ID (or VERTEX_PROJECT), VERTEX_CLIENT_EMAIL\n" in message
+
+
+def test_a_key_file_supplies_all_three_at_once(no_vertex_env, monkeypatch, tmp_path):
+    key_file = tmp_path / "sa.json"
+    key_file.write_text(
+        json.dumps(
+            {
+                "project_id": "proj",
+                "client_email": "robot@proj.iam.gserviceaccount.com",
+                "private_key": "-----BEGIN PRIVATE KEY-----\\nabc\\n-----END PRIVATE KEY-----",
+            }
+        )
+    )
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(key_file))
+    sa = vertex.load_service_account()
+    assert sa["project_id"] == "proj"
+    assert sa["token_uri"] == vertex.DEFAULT_TOKEN_URI
+    assert "\n" in sa["private_key"]  # unescaped on the way out
 
 
 def test_the_regional_and_global_endpoints_differ_by_host():

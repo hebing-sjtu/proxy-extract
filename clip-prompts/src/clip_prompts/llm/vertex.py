@@ -113,19 +113,29 @@ def load_service_account() -> dict:
             "private_key_id": env_any("VERTEX_PRIVATE_KEY_ID", "VERTEXT_KEY_ID"),
             "token_uri": env_any("VERTEX_TOKEN_URI", default=DEFAULT_TOKEN_URI),
         }
-    missing = [
-        variable
-        for variable, field in (
-            ("VERTEX_PROJECT_ID", "project_id"),
-            ("VERTEX_CLIENT_EMAIL", "client_email"),
-            ("VERTEX_PRIVATE_KEY", "private_key"),
-        )
-        if not str(data.get(field) or "").strip()
-    ]
+    required = (
+        ("project_id", "VERTEX_PROJECT_ID", "VERTEX_PROJECT"),
+        ("client_email", "VERTEX_CLIENT_EMAIL", None),
+        ("private_key", "VERTEX_PRIVATE_KEY", "VERTEXT_KEY"),
+    )
+    missing = [names for names in required if not str(data.get(names[0]) or "").strip()]
     if missing:
+        # Naming what *was* found matters as much as what was not: a half-filled
+        # environment looks identical to an empty one from the error alone, and
+        # the half-filled case is the common one when credentials are being
+        # moved between machines a variable at a time.
+        found = [names[1] for names in required if names not in missing]
+        wanted = ", ".join(
+            variable if alias is None else f"{variable} (or {alias})"
+            for _, variable, alias in missing
+        )
         raise VertexAuthError(
-            "the Vertex service account is incomplete. Set VERTEX_SA_JSON to a "
-            "key file, or set: " + ", ".join(missing)
+            "the Vertex service account is incomplete.\n"
+            f"  missing: {wanted}\n"
+            + (f"  already set: {', '.join(found)}\n" if found else "")
+            + "  Simplest fix: put the key file somewhere readable and set "
+            "VERTEX_SA_JSON (or GOOGLE_APPLICATION_CREDENTIALS) to its path, "
+            "which supplies all three at once."
         )
     data["private_key"] = unescape_pem(str(data["private_key"]))
     data.setdefault("token_uri", DEFAULT_TOKEN_URI)

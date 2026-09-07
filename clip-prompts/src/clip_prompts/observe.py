@@ -23,7 +23,15 @@ from pathlib import Path
 
 from . import prompts, vocab
 from .contract import COMPILER_VERSION, Caption, Entity, Event, Scene
-from .llm import ChatRequest, Image, Message, Text, Video, parse_json_object
+from .llm import (
+    ChatRequest,
+    Image,
+    Message,
+    Text,
+    VertexAuthError,
+    Video,
+    parse_json_object,
+)
 from .llm import build_client as _build_client
 from .llm.env import load_env as _load_env
 from .timeline import Grid
@@ -42,8 +50,8 @@ DEFAULT_REPAIRS = 2
 REPO = Path(__file__).resolve().parents[3]
 
 
-def load_env(extra: str | Path | None = None) -> list[Path]:
-    """Load credentials from `.env` files, and report which ones were read.
+def env_roots(extra: str | Path | None = None) -> list[Path]:
+    """Where `.env` files are looked for, in order.
 
     The sibling checkout is searched last and only if it happens to be there.
     That is a convenience for whoever still has their keys in it, not a
@@ -53,16 +61,41 @@ def load_env(extra: str | Path | None = None) -> list[Path]:
     roots = [REPO, Path.cwd(), REPO / "low_high_pipeline"]
     if extra:
         roots.insert(0, Path(extra).expanduser())
-    return _load_env(*roots)
+    return roots
+
+
+def load_env(extra: str | Path | None = None) -> list[Path]:
+    """Load credentials from `.env` files, and report which ones were read."""
+    return _load_env(*env_roots(extra))
+
+
+def _env_trail(read: list[Path], extra: str | Path | None) -> str:
+    """What the credential search actually did, for an error that says it did not work.
+
+    Without this, a missing `.env.local` and a `.env.local` that was found but
+    is missing a line produce the same message, and the first thing anyone asks
+    is which of the two it was.
+    """
+    if read:
+        return "  .env files read: " + ", ".join(str(path) for path in read)
+    looked = ", ".join(str(root) for root in env_roots(extra))
+    return (
+        f"  no .env file was found. Looked for .env and .env.local in: {looked}\n"
+        "  There is a template at clip-prompts/.env.example; --env-dir adds a "
+        "directory to that list."
+    )
 
 
 def build_client(backend: str = DEFAULT_BACKEND, *, env_dir: str | Path | None = None):
-    load_env(env_dir)
-    return _build_client(
-        backend,
-        api_key=os.environ.get("LITELLM_API_KEY", ""),
-        base_url=os.environ.get("LITELLM_BASE_URL", ""),
-    )
+    read = load_env(env_dir)
+    try:
+        return _build_client(
+            backend,
+            api_key=os.environ.get("LITELLM_API_KEY", ""),
+            base_url=os.environ.get("LITELLM_BASE_URL", ""),
+        )
+    except VertexAuthError as exc:
+        raise VertexAuthError(f"{exc}\n{_env_trail(read, env_dir)}") from exc
 
 
 @dataclass(frozen=True)
