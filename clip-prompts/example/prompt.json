@@ -1,0 +1,419 @@
+{
+  "contract": "timeline",
+  "version": 4,
+  "compiler": 1,
+  "window": {
+    "clip": "clip_000414_2",
+    "episode": "seg_000414",
+    "window": 2,
+    "t0": 0.0,
+    "frames": 124,
+    "fps": 24.0,
+    "duration": 5.167,
+    "source_fps": 30.0,
+    "source_ordinals": [
+      368,
+      523
+    ],
+    "source_video": "data/abot/000414/video.mp4"
+  },
+  "timeline": {
+    "fps": 24.0,
+    "frames": 124,
+    "duration": 5.167,
+    "bin_seconds": 1.0,
+    "count": 5,
+    "bins": [
+      {
+        "index": 0,
+        "t": [
+          0.0,
+          1.0
+        ],
+        "frames": [
+          0,
+          24
+        ]
+      },
+      {
+        "index": 1,
+        "t": [
+          1.0,
+          2.0
+        ],
+        "frames": [
+          24,
+          48
+        ]
+      },
+      {
+        "index": 2,
+        "t": [
+          2.0,
+          3.0
+        ],
+        "frames": [
+          48,
+          72
+        ]
+      },
+      {
+        "index": 3,
+        "t": [
+          3.0,
+          4.0
+        ],
+        "frames": [
+          72,
+          96
+        ]
+      },
+      {
+        "index": 4,
+        "t": [
+          4.0,
+          5.167
+        ],
+        "frames": [
+          96,
+          124
+        ]
+      }
+    ]
+  },
+  "scene": {
+    "medium": "third-person open-world video game",
+    "environment": "city street",
+    "environment_rich": "a broad urban boulevard lined with stone buildings",
+    "lighting": "bright daylight",
+    "lighting_rich": "bright clear daylight with hard shadows on the pavement"
+  },
+  "entities": [
+    {
+      "id": "char_0",
+      "kind": "man",
+      "look": "man in a dark green jacket",
+      "look_rich": "man in a dark green bomber jacket, dark jeans and white sneakers",
+      "protagonist": true,
+      "bins": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ]
+    }
+  ],
+  "events": [
+    {
+      "id": "e0",
+      "channel": "subject",
+      "entity": "char_0",
+      "verb": "stand",
+      "phrase": "still in the middle of the roadway",
+      "phrase_rich": "motionless in the middle of the empty asphalt roadway",
+      "target": null,
+      "facing": "back",
+      "bins": [
+        0
+      ],
+      "t": [
+        0.0,
+        1.0
+      ],
+      "confidence": 1.0,
+      "starts_before": false,
+      "continues_after": false
+    },
+    {
+      "id": "e1",
+      "channel": "subject",
+      "entity": "char_0",
+      "verb": "walk",
+      "phrase": "forward along the road",
+      "phrase_rich": "steadily along the asphalt roadway toward an intersection",
+      "target": null,
+      "facing": "back",
+      "bins": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "t": [
+        1.0,
+        5.167
+      ],
+      "confidence": 1.0,
+      "starts_before": false,
+      "continues_after": false
+    },
+    {
+      "id": "c0",
+      "channel": "camera",
+      "entity": null,
+      "verb": "follow",
+      "phrase": "from behind at shoulder height",
+      "phrase_rich": "from behind at shoulder height, holding the man centred",
+      "target": null,
+      "facing": "unknown",
+      "bins": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "t": [
+        0.0,
+        5.167
+      ],
+      "confidence": 1.0,
+      "starts_before": false,
+      "continues_after": false
+    }
+  ],
+  "evidence": {
+    "source": "duv",
+    "from": "proxy/duv.mp4",
+    "hero_resolved": true,
+    "ped_min_pixels": 8,
+    "static_code_delta": 0.5,
+    "per_bin": [
+      {
+        "bin": 0,
+        "t": [
+          0.0,
+          1.0
+        ],
+        "player": true,
+        "peds": 0,
+        "vehicle": false,
+        "ego_vehicle": false,
+        "player_area": 0.031,
+        "sky_frac": 0.212,
+        "road_frac": 0.114,
+        "vegetation_frac": 0.301,
+        "static_frac": 0.342,
+        "player_bbox": [
+          0.42,
+          0.35,
+          0.58,
+          0.92
+        ],
+        "depth_delta_code": 0.04,
+        "world_moving": false,
+        "depth_p10_m": 4.2,
+        "depth_p50_m": 18.4,
+        "depth_p90_m": 210.0
+      },
+      {
+        "bin": 1,
+        "t": [
+          1.0,
+          2.0
+        ],
+        "player": true,
+        "peds": 0,
+        "vehicle": false,
+        "ego_vehicle": false,
+        "player_area": 0.031,
+        "sky_frac": 0.212,
+        "road_frac": 0.114,
+        "vegetation_frac": 0.301,
+        "static_frac": 0.342,
+        "player_bbox": [
+          0.42,
+          0.35,
+          0.58,
+          0.92
+        ],
+        "depth_delta_code": 0.91,
+        "world_moving": true,
+        "depth_p10_m": 4.2,
+        "depth_p50_m": 18.4,
+        "depth_p90_m": 210.0
+      },
+      {
+        "bin": 2,
+        "t": [
+          2.0,
+          3.0
+        ],
+        "player": true,
+        "peds": 0,
+        "vehicle": false,
+        "ego_vehicle": false,
+        "player_area": 0.031,
+        "sky_frac": 0.212,
+        "road_frac": 0.114,
+        "vegetation_frac": 0.301,
+        "static_frac": 0.342,
+        "player_bbox": [
+          0.42,
+          0.35,
+          0.58,
+          0.92
+        ],
+        "depth_delta_code": 0.91,
+        "world_moving": true,
+        "depth_p10_m": 4.2,
+        "depth_p50_m": 18.4,
+        "depth_p90_m": 210.0
+      },
+      {
+        "bin": 3,
+        "t": [
+          3.0,
+          4.0
+        ],
+        "player": true,
+        "peds": 0,
+        "vehicle": false,
+        "ego_vehicle": false,
+        "player_area": 0.031,
+        "sky_frac": 0.212,
+        "road_frac": 0.114,
+        "vegetation_frac": 0.301,
+        "static_frac": 0.342,
+        "player_bbox": [
+          0.42,
+          0.35,
+          0.58,
+          0.92
+        ],
+        "depth_delta_code": 0.91,
+        "world_moving": true,
+        "depth_p10_m": 4.2,
+        "depth_p50_m": 18.4,
+        "depth_p90_m": 210.0
+      },
+      {
+        "bin": 4,
+        "t": [
+          4.0,
+          5.167
+        ],
+        "player": true,
+        "peds": 0,
+        "vehicle": false,
+        "ego_vehicle": false,
+        "player_area": 0.031,
+        "sky_frac": 0.212,
+        "road_frac": 0.114,
+        "vegetation_frac": 0.301,
+        "static_frac": 0.342,
+        "player_bbox": [
+          0.42,
+          0.35,
+          0.58,
+          0.92
+        ],
+        "depth_delta_code": 0.91,
+        "world_moving": true,
+        "depth_p10_m": 4.2,
+        "depth_p50_m": 18.4,
+        "depth_p90_m": 210.0
+      }
+    ]
+  },
+  "checks": {
+    "passed": true,
+    "checked": true,
+    "fail": [],
+    "warn": []
+  },
+  "compiled": {
+    "lean": {
+      "global": "Third-person open-world video game. City street. Bright daylight. A man in a dark green jacket stands still in the middle of the roadway, then the camera follows from behind at shoulder height, then the man walks forward along the road.",
+      "bins": [
+        "A man in a dark green jacket stands still in the middle of the roadway. The camera follows from behind at shoulder height.",
+        "The man walks forward along the road. The camera keeps following from behind at shoulder height.",
+        "The man keeps walking forward along the road. The camera is still following from behind at shoulder height.",
+        "The man is still walking forward along the road. The camera is still following from behind at shoulder height.",
+        "The man is still walking forward along the road. The camera is still following from behind at shoulder height."
+      ]
+    },
+    "rich": {
+      "global": "Third-person open-world video game. A broad urban boulevard lined with stone buildings. Bright clear daylight with hard shadows on the pavement. A man in a dark green bomber jacket, dark jeans and white sneakers stands motionless in the middle of the empty asphalt roadway, then the camera follows from behind at shoulder height, holding the man centred, then the man walks steadily along the asphalt roadway toward an intersection.",
+      "bins": [
+        "A man in a dark green bomber jacket, dark jeans and white sneakers stands motionless in the middle of the empty asphalt roadway. The camera follows from behind at shoulder height, holding the man centred.",
+        "The man walks steadily along the asphalt roadway toward an intersection. The camera keeps following from behind at shoulder height, holding the man centred.",
+        "The man keeps walking steadily along the asphalt roadway toward an intersection. The camera is still following from behind at shoulder height, holding the man centred.",
+        "The man is still walking steadily along the asphalt roadway toward an intersection. The camera is still following from behind at shoulder height, holding the man centred.",
+        "The man is still walking steadily along the asphalt roadway toward an intersection. The camera is still following from behind at shoulder height, holding the man centred."
+      ]
+    },
+    "timed": {
+      "global": "Third-person open-world video game. City street. Bright daylight. A man in a dark green jacket stands still in the middle of the roadway, then the camera follows from behind at shoulder height, then the man walks forward along the road.",
+      "facing": "Opening screen facing: back.",
+      "offset": 0.0,
+      "bins": [
+        {
+          "bin": 0,
+          "t": [
+            0.0,
+            1.0
+          ],
+          "text": "A man in a dark green jacket stands still in the middle of the roadway. The camera follows from behind at shoulder height."
+        },
+        {
+          "bin": 1,
+          "t": [
+            1.0,
+            2.0
+          ],
+          "text": "The man walks forward along the road. The camera keeps following from behind at shoulder height."
+        },
+        {
+          "bin": 2,
+          "t": [
+            2.0,
+            3.0
+          ],
+          "text": "The man keeps walking forward along the road. The camera is still following from behind at shoulder height."
+        },
+        {
+          "bin": 3,
+          "t": [
+            3.0,
+            4.0
+          ],
+          "text": "The man is still walking forward along the road. The camera is still following from behind at shoulder height."
+        },
+        {
+          "bin": 4,
+          "t": [
+            4.0,
+            5.167
+          ],
+          "text": "The man is still walking forward along the road. The camera is still following from behind at shoulder height."
+        }
+      ],
+      "script": "[0.00s-1.00s] A man in a dark green jacket stands still in the middle of the roadway. The camera follows from behind at shoulder height.\n[1.00s-2.00s] The man walks forward along the road. The camera keeps following from behind at shoulder height.\n[2.00s-3.00s] The man keeps walking forward along the road. The camera is still following from behind at shoulder height.\n[3.00s-4.00s] The man is still walking forward along the road. The camera is still following from behind at shoulder height.\n[4.00s-5.17s] The man is still walking forward along the road. The camera is still following from behind at shoulder height."
+    },
+    "conditioning": {
+      "card": "duv.abot.v1",
+      "stream": "proxy/duv.mp4",
+      "contents": "In this clip the control video holds road surface, vegetation, static structure, sky and one protagonist, and no vehicles."
+    }
+  },
+  "provenance": {
+    "source": "vlm:target:gemini-3.8-flash",
+    "backend": "vertex",
+    "model": "gemini-3.8-flash",
+    "prompt": "clip_prompts.timeline.v4",
+    "compiler": 1,
+    "attempts": 1,
+    "usage": {
+      "promptTokenCount": 9134,
+      "candidatesTokenCount": 612
+    },
+    "quality": {
+      "usable": true,
+      "issues": []
+    },
+    "written": "2026-09-07T09:41:00+00:00",
+    "score": 1.0
+  }
+}

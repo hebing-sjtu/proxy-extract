@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clip-prompts"
+version = "0.1.0"
+description = "Timestamped VLM captions for the ABot SFT clips"
+requires-python = ">=3.10"
+# The VLM transport is not a dependency: it is `low_high_pipeline/src/mllm`,
+# found at run time by `observe.mllm_root`. Vendoring or re-implementing it
+# would give this corpus a second retry policy against the same API quota.
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python-headless>=4.8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+clip-prompts = "clip_prompts.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
