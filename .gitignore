@@ -2,9 +2,9 @@
 # would commit a gitlink with no .gitmodules — a directory that clones empty.
 code-world-model/
 
-# Same situation: its own repo, cloned beside this one. `clip-prompts` finds its
-# mllm package at run time and reports a plain missing-directory error when it
-# is absent, so nothing here breaks by leaving it out of this tree.
+# Same situation: its own repo, cloned beside this one. Nothing depends on it
+# any more - `clip-prompts` carries its own copy of the client it used to borrow -
+# so its absence on a caption node is not a problem to work around.
 low_high_pipeline/
 
 # Input corpora and delivered output. Both are mounted or written at runtime and
@@ -14,6 +14,17 @@ out/
 
 # Weights.
 .hf-cache/
+
+# Credentials. `captions` reads a Vertex service-account private key out of
+# these, and this repository is public, so the ignore is load-bearing rather
+# than tidiness. The committed template is the one exception.
+.env
+.env.*
+!.env.example
+
+# Service-account key files, whatever they got named.
+*service-account*.json
+*-sa.json
 
 # Local environment.
 .venv/
