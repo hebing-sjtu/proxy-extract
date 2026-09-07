@@ -7,9 +7,10 @@ name = "clip-prompts"
 version = "0.1.0"
 description = "Timestamped VLM captions for the ABot SFT clips"
 requires-python = ">=3.10"
-# The VLM transport is not a dependency: it is `low_high_pipeline/src/mllm`,
-# found at run time by `observe.mllm_root`. Vendoring or re-implementing it
-# would give this corpus a second retry policy against the same API quota.
+# The VLM transport is `clip_prompts.llm` and is standard library throughout,
+# so the only things to install are the two that read pixels. That is the point:
+# the caption nodes cannot reach the internal package index or Git host, and an
+# `openssl` binary is easier to guarantee there than a crypto wheel.
 dependencies = [
     "numpy>=1.24",
     "opencv-python-headless>=4.8",

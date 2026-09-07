@@ -37,15 +37,34 @@
 pip install -e clip-prompts            # numpy + opencv，没有别的
 ```
 
-VLM 的传输层**不在本包里**，用的是 `low_high_pipeline/src/mllm`（Vertex / LiteLLM /
-DashScope 三选一，带 token 刷新和 429 退避）。同一个配额上挂两套重试策略迟早出事，
-所以这里不复制一份。找不到的话报的是「目录不存在」而不是 ImportError：
+**装完就能跑，不需要再 clone 任何别的仓库。** VLM 传输层是 `clip_prompts/llm/`
+（Vertex 或 LiteLLM 网关，带 service-account token 刷新和 429 退避），全部只用标准库
+——service-account 的 RS256 签名是 shell 出去调 `openssl`，所以连 crypto wheel 都不用装。
+外网节点上唯一的系统依赖就是 `openssl`（`openssl version` 能出来就行）。
+
+这份代码是 `low_high_pipeline/src/mllm` 的精简重写。搬过来是因为跑 caption 的节点拉
+不到内网 Git，而拉不到的依赖等于跑不起来。搬的时候丢掉了 DashScope backend（要 SDK、
+只能在 k8s pod 里跑、还要 import 那边仓库的 `scripts.gemini_api`——这三条正好是要摆脱
+的东西），也丢掉了没人实现过的 `shrink_media` 钩子。
+
+**顺手修了一个 bug**：`observe.py` 发的是 `Message(role="system", ...)`，而原来的
+`render_vertex_parts` 把非 user 的 role 一律映射成 `"model"`。Gemini 没有 system turn，
+它有独立的顶层 `systemInstruction` 字段——把 system prompt 塞进 `contents` 当 `"model"`
+轮次，模型会当成「这是我自己刚说过的话」，于是指令被复述而不是被执行，**而且照样返回
+200**。上游自己从来不发 system turn，所以这条路径一直没被走过。现在 `render_vertex()`
+把两者分开返回，类型上就没法再塞错。
+
+### 密钥
+
+按顺序读仓库根、当前目录、以及 `low_high_pipeline/`（如果碰巧还在，纯粹是迁移期方便，
+不是依赖）的 `.env` / `.env.local`。**已经 export 的环境变量不会被文件覆盖。**
+照着 `.env.example` 填：
 
 ```bash
-export CLIP_PROMPTS_MLLM=/path/to/low_high_pipeline/src   # 只有不在同级目录时才需要
+cp clip-prompts/.env.example .env.local     # 然后填 project / client_email / private_key
 ```
 
-密钥读 `low_high_pipeline/.env.local`、本仓库 `.env` / `.env.local`，顺序如此。
+`--env-dir` 可以再加一个目录（例如密钥挂在 `/secrets` 里）。
 
 ```bash
 # 0) 先不花钱：看 DUV 表和将要发出去的 prompt 长什么样

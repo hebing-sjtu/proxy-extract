@@ -42,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--workers", type=int, default=4)
     run.add_argument("--model", default=observe.DEFAULT_MODEL)
     run.add_argument("--backend", default=observe.DEFAULT_BACKEND)
-    run.add_argument("--mllm-src", type=Path, help="directory holding the mllm package")
+    run.add_argument("--env-dir", type=Path, help="extra directory to read .env files from")
     run.add_argument("--bin-seconds", type=float, default=timeline.DEFAULT_BIN_SECONDS)
     run.add_argument(
         "--min-tail-seconds",
@@ -217,7 +217,7 @@ def _run_captions(args: argparse.Namespace) -> int:
     if not clips:
         _say(f"no clips under {args.clips}")
         return 1
-    client = observe.build_client(args.backend, mllm_src=args.mllm_src)
+    client = observe.build_client(args.backend, env_dir=args.env_dir)
 
     rows: list[dict] = []
 

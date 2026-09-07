@@ -1,10 +1,10 @@
 """One captioning round trip, plus the repair loop that makes it land.
 
 The transport - Vertex or a LiteLLM gateway, service-account refresh, backoff
-on 429, base64 inlining of video with a sampling rate - already exists in
-`low_high_pipeline/src/mllm` and is in production on this corpus's sibling
-pipeline. This module borrows it rather than growing a second copy, because
-two retry policies against the same quota is a way to discover you had two.
+on 429, base64 inlining of video with a sampling rate - lives in `.llm`, which
+is this repo's own copy of a client proven on the sibling pipeline. It is a
+copy rather than an import because the nodes that run this cannot reach the
+host that the original lives on.
 
 What this module owns is the loop around it. The reply is parsed into a
 `Caption`, checked against the grid, and if anything is structurally wrong the
@@ -17,13 +17,15 @@ formatting, so the clip is better recorded as failed than coerced.
 from __future__ import annotations
 
 import os
-import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import prompts, vocab
 from .contract import COMPILER_VERSION, Caption, Entity, Event, Scene
+from .llm import ChatRequest, Image, Message, Text, Video, parse_json_object
+from .llm import build_client as _build_client
+from .llm.env import load_env as _load_env
 from .timeline import Grid
 
 DEFAULT_MODEL = "gemini-3.8-flash"
@@ -40,56 +42,27 @@ DEFAULT_REPAIRS = 2
 REPO = Path(__file__).resolve().parents[3]
 
 
-def mllm_root(explicit: str | Path | None = None) -> Path:
-    """Locate the `mllm` package, preferring an explicit override.
+def load_env(extra: str | Path | None = None) -> list[Path]:
+    """Load credentials from `.env` files, and report which ones were read.
 
-    Reported as a plain missing-directory error rather than an ImportError
-    three frames deep, because the usual cause is that the sibling repo was
-    not checked out and the fix is a path, not a pip install.
+    The sibling checkout is searched last and only if it happens to be there.
+    That is a convenience for whoever still has their keys in it, not a
+    dependency: nothing breaks when it is absent, which on the caption nodes it
+    always is.
     """
-    candidates = []
-    if explicit:
-        candidates.append(Path(explicit))
-    env = os.environ.get("CLIP_PROMPTS_MLLM", "").strip()
-    if env:
-        candidates.append(Path(env))
-    candidates.append(REPO / "low_high_pipeline" / "src")
-    for candidate in candidates:
-        resolved = candidate.expanduser().resolve()
-        if (resolved / "mllm").is_dir():
-            return resolved
-    raise FileNotFoundError(
-        "cannot find the mllm package. Check out low_high_pipeline beside this "
-        "repo, or point CLIP_PROMPTS_MLLM at the directory that contains it. "
-        f"Looked in: {', '.join(str(c) for c in candidates)}"
+    roots = [REPO, Path.cwd(), REPO / "low_high_pipeline"]
+    if extra:
+        roots.insert(0, Path(extra).expanduser())
+    return _load_env(*roots)
+
+
+def build_client(backend: str = DEFAULT_BACKEND, *, env_dir: str | Path | None = None):
+    load_env(env_dir)
+    return _build_client(
+        backend,
+        api_key=os.environ.get("LITELLM_API_KEY", ""),
+        base_url=os.environ.get("LITELLM_BASE_URL", ""),
     )
-
-
-def load_env(explicit: str | Path | None = None) -> None:
-    """Read the same .env files the sibling pipeline reads, then this repo's."""
-    root = mllm_root(explicit)
-    if str(root) not in sys.path:
-        sys.path.insert(0, str(root))
-    from mllm.config import load_dotenv
-
-    for name in (".env", ".env.local"):
-        for base in (root.parent, REPO, Path.cwd()):
-            path = base / name
-            if path.is_file():
-                load_dotenv(path)
-
-
-def build_client(backend: str = DEFAULT_BACKEND, *, mllm_src: str | Path | None = None):
-    load_env(mllm_src)
-    from mllm.client import build_client as _build
-
-    if backend in {"litellm", "openai", "openai_compat", "openai-compat"}:
-        return _build(
-            backend,
-            api_key=os.environ.get("LITELLM_API_KEY", ""),
-            base_url=os.environ.get("LITELLM_BASE_URL", ""),
-        )
-    return _build(backend, api_key=os.environ.get("DASHSCOPE_API_KEY", ""))
 
 
 @dataclass(frozen=True)
@@ -101,8 +74,6 @@ class Observation:
 
 
 def _parts(text: str, video: Path, sheet: Path | None, sample_fps: float, max_frames: int):
-    from mllm.content import Image, Text, Video
-
     parts = [Text(text), Video(video, fps=sample_fps, max_frames=max_frames)]
     if sheet is not None:
         parts.append(Text("Contact sheet: one frame per bin, stamped with its bin index."))
@@ -164,9 +135,6 @@ def observe(
     repairs: int = DEFAULT_REPAIRS,
 ) -> Observation:
     """Ask once, repair up to `repairs` times, return a structurally valid caption."""
-    from mllm.client import ChatRequest, parse_json_object
-    from mllm.content import Message, Text
-
     text = prompts.instruction(grid, briefing, sheet=sheet is not None)
     history = [
         Message(role="system", parts=(Text(prompts.SYSTEM),)),
