@@ -2,6 +2,11 @@
 # would commit a gitlink with no .gitmodules — a directory that clones empty.
 code-world-model/
 
+# Same situation: its own repo, cloned beside this one. `clip-prompts` finds its
+# mllm package at run time and reports a plain missing-directory error when it
+# is absent, so nothing here breaks by leaving it out of this tree.
+low_high_pipeline/
+
 # Input corpora and delivered output. Both are mounted or written at runtime and
 # neither belongs in the source tree.
 handpick29_high_low/
