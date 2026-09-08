@@ -22,9 +22,16 @@ VERTEX_VARS = (
 
 
 @pytest.fixture
-def no_vertex_env(monkeypatch):
+def no_vertex_env(monkeypatch, tmp_path):
+    """An environment with no credentials anywhere the search would reach.
+
+    `observe.REPO` is repointed because a developer who has configured real
+    credentials has a `.env.local` at the repository root, and without this the
+    suite would pass or fail depending on whose machine it runs on.
+    """
     for name in VERTEX_VARS:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(observe, "REPO", tmp_path / "repo")
 
 
 def test_the_failure_says_where_it_looked_for_a_dotenv(no_vertex_env, tmp_path, monkeypatch):

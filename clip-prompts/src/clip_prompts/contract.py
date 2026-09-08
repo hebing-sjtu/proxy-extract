@@ -52,7 +52,11 @@ VERSION = 4
 # Stored so a corpus can be recompiled selectively: the compiler is cheap, the
 # captioner is not, and without this there is no way to tell which clips hold
 # text from which compiler.
-COMPILER_VERSION = 1
+# 2 adds `compiled.cwm`, the flat user sentence CWM feeds Qwen. The lean, rich
+# and timed renderings are byte-identical to version 1, but the set of texts a
+# consumer can expect changed, so the number moves. `captions-recompile`
+# backfills it from structure already on disk; no clip needs the VLM again.
+COMPILER_VERSION = 2
 
 PROMPT_NAME = "prompt.json"
 

@@ -1,7 +1,7 @@
 {
   "contract": "timeline",
   "version": 4,
-  "compiler": 1,
+  "compiler": 2,
   "window": {
     "clip": "clip_000414_2",
     "episode": "seg_000414",
@@ -396,6 +396,16 @@
       "card": "duv.abot.v1",
       "stream": "proxy/duv.mp4",
       "contents": "In this clip the control video holds road surface, vegetation, static structure, sky and one protagonist, and no vehicles."
+    },
+    "cwm": {
+      "variant": "window",
+      "system": "w0",
+      "t": [
+        0.0,
+        5.167
+      ],
+      "user": "[0.00s-5.17s] Third-person open-world video game. City street. Bright daylight. A man in a dark green jacket stands still in the middle of the roadway, then the camera follows from behind at shoulder height, then the man walks forward along the road.",
+      "timed": "[0.00s-1.00s] A man in a dark green jacket stands still in the middle of the roadway. The camera follows from behind at shoulder height.\n[1.00s-2.00s] The man walks forward along the road. The camera keeps following from behind at shoulder height.\n[2.00s-3.00s] The man keeps walking forward along the road. The camera is still following from behind at shoulder height.\n[3.00s-4.00s] The man is still walking forward along the road. The camera is still following from behind at shoulder height.\n[4.00s-5.17s] The man is still walking forward along the road. The camera is still following from behind at shoulder height."
     }
   },
   "provenance": {
@@ -403,7 +413,7 @@
     "backend": "vertex",
     "model": "gemini-3.8-flash",
     "prompt": "clip_prompts.timeline.v4",
-    "compiler": 1,
+    "compiler": 2,
     "attempts": 1,
     "usage": {
       "promptTokenCount": 9134,

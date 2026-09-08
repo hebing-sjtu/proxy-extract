@@ -78,6 +78,17 @@ class Clip:
         """Working file, kept beside the caption so a bad bin can be seen."""
         return self.annotations / "prompt_sheet.jpg"
 
+    @property
+    def prompt_txt(self) -> Path:
+        """The exported CWM user sentence.
+
+        At the clip root rather than in `annotations/`, which is the one place
+        in this package where that is right: FastVideo's manifest builder reads
+        `<clip>/prompt.txt` and falls back to the episode caption if it is
+        missing, so this path is fixed by a consumer rather than chosen here.
+        """
+        return self.root / "prompt.txt"
+
     def report(self) -> dict:
         return _read_report(self.report_path)
 

@@ -337,8 +337,11 @@ src/clip_prompts/
     verify.py     caption 对 evidence 的对账
     conditioning.py  控制信号含义：语料级 card + 逐片内容
     render.py     结构 → lean / rich / timed 文本
+    cwm_export.py 投影成 CWM 真正喂给 Qwen 的那一句（见 CWM_TEXT_EXPORT.md）
+    llm/          VLM 传输层：Vertex / LiteLLM，全标准库
     layout.py     片目录解析，prompt.json 放哪
-    cli.py        六个子命令
+    cli.py        七个子命令
+CWM_TEXT_EXPORT.md   文本落地合同：时间戳、CRLF、w0/wn、prompt.txt 写哪
 example/prompt.json
 tests/
 ```
@@ -349,4 +352,4 @@ tests/
 python -m pytest clip-prompts/tests -q
 ```
 
-不需要 GPU、不需要网络、不需要语料——80 个用例全部在合成数据上跑。
+不需要 GPU、不需要网络、不需要语料——161 个用例全部在合成数据上跑。

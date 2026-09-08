@@ -328,6 +328,11 @@ VLM。
 `compiled.lean.global` / `rich.global` 是**不带时间戳**的整段描述，建议按比例混进
 训练集，免得模型变成没有时间戳就不会写。
 
+**真正喂给模型的那一句见 `clip-prompts/CWM_TEXT_EXPORT.md`。** `prompt.json` 是结构，
+训练用的用户句是它的一个确定性投影——`compiled.cwm.user`，以及导出到
+`<clip>/prompt.txt` 的那份。规则（整窗时间戳、CRLF、w0/wn 怎么选）都在那份合同里，
+这里不复述，免得两处说法漂移。
+
 还有一条来自 `INFERENCE.md`：**prompt 在进 Qwen 之前行尾会被规范成 CRLF**。导出训练
 样本时按同一条规矩来，否则编辑器把 CRLF 存成 LF 就会改掉实际消费的 token。
 

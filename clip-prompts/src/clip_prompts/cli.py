@@ -8,6 +8,7 @@ different training window, a look at what it did - do not require it.
     captions-evidence   the DUV table and the exact prompt, with no model call
     captions-recompile  re-render the text from structure already on disk
     captions-slice      cut a caption down to a sub-window of its clip
+    captions-export     project captions onto CWM user sentences, write prompt.txt
     captions-audit      count what is captioned, what failed, and what disagreed
     captions-show       print one caption's compiled text
 """
@@ -16,13 +17,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from . import cwm_export, layout, observe, render, timeline, verify
 from . import evidence as evidence_mod
-from . import layout, observe, render, timeline, verify
 from .contract import Caption
 
 AUDIT_NAME = "captions_audit.json"
@@ -86,6 +88,33 @@ def build_parser() -> argparse.ArgumentParser:
     cut.add_argument("--stop", type=float, required=True)
     cut.add_argument("--out", type=Path, help="defaults to stdout")
 
+    export = sub.add_parser(
+        "captions-export",
+        help="project captions onto CWM user sentences",
+        description=(
+            "Write the flat user sentence CWM feeds Qwen. Deterministic: it reads "
+            "prompt.json and calls no model. See clip-prompts/CWM_TEXT_EXPORT.md."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    export.add_argument("--clips", type=Path, required=True, help="a clips root, or one clip dir")
+    export.add_argument("--style", choices=cwm_export.VARIANTS, default="window")
+    export.add_argument(
+        "--prose",
+        choices=cwm_export.PROSE_STYLES,
+        default="lean",
+        help="which global sentence the window variant carries",
+    )
+    export.add_argument("--write-txt", action="store_true", help="write <clip>/prompt.txt")
+    export.add_argument("--overwrite", action="store_true", help="replace an existing prompt.txt")
+    export.add_argument(
+        "--keep-failed",
+        action="store_true",
+        help="write prompt.txt even when the verifier found a contradiction",
+    )
+    export.add_argument("--limit", type=int, help="only the first N clips, in name order")
+    export.add_argument("--report", type=Path)
+
     audit = sub.add_parser("captions-audit", help="count captioned, failed and disagreeing clips")
     audit.add_argument("--clips", type=Path, required=True)
     audit.add_argument("--report", type=Path)
@@ -93,7 +122,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     show = sub.add_parser("captions-show", help="print a caption's compiled text")
     show.add_argument("--prompt", type=Path, required=True)
-    show.add_argument("--style", choices=("timed", "lean", "rich"), default="timed")
+    show.add_argument("--style", choices=("timed", "lean", "rich", "cwm"), default="timed")
+    show.add_argument(
+        "--prose",
+        choices=cwm_export.PROSE_STYLES,
+        default="lean",
+        help="for --style cwm: which global sentence to carry",
+    )
     show.add_argument(
         "--conditioning",
         action="store_true",
@@ -301,10 +336,101 @@ def _run_slice(args: argparse.Namespace) -> int:
     return 0
 
 
+def _export_one(clip: layout.Clip, args: argparse.Namespace) -> dict:
+    from dataclasses import replace
+
+    caption = Caption.read(clip.prompt)
+    compiled = caption.compiled or render.compile_all(caption)
+    caption = replace(caption, compiled=compiled)
+    user = cwm_export.user_text(caption, variant=args.style, prose=args.prose)
+
+    row = {
+        "clip": clip.name,
+        "variant": args.style,
+        "system": cwm_export.system_id(caption),
+        "chars": len(user),
+    }
+    if not args.write_txt:
+        row["status"] = "compiled"
+        return row
+    if not cwm_export.should_write_txt(caption, keep_failed=args.keep_failed):
+        row["status"] = "skipped"
+        row["why"] = "the verifier found a contradiction; --keep-failed writes it anyway"
+        return row
+    if clip.prompt_txt.exists() and not args.overwrite:
+        row["status"] = "skipped"
+        row["why"] = "prompt.txt already exists; --overwrite replaces it"
+        return row
+    cwm_export.write_prompt_txt(clip.prompt_txt, user)
+    row["status"] = "written"
+    row["path"] = str(clip.prompt_txt)
+    return row
+
+
+def _run_export(args: argparse.Namespace) -> int:
+    clips = layout.discover(args.clips, limit=args.limit)
+    if not clips:
+        _say(f"no clips under {args.clips}")
+        return 1
+
+    rows: list[dict] = []
+    for clip in clips:
+        if not clip.prompt.is_file():
+            # No invented fallback caption: a clip with no prompt.json is
+            # counted and left alone. Writing a plausible sentence here is how
+            # a corpus quietly acquires text nobody checked.
+            rows.append({"clip": clip.name, "status": "missing"})
+            continue
+        try:
+            rows.append(_export_one(clip, args))
+        except Exception as exc:  # noqa: BLE001 - one bad clip must not stop the corpus
+            rows.append(
+                {"clip": clip.name, "status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+            )
+
+    summary: dict = {"clips": len(rows)}
+    for row in rows:
+        key = row.get("status", "failed")
+        summary[key] = summary.get(key, 0) + 1
+    _say(json.dumps(summary, ensure_ascii=False, indent=2))
+    if summary.get("written"):
+        _say(
+            "text changed, so the text embeddings must be recomputed on the "
+            "training side. The VAE latents are unaffected.",
+        )
+    if args.report:
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        args.report.write_text(
+            json.dumps({"summary": summary, "clips": rows}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    return 0 if not summary.get("failed") else 1
+
+
+# A user sentence always opens with its window stamp. Matching the shape rather
+# than `[0.00s-` specifically so that a sliced continuation still counts.
+EXPORTED_RE = re.compile(r"^\[\d+\.\d{2}s-\d+\.\d{2}s\] ")
+
+
+def _is_exported(clip: layout.Clip) -> bool:
+    if not clip.prompt_txt.is_file():
+        return False
+    head = clip.prompt_txt.read_bytes()[:64].decode("utf-8", errors="replace")
+    return bool(EXPORTED_RE.match(head))
+
+
 def _run_audit(args: argparse.Namespace) -> int:
-    buckets: dict[str, list[str]] = {"captioned": [], "missing": [], "failed": [], "warned": []}
+    buckets: dict[str, list[str]] = {
+        "captioned": [],
+        "missing": [],
+        "failed": [],
+        "warned": [],
+        "exported": [],
+    }
     scores: list[float] = []
     for clip in layout.discover(args.clips):
+        if _is_exported(clip):
+            buckets["exported"].append(clip.name)
         if not clip.prompt.is_file():
             buckets["missing"].append(clip.name)
             continue
@@ -340,6 +466,8 @@ def _run_audit(args: argparse.Namespace) -> int:
 
 
 def _run_show(args: argparse.Namespace) -> int:
+    from dataclasses import replace
+
     from . import conditioning
 
     caption = Caption.read(args.prompt)
@@ -347,6 +475,16 @@ def _run_show(args: argparse.Namespace) -> int:
     if args.conditioning:
         _say(conditioning.full_text(compiled.get("conditioning") or {}))
         _say("")
+
+    if args.style == "cwm":
+        caption = replace(caption, compiled=compiled)
+        # The system prompt goes to stderr: it is a label for whoever wires up
+        # FastVideo, and it must never end up concatenated onto the user
+        # sentence by someone piping stdout into a file.
+        print(f"system={cwm_export.system_id(caption)}", file=sys.stderr)
+        _say(cwm_export.user_text(caption, variant="window", prose=args.prose))
+        return 0
+
     block = compiled[args.style]
     _say(block["global"])
     if args.style == "timed":
@@ -368,6 +506,7 @@ def main(argv: list[str] | None = None) -> int:
         "captions-evidence": _run_evidence,
         "captions-recompile": _run_recompile,
         "captions-slice": _run_slice,
+        "captions-export": _run_export,
         "captions-audit": _run_audit,
         "captions-show": _run_show,
     }

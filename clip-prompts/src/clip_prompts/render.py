@@ -30,6 +30,8 @@ the text look varied would teach a model that the paraphrase is the signal.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from . import conditioning
 from .contract import Caption, Entity, Event
 from .vocab import verb as conjugate
@@ -207,6 +209,13 @@ def compile_all(caption: Caption) -> dict:
     # Its own block, not appended to the others, so a training run can include
     # it, drop it, or mix it in at some rate without recompiling the corpus.
     out["conditioning"] = conditioning.block(caption.evidence)
+
+    # The projection onto CWM's flat user sentence. Imported here because
+    # `cwm_export` reads the compiled block this function is still building, and
+    # at module scope the two would import each other.
+    from . import cwm_export
+
+    out["cwm"] = cwm_export.compile_cwm(replace(caption, compiled=out))
     return out
 
 
