@@ -336,6 +336,50 @@ VLM。
 还有一条来自 `INFERENCE.md`：**prompt 在进 Qwen 之前行尾会被规范成 CRLF**。导出训练
 样本时按同一条规矩来，否则编辑器把 CRLF 存成 LF 就会改掉实际消费的 token。
 
+### 5.5 从 caption 到 VAE 打包
+
+`prompt.json` 不直接进训练。链路是三段，**每一段的产物都是下一段的输入，中间不需要
+改任何代码**：
+
+```
+annotations/prompt.json     结构（VLM 产出，贵，只做一次）
+        │  clip-prompts captions-export --write-txt
+        ▼
+<clip>/prompt.txt           用户句（确定性投影，随时可重来）
+        │  FastVideo clip_dir_to_encode_manifest.py
+        ▼
+h3_abot_train.jsonl         encode manifest → VAE / text 打包
+```
+
+**`prompt.txt` 放在片根目录，不在 `annotations/` 下。** 这是整个 clip-prompts 里唯一
+一处不放 `annotations/` 的文件，因为路径是消费方定的：`clip_dir_to_encode_manifest.py`
+的 `read_prompt()` 只看 `<clip>/prompt.txt`。
+
+manifest 每行长这样，`prompt` 字段就是 `prompt.txt` 原文：
+
+```json
+{"name": "clip_000414_2",
+ "target": "clip_000414_2/target/rgb.mp4",
+ "proxy_duv_video": "clip_000414_2/proxy/duv.mp4",
+ "anchor": "clip_000414_2/target/anchor.png",
+ "prompt": "[0.00s-5.17s] Third-person open-world video game. City street. ...",
+ "id": "clip_000414_2"}
+```
+
+三件容易出事的：
+
+1. **一定要加 `--no-episode-caption`。** 没有 `prompt.txt` 时 `read_prompt()` 会回落到
+   `annotations/caption.json`——那是**整条 60 秒 episode** 的文案，喂给 5.17 秒的窗口
+   等于教模型在 5 秒里演完一整集。跑完 manifest 要看输出里那行
+   `prompt sources:`，应该是 `prompt.txt=N` 而没有 `caption.json=`。
+2. **切分按 episode，不按 clip。** 同一条 episode 的 5 片共享天气、光照、地形，按片切
+   会拿训练过的画面做验证。`--val-episodes` 已经是按 episode 切的，别自己改成按片。
+3. **文本变了要重编 text embedding，VAE latent 不用动。** 这两个 cache 是分开的。
+
+单行的默认变体在盘上根本没有换行，所以 `read_text()` 的 universal newlines 影响不到
+它。**只有 `--style timed` 那种多行变体**，CRLF 会在读取时被还原成 LF，需要训练侧在
+送进 Qwen 前再规范一次（`CWM_TEXT_EXPORT.md` 第 10 节第 3 步）。
+
 ---
 
 ## 6. 几何对齐保证

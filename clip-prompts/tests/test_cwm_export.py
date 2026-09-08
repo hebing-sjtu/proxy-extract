@@ -242,6 +242,50 @@ def test_prompt_txt_sits_at_the_clip_root_where_fastvideo_looks(tmp_path):
     assert clip.prompt_txt.parent != clip.annotations
 
 
+# --- the contract with FastVideo's manifest builder -----------------------
+
+
+def _as_fastvideo_reads_it(path: Path) -> str:
+    """Exactly what `clip_dir_to_encode_manifest.read_prompt` does to the file."""
+    return path.read_text(encoding="utf-8").strip()
+
+
+def test_the_exported_file_is_what_the_manifest_builder_will_read(example, tmp_path):
+    """The consumer lives in another repository, so nothing here would fail if this drifted.
+
+    `read_prompt` takes `<clip>/prompt.txt` in preference to the episode
+    caption and rejects the clip if the text is empty, which makes both the
+    path and the non-emptiness load-bearing.
+    """
+    clip = tmp_path / "clip_000414_2"
+    clip.mkdir()
+    user = cwm_export.window_user(example)
+    cwm_export.write_prompt_txt(clip / "prompt.txt", user)
+
+    got = _as_fastvideo_reads_it(clip / "prompt.txt")
+    assert got == user
+    assert got.startswith("[0.00s-5.17s] ")
+
+
+def test_reading_the_timed_variant_as_text_silently_drops_its_carriage_returns(example, tmp_path):
+    """A caveat worth pinning rather than discovering in a token diff.
+
+    The bytes on disk are CRLF, as section 4 requires, but `read_text` applies
+    universal newlines and hands back LF. The default single-line variant has no
+    newline at all, so it is unaffected; the timed variant is only correct if
+    the training side re-canonicalises before Qwen, which is section 10's third
+    step and not something this package can do for it.
+    """
+    path = tmp_path / "prompt.txt"
+    cwm_export.write_prompt_txt(path, cwm_export.timed_user(example))
+    assert b"\r\n" in path.read_bytes()
+    assert "\r" not in _as_fastvideo_reads_it(path)
+
+    window = tmp_path / "window.txt"
+    cwm_export.write_prompt_txt(window, cwm_export.window_user(example))
+    assert b"\r" not in window.read_bytes(), "the default variant sidesteps this entirely"
+
+
 # --- the notation must not fork -------------------------------------------
 
 
