@@ -242,6 +242,20 @@ def test_prompt_txt_sits_at_the_clip_root_where_fastvideo_looks(tmp_path):
     assert clip.prompt_txt.parent != clip.annotations
 
 
+def test_discover_finds_gta_seg_directories_without_a_clip_report(tmp_path):
+    from clip_prompts import layout
+
+    seg = tmp_path / "seg_000000"
+    (seg / "minimax_h3").mkdir(parents=True)
+    (seg / "proxy").mkdir()
+    (seg / "minimax_h3" / "output.mp4").write_bytes(b"x")
+    (seg / "proxy" / "duv.mp4").write_bytes(b"x")
+    found = layout.discover(tmp_path)
+    assert [clip.name for clip in found] == ["seg_000000"]
+    assert found[0].rgb == seg / "minimax_h3" / "output.mp4"
+    assert found[0].duv == seg / "proxy" / "duv.mp4"
+
+
 # --- the contract with FastVideo's manifest builder -----------------------
 
 
