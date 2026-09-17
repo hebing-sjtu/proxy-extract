@@ -27,4 +27,8 @@ def get_refiner(name: str, **kwargs):
         from .sam3 import Sam3ConceptRefiner
 
         return Sam3ConceptRefiner(**kwargs)
+    if name == "sam2":
+        from .sam2 import Sam2ConsistencyRefiner
+
+        return Sam2ConsistencyRefiner(**kwargs)
     raise ValueError(f"unknown semantic refiner: {name}")

@@ -4,6 +4,7 @@
 #   scripts/run_clip_episodes.sh
 #   DATA_DIR=... CLIPS_DIR=... scripts/run_clip_episodes.sh
 #   LIMIT=4 scripts/run_clip_episodes.sh          # prove a node on 4 episodes
+#   NODE_COUNT=2 NODE_RANK=0 scripts/run_clip_episodes.sh   # and =1 on the other
 #
 # The one-pass route. run_scenes.sh delivers whole episodes and run_clips.sh
 # then slices them, which predicts depth and semantics for every frame and
@@ -16,10 +17,17 @@
 
 set -euo pipefail
 
+die() { echo "error: $*" >&2; exit 1; }
+
 DATA_DIR="${DATA_DIR:-/data/binghe/datasets/ABot-World-Explorer-subset2000/data}"
 CLIPS_DIR="${CLIPS_DIR:-/data/binghe/datasets/ABot-sub-2000-clips}"
 SEMANTIC="${SEMANTIC:-standard11}"
 DEPTH="${DEPTH:-depth_anything_v3}"
+# The consistency refiner, and PROXY_DUV_SPEC.md's per-frame form. Both default
+# off because both cost real time; `REFINER=sam2 PROXY_DUV=1 DEPTH=moge3` is the
+# configuration for a delivery that flickers. See RUNBOOK section 5.
+REFINER="${REFINER:-none}"
+PROXY_DUV="${PROXY_DUV:-0}"
 
 PER_SCENE="${PER_SCENE:-5}"
 FRAMES="${FRAMES:-124}"
@@ -27,6 +35,14 @@ FPS="${FPS:-24}"
 WORK_SIZE="${WORK_SIZE:-1344x768}"
 
 _repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# An activated environment wins over a repo-local .venv. That ordering matters
+# inside the FastVideo Docker image, where the interpreter belongs to the image
+# and a stale ./.venv left by an earlier attempt would otherwise silently take
+# over - with a torch built for a different CUDA than the driver. See
+# RUNBOOK_DOCKER.md.
+if [[ -z "${PYTHON:-}" && -n "${VIRTUAL_ENV:-}" && -x "$VIRTUAL_ENV/bin/python" ]]; then
+  PYTHON="$VIRTUAL_ENV/bin/python"
+fi
 if [[ -z "${PYTHON:-}" && -x "$_repo/.venv/bin/python" ]]; then
   PYTHON="$_repo/.venv/bin/python"
 fi
@@ -40,6 +56,13 @@ PYTHON="${PYTHON:-python}"
 MIB_PER_CLIP="${MIB_PER_CLIP:-8}"
 MIB_PER_WORKER_SCRATCH="${MIB_PER_WORKER_SCRATCH:-600}"
 
+# PROXY_DUV_SPEC.md's per-frame form is uncompressed, and it dwarfs everything
+# else a clip holds: one float32 depth plane is 258,048 bytes, so 124 frames is
+# about 31 MiB against the 8 MiB of the two videos put together. Left out of the
+# estimate, the pre-flight would clear a 400 GiB run against an 80 GiB budget
+# and the disk would fill somewhere in the middle of the corpus instead.
+# Derived from FRAMES rather than hardcoded so it stays true if the shape moves.
+
 # Far lighter than the delivery run: a window is 128 frames, so the label stack
 # `derive` holds is 132 MiB rather than 1.7 GiB, and what is left is mostly the
 # model. Raise it while nvidia-smi shows the cards short of full.
@@ -50,6 +73,23 @@ if [[ -z "${N_GPUS:-}" ]]; then
   [[ "$N_GPUS" -gt 0 ]] || { echo "no GPUs found; set N_GPUS=1 to run on CPU" >&2; exit 1; }
 fi
 n_workers=$((N_GPUS * WORKERS_PER_GPU))
+
+# Several nodes over one corpus. `--shard i/N` partitions the episode list by
+# position, and every worker derives that list itself from DATA_DIR, so the
+# nodes need no coordination beyond agreeing on N and taking disjoint i. This
+# node takes the block [NODE_RANK * n_workers, +n_workers).
+#
+# The arithmetic assumes **every node contributes the same worker count**. That
+# is why it is checked rather than inferred: a node with 4 GPUs joining a run
+# sized for 8 would silently leave half the corpus unclaimed, and the only
+# symptom is a final audit that is short by episodes nobody looked at.
+NODE_COUNT="${NODE_COUNT:-1}"
+NODE_RANK="${NODE_RANK:-0}"
+((NODE_COUNT >= 1)) || die "NODE_COUNT must be >= 1, got $NODE_COUNT"
+((NODE_RANK >= 0 && NODE_RANK < NODE_COUNT)) \
+  || die "NODE_RANK must be in [0, $NODE_COUNT), got $NODE_RANK"
+n_shards=$((n_workers * NODE_COUNT))
+shard_base=$((NODE_RANK * n_workers))
 
 cores="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)"
 if [[ -z "${THREADS_PER_WORKER:-}" ]]; then
@@ -63,8 +103,6 @@ export OPENBLAS_NUM_THREADS="$THREADS_PER_WORKER"
 export NUMEXPR_NUM_THREADS="$THREADS_PER_WORKER"
 export OPENCV_FOR_THREADS_NUM="$THREADS_PER_WORKER"
 export PROXY_EXTRACT_THREADS="$THREADS_PER_WORKER"
-
-die() { echo "error: $*" >&2; exit 1; }
 
 # ------------------------------------------------------------------ pre-flight
 
@@ -89,6 +127,32 @@ for pair in "semantic=$SEMANTIC" "depth=$DEPTH"; do
   fi
 done
 
+# Are the selected backends actually importable? Both of the anti-flicker ones
+# are git-only installs that a fresh node will not have, and without this the
+# failure arrives as $n_workers identical ImportErrors in $n_workers separate
+# log files, after the run has already been declared launched.
+$PYTHON - "$DEPTH" "$REFINER" <<'PREFLIGHT' || die "a selected backend is not installed"
+import importlib.util
+import sys
+
+depth, refiner = sys.argv[1], sys.argv[2]
+needed = {
+    "moge3": ("moge", "pip install git+https://github.com/microsoft/MoGe.git"),
+    "sam2": ("sam2", "pip install git+https://github.com/facebookresearch/sam2.git"),
+    "sam3": ("sam3", "pip install 'proxy-extract[sam3]'"),
+}
+missing = []
+for choice in (depth, refiner):
+    if choice in needed:
+        module, how = needed[choice]
+        if importlib.util.find_spec(module) is None:
+            missing.append(f"  {choice} needs `{module}`, which is absent: {how}")
+if missing:
+    print("\n".join(missing), file=sys.stderr)
+    raise SystemExit(1)
+print(f"  ok: backends importable (depth={depth}, refiner={refiner})")
+PREFLIGHT
+
 if [[ "${ALLOW_CPU:-0}" != "1" ]]; then
   $PYTHON -c '
 import sys, torch
@@ -102,22 +166,28 @@ print(f"  ok: torch sees {torch.cuda.device_count()} GPU(s), CUDA {torch.version
 fi
 
 mkdir -p "$CLIPS_DIR/logs"
-need_mib=$((clips * MIB_PER_CLIP + n_workers * MIB_PER_WORKER_SCRATCH))
+mib_per_clip="$MIB_PER_CLIP"
+if [[ "$PROXY_DUV" == "1" ]]; then
+  # 258048 bytes of depth plus a compressible 8-bit id plane, per frame.
+  mib_per_clip=$((mib_per_clip + FRAMES * 258048 / 1048576 + 1))
+fi
+need_mib=$((clips * mib_per_clip + n_workers * MIB_PER_WORKER_SCRATCH))
 avail_mib="$(df -Pm "$CLIPS_DIR" | awk 'NR==2 {print $4}')"
 if [[ "$avail_mib" -lt "$need_mib" ]]; then
-  die "$CLIPS_DIR has $((avail_mib / 1024)) GiB free but $clips clips plus $n_workers working
-       directories need about $((need_mib / 1024)) GiB."
+  die "$CLIPS_DIR has $((avail_mib / 1024)) GiB free but $clips clips at ~$mib_per_clip MiB
+       plus $n_workers working directories need about $((need_mib / 1024)) GiB.${PROXY_DUV:+
+       PROXY_DUV=1 is most of that: the per-frame form is ~$((FRAMES * 258048 / 1048576)) MiB a clip, uncompressed.}"
 fi
 
 gib() { awk -v m="$1" 'BEGIN {printf "%.1f", m / 1024}'; }
 
 cat <<EOF
 data       $DATA_DIR ($episodes episodes${LIMIT:+, limited})
-clips      $CLIPS_DIR ($clips clips, $(gib "$avail_mib") GiB free, need ~$(gib "$need_mib") GiB)
+clips      $CLIPS_DIR ($clips clips at ~$mib_per_clip MiB, $(gib "$avail_mib") GiB free, need ~$(gib "$need_mib") GiB)
 shape      $PER_SCENE x $FRAMES frames at $FPS fps, models at $WORK_SIZE
-shards     $n_workers ($N_GPUS GPU(s) x $WORKERS_PER_GPU worker(s))
+shards     $shard_base..$((shard_base + n_workers - 1)) of $n_shards ($N_GPUS GPU(s) x $WORKERS_PER_GPU worker(s), node $NODE_RANK of $NODE_COUNT)
 threads    $THREADS_PER_WORKER per worker, of $cores core(s)
-backends   semantic=$SEMANTIC depth=$DEPTH
+backends   semantic=$SEMANTIC depth=$DEPTH refiner=$REFINER proxy_duv=$PROXY_DUV
 
 EOF
 
@@ -136,10 +206,14 @@ done
 if [[ -n "${LIMIT:-}" ]]; then
   extra+=(--limit "$LIMIT")
 fi
+if [[ "$PROXY_DUV" == "1" ]]; then
+  extra+=(--proxy-duv)
+fi
 
 pids=()
 for ((i = 0; i < n_workers; i++)); do
   gpu=$((i % N_GPUS))
+  shard=$((shard_base + i))
   CUDA_VISIBLE_DEVICES="$gpu" \
   $PYTHON -u -m proxy_extract clip-episodes \
     --video "$DATA_DIR" \
@@ -151,19 +225,23 @@ for ((i = 0; i < n_workers; i++)); do
     --work-size "$WORK_SIZE" \
     --semantic-backend "$SEMANTIC" \
     --depth-backend "$DEPTH" \
+    --refiner "$REFINER" \
     ${extra[@]+"${extra[@]}"} \
-    --shard "$i/$n_workers" \
+    --shard "$shard/$n_shards" \
     --resume \
     --keep-going \
-    >"$CLIPS_DIR/logs/shard-$i.log" 2>&1 &
+    >"$CLIPS_DIR/logs/shard-$shard.log" 2>&1 &
   pid=$!
   pids+=("$pid")
-  echo "launched shard $i/$n_workers on GPU $gpu (pid $pid)"
+  echo "launched shard $shard/$n_shards on GPU $gpu (pid $pid)"
 done
 
 echo
-echo "follow one:   tail -f $CLIPS_DIR/logs/shard-0.log"
+echo "follow one:   tail -f $CLIPS_DIR/logs/shard-$shard_base.log"
 echo "check totals: $PYTHON -m proxy_extract clips-audit --clips-out $CLIPS_DIR --frames $FRAMES"
+if [[ "$PROXY_DUV" == "1" ]]; then
+  echo "spec checks:  $PYTHON -m proxy_extract proxy-duv-audit --root $CLIPS_DIR"
+fi
 echo
 
 done_at_start="$(find "$CLIPS_DIR" -maxdepth 2 -name clip_report.json 2>/dev/null | wc -l | tr -d ' ')"
@@ -196,7 +274,8 @@ trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT
 failed=0
 for ((i = 0; i < n_workers; i++)); do
   if ! wait "${pids[$i]}"; then
-    echo "shard $i FAILED -- see $CLIPS_DIR/logs/shard-$i.log" >&2
+    shard=$((shard_base + i))
+    echo "shard $shard FAILED -- see $CLIPS_DIR/logs/shard-$shard.log" >&2
     failed=1
   fi
 done

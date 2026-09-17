@@ -275,6 +275,149 @@ def test_a_half_written_clip_is_cut_again(delivered, tmp_path):
     assert clips.already_cut(clip, 8)
 
 
+# ------------------------------------------- PROXY_DUV_SPEC.md's per-frame form
+
+
+def test_the_per_frame_form_lands_beside_the_composed_video(delivered, tmp_path):
+    """`--proxy-duv` adds a deliverable; it must not replace the existing one.
+
+    A clip carries both because they serve different consumers: `proxy/duv.mp4`
+    is DATA_F.md's palette and `duv/` is PROXY_DUV_SPEC.md's per-frame form. A
+    change that wrote one over the other would pass every check either consumer
+    makes on its own.
+    """
+    from proxy_extract import contract, proxy_duv
+
+    reports = _cut_one(delivered, tmp_path, proxy_duv_frames=True)
+    clip = tmp_path / reports[0]["clip"]
+
+    assert (clip / clips.PROXY_DIRNAME / clips.DUV_NAME).is_file()
+    duv = proxy_duv.duv_dir_for(clip)
+    assert sorted(path.name for path in duv.glob("*.depth.f32"))[:2] == [
+        "000000.depth.f32",
+        "000001.depth.f32",
+    ]
+    for ordinal in range(8):
+        depth, semantic = contract.frame_paths(duv, ordinal)
+        assert depth.stat().st_size == contract.DEPTH_BYTES
+        assert semantic.is_file()
+
+    # Which class table `duv/` holds is recorded, because the ids cannot say:
+    # standard11 and cwm12 are both small integers in the same range, so a
+    # delivery in the wrong one is silent. `projected_from` is read out of the
+    # segment's own report rather than assumed, which is the linkage that
+    # matters: projecting from the wrong source table is the failure.
+    delivered_taxonomy = json.loads(
+        (delivered / delivery.REPORT_NAME).read_text()
+    )["semantic"]["taxonomy"]
+    assert reports[0]["proxy_duv"] == {
+        "dir": proxy_duv.DUV_DIRNAME,
+        "taxonomy": "cwm12",
+        "projected_from": delivered_taxonomy,
+    }
+
+
+def test_the_per_frame_depth_is_metres_and_not_the_videos_codes(delivered, tmp_path):
+    """The whole reason this form exists rather than reusing `proxy/duv.mp4`.
+
+    The composed video stores depth as a log code in an 8-bit R channel; this
+    stores float32 metres. Reading one as the other is silent -- both are
+    plausible-looking numbers in a plausible-looking range.
+    """
+    import numpy as np
+
+    from proxy_extract import contract, proxy_duv
+
+    reports = _cut_one(delivered, tmp_path, proxy_duv_frames=True)
+    clip = tmp_path / reports[0]["clip"]
+
+    metres, ids = contract.read_frame(proxy_duv.duv_dir_for(clip), 0)
+
+    assert metres.dtype == np.float32
+    assert metres.shape == (contract.CONDITION_HEIGHT, contract.CONDITION_WIDTH)
+    assert np.all(np.isfinite(metres)) and np.all(metres >= 0.0)
+    assert metres.max() > 1.5, "these look like 0-1 codes, not metres"
+    assert ids.max() < 12, "the ids must already be projected onto CWM's twelve"
+
+
+def test_a_clip_cut_before_the_flag_existed_is_cut_again_for_it(delivered, tmp_path):
+    """The resume trap, and why `already_cut` takes the flag as an argument.
+
+    A clip cut without `--proxy-duv` is complete by its own standard and has no
+    `duv/`. Inferring the requirement from the disk would answer "already done"
+    for precisely the clips a `--proxy-duv` rerun exists to fill in, and the
+    rerun would report success having written nothing.
+    """
+    from proxy_extract import proxy_duv
+
+    reports = _cut_one(delivered, tmp_path)
+    clip = tmp_path / reports[0]["clip"]
+
+    assert clips.already_cut(clip, 8) is True
+    assert clips.already_cut(clip, 8, proxy_duv_frames=True) is False
+    assert not proxy_duv.duv_dir_for(clip).exists()
+
+    _cut_one(delivered, tmp_path, resume=True, proxy_duv_frames=True)
+
+    assert clips.already_cut(clip, 8, proxy_duv_frames=True) is True
+
+
+def test_a_truncated_depth_plane_is_not_mistaken_for_a_finished_clip(
+    delivered, tmp_path
+):
+    """A full disk leaves a short file, not a missing one.
+
+    The consumer asserts on the byte count of every plane it opens, so a
+    resume that counted files rather than bytes would hand the failure to
+    whoever builds the cache days later.
+    """
+    from proxy_extract import contract, proxy_duv
+
+    reports = _cut_one(delivered, tmp_path, proxy_duv_frames=True)
+    clip = tmp_path / reports[0]["clip"]
+    depth, _semantic = contract.frame_paths(proxy_duv.duv_dir_for(clip), 5)
+    depth.write_bytes(depth.read_bytes()[:-4])
+
+    assert clips.already_cut(clip, 8, proxy_duv_frames=True) is False
+
+
+def test_the_per_frame_form_is_off_unless_it_is_asked_for(delivered, tmp_path):
+    """It costs 336 KB a frame, and nothing downstream of `clips` needs it."""
+    from proxy_extract import proxy_duv
+
+    reports = _cut_one(delivered, tmp_path)
+    clip = tmp_path / reports[0]["clip"]
+
+    assert not proxy_duv.duv_dir_for(clip).exists()
+    assert reports[0]["proxy_duv"] is None
+
+
+def test_the_command_line_turns_it_on(delivered, tmp_path):
+    from proxy_extract import cli, proxy_duv
+
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "seg_000000").symlink_to(delivered)
+    delivery.write_manifest(
+        out, delivery.assign_scenes([("ep0", delivered.parent / "video.mp4", None)])
+    )
+
+    code = cli.main(
+        [
+            "clips", "--out", str(out), "--clips-out", str(tmp_path / "clips"),
+            "--per-scene", "1", "--frames", "8", "--fps", "24",
+            "--proxy-duv", "--quiet",
+        ]
+    )
+
+    assert code == 0
+    cut = tmp_path / "clips" / "clip_000000_0"
+    assert proxy_duv.duv_dir_for(cut).is_dir()
+    # And the manifest the spec asks for can be built straight off the result.
+    entries = proxy_duv.manifest_from_root(tmp_path / "clips")
+    assert [entry["proxy_duv"] for entry in entries] == ["clip_000000_0/duv"]
+
+
 def test_the_audit_counts_what_is_whole(delivered, tmp_path):
     _cut_one(delivered, tmp_path)
     summary = clips.audit_clips(tmp_path, 8)

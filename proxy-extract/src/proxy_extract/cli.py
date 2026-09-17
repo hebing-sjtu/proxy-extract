@@ -17,15 +17,19 @@ from . import accel
 from . import cameras as camera_io
 from . import clips as clip_defaults
 from . import contract
+from . import proxy_duv as proxy_duv_defaults
 from .frames import STREAMS as FRAME_STREAMS
 from .pipeline import ExtractionConfig, condition_dir_for, extract_clip, extract_dataset, shard
 from .proxy import DEFAULT_COLOR_CRF
 from .streaming import DEFAULT_BLOCK
 from .temporal import DEFAULT_MIN_RUN, DEFAULT_RADIUS
 
-DEPTH_BACKENDS = ("mapanything", "depth_anything", "depth_anything_v3", "synthetic")
+DEPTH_BACKENDS = ("mapanything", "depth_anything", "depth_anything_v3", "moge3", "synthetic")
 SEMANTIC_BACKENDS = ("ade20k", "cityscapes", "coarse6", "standard11", "synthetic")
-REFINERS = ("none", "sam3")
+# `sam3` adds classes the closed set cannot express; `sam2` makes the ones it
+# can express temporally consistent. They solve different problems and only one
+# can be selected here, so the flag names the refiner rather than a list.
+REFINERS = ("none", "sam3", "sam2")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -231,6 +235,12 @@ def build_parser() -> argparse.ArgumentParser:
         "resampling with the DUV; 'source' re-decodes the 1920x1080 original, which is "
         "sharper but needs the corpus mounted (default: %(default)s)",
     )
+    clips.add_argument(
+        "--proxy-duv", action="store_true",
+        help="also write PROXY_DUV_SPEC.md's per-frame form into each clip's duv/: "
+        "float32 metric depth and CWM 12-class ids, which is the shape the H3 proxy "
+        "consumer prefers because it has no palette to get wrong",
+    )
     clips.add_argument("--shard", metavar="INDEX/COUNT", help="process only this worker's slice")
     clips.add_argument("--resume", action="store_true", help="skip clips already whole")
     clips.add_argument("--keep-going", action="store_true", help="log and continue on failure")
@@ -289,6 +299,10 @@ def build_parser() -> argparse.ArgumentParser:
     episodes.add_argument("--no-hero-split", action="store_true")
     episodes.add_argument("--writer-threads", type=int, default=4, metavar="N")
     episodes.add_argument(
+        "--proxy-duv", action="store_true",
+        help="also write PROXY_DUV_SPEC.md's per-frame form into each clip's duv/",
+    )
+    episodes.add_argument(
         "--keep-work", action="store_true",
         help="leave each clip's .work/ directory, which holds the predicted frames",
     )
@@ -308,6 +322,43 @@ def build_parser() -> argparse.ArgumentParser:
         "--frames", type=int, default=clip_defaults.CLIP_FRAMES, metavar="N"
     )
     clips_audit.add_argument("--report", type=Path, help="also write the JSON here")
+
+    duv_manifest = sub.add_parser(
+        "proxy-duv-manifest",
+        help="write the encode manifest PROXY_DUV_SPEC.md section 7 specifies",
+        description="Scan a clips root for segments that carry both a target video "
+        "and a duv/, and write one JSON object per line with every path relative to "
+        "the root. Names proxy_duv and never proxy_duv_video: the keys are mutually "
+        "exclusive, and a clip cut by this pipeline also holds a composed duv.mp4 in "
+        "DATA_F.md's palette, which is the wrong one for this consumer.",
+    )
+    duv_manifest.add_argument("--root", type=Path, required=True)
+    duv_manifest.add_argument(
+        "--prompts", type=Path,
+        help='JSON mapping segment name to prompt text, e.g. {"clip_000000_0": "..."}; '
+        "segments missing from it get no prompt key",
+    )
+    duv_manifest.add_argument("--name", default=proxy_duv_defaults.MANIFEST_NAME)
+
+    duv_audit = sub.add_parser(
+        "proxy-duv-audit",
+        help="run PROXY_DUV_SPEC.md section 8's acceptance checks over a root",
+        description="Re-reads every segment's duv/ and applies the checks the "
+        "consumer's loader applies, then compares the segments against each other. "
+        "The cross-segment depth median spread is the point: per-segment depth "
+        "normalisation passes every per-frame test and is the one mistake that makes "
+        "the whole batch scrap.",
+    )
+    duv_audit.add_argument("--root", type=Path, required=True)
+    duv_audit.add_argument(
+        "--frames", type=int, default=proxy_duv_defaults.SPEC_FRAMES, metavar="N",
+        help="frames every segment must have at least (default: %(default)s)",
+    )
+    duv_audit.add_argument("--report", type=Path, help="also write the JSON here")
+    duv_audit.add_argument(
+        "--per-segment", action="store_true",
+        help="print every segment's statistics, not just the corpus summary",
+    )
 
     validate = sub.add_parser("validate", help="re-read a condition_root and check it")
     validate.add_argument("--condition-root", type=Path, required=True)
@@ -645,6 +696,7 @@ def _run_clips(args: argparse.Namespace) -> int:
                     fps=args.fps,
                     color_crf=args.color_crf if args.color_crf is not None else DEFAULT_COLOR_CRF,
                     target_from_source=args.target_from == "source",
+                    proxy_duv_frames=args.proxy_duv,
                     resume=args.resume,
                     progress=say,
                 )
@@ -750,6 +802,7 @@ def _run_clip_episodes(args: argparse.Namespace) -> int:
                     depth_backend=depth,
                     semantic_backend=semantic,
                     refiner=refiner,
+                    proxy_duv_frames=args.proxy_duv,
                     resume=args.resume,
                     keep_work=args.keep_work,
                     progress=say,
@@ -775,6 +828,51 @@ def _run_clips_audit(args: argparse.Namespace) -> int:
     if args.report:
         args.report.write_text(json.dumps(summary, indent=2))
     return 0 if summary["incomplete"] == 0 else 1
+
+
+def _run_proxy_duv_manifest(args: argparse.Namespace) -> int:
+    from . import proxy_duv
+
+    prompts = json.loads(args.prompts.read_text()) if args.prompts else None
+    entries = proxy_duv.manifest_from_root(args.root, prompts=prompts)
+    if not entries:
+        print(
+            f"error: no segment under {args.root} has both a target video and a "
+            f"{proxy_duv.DUV_DIRNAME}/. Cut with --proxy-duv first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    path = proxy_duv.write_manifest(args.root, entries, name=args.name)
+    without = [entry["name"] for entry in entries if "prompt" not in entry]
+    print(f"{len(entries)} segments -> {path}")
+    if without:
+        # Not an error: the consumer's prompt regime is its own choice, and a
+        # manifest without prompts is still loadable. But it is not what a
+        # training run wants, and it happens by forgetting --prompts.
+        print(f"  {len(without)} without a prompt, e.g. {', '.join(without[:3])}")
+    return 0
+
+
+def _run_proxy_duv_audit(args: argparse.Namespace) -> int:
+    from . import proxy_duv
+
+    summary = proxy_duv.audit_root(args.root, frames=args.frames)
+    detail = summary.pop("segment_stats")
+    print(json.dumps(summary, indent=2))
+    if args.per_segment:
+        for item in detail:
+            print(json.dumps(item))
+    if args.report:
+        args.report.write_text(json.dumps({**summary, "segment_stats": detail}, indent=2))
+        print(f"report written to {args.report}")
+
+    for line in summary["warnings"]:
+        print(f"warning: {line}", file=sys.stderr)
+    # Non-zero on a warning as well as a failure. Every warning this raises
+    # describes a delivery that passes the consumer's own assertions and still
+    # cannot train, so letting it exit 0 would put it past a CI gate.
+    return 1 if summary["failed"] or summary["warnings"] else 0
 
 
 def _run_validate(args: argparse.Namespace) -> int:
@@ -824,6 +922,8 @@ def main(argv: list[str] | None = None) -> int:
         "clips": _run_clips,
         "clip-episodes": _run_clip_episodes,
         "clips-audit": _run_clips_audit,
+        "proxy-duv-manifest": _run_proxy_duv_manifest,
+        "proxy-duv-audit": _run_proxy_duv_audit,
         "validate": _run_validate,
         "preview": _run_preview,
         "scenes-preview": _run_scenes_preview,

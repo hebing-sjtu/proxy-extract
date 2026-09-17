@@ -76,6 +76,14 @@ episode 只损失一条，结束时跑 `scenes-audit` 统计完整度。
 
 ## 1. 装 venv
 
+> **在 FastVideo 官方 Docker 里跑就别看这一节，看
+> [`RUNBOOK_DOCKER.md`](RUNBOOK_DOCKER.md)。** 那个镜像自带 Python 和一个按它的
+> 驱动编好的 torch（cu126），而下面这节装的 `requirements.txt` 钉的是另一个 torch，
+> PyPI 给的是 cu130 构建 —— 在 12.x 驱动上装完，`torch.cuda.is_available()` 会变成
+> False，整机的卡静默消失，提示只有一条 UserWarning。用
+> `scripts/setup_docker_env.sh`，它复用镜像的 torch 并且会拒绝动它。
+
+
 ```bash
 cd /path/to/fastvideo_datapipe
 DA3=1 scripts/setup_venv.sh          # 或 make venv
@@ -144,6 +152,7 @@ export PATH="$HOME/.local/bin:$PATH"
 ```bash
 .venv/bin/python scripts/fetch_models.py --set default    # 或 make venv-fetch
 .venv/bin/python scripts/fetch_models.py --set da3        # 默认深度后端，6.8 GB
+.venv/bin/python scripts/fetch_models.py --set flicker    # MoGe-3 + SAM 2，见第 5 节
 ```
 
 `default` 拉 Mask2Former（语义）和 Depth Anything V2 Metric Outdoor（深度兜底）。
@@ -207,6 +216,37 @@ worker 一个进程，CUDA OOM 只杀一个 shard，重跑 `make scenes` 会从�
 > 同一场景的 4 个视角，把它们的深度尺度绑在一起，而不是把前向做宽。所以填满 GPU
 > 只能靠叠 worker。语义模型那边可以真的加宽：
 > `SEMANTIC_OPTIONS="batch_size=8"`。
+
+### 多节点：一份语料，两台机器
+
+`--shard i/N` 按位置切 episode 列表，而**每个 worker 自己从 `DATA_DIR` 重新列一遍
+这个列表**（`resolve_videos` 里排过序），所以两台机器之间不需要任何通信，只需要就
+N 达成一致并各拿互不相交的 i。启动器把这件事收成两个变量：
+
+```bash
+# node 0
+NODE_COUNT=2 NODE_RANK=0 make clip-episodes
+# node 1
+NODE_COUNT=2 NODE_RANK=1 make clip-episodes
+```
+
+分片空间是全局的：本节点拿 `[NODE_RANK * n_workers, +n_workers)` 这一段，日志也按
+全局编号落在 `logs/shard-<全局号>.log`，所以两台机器写进同一个 `CLIPS_DIR` 不会撞
+名字。分片是**跨步**而不是分块的（`position % N == i`），所以就算语料按角色排序、
+某一段明显更重，两台机器的负载也仍然是均的。
+
+三件事必须一致，否则会**静默**漏掉一部分语料 —— 没有任何报错，只有最后审计数目偏少：
+
+1. **`DATA_DIR` 两边看到的 episode 列表必须完全相同。** 共享挂载最省事；各自一份拷贝
+   也行，但必须是同一份数据，多一条少一条都会让两边的位置切分错开。
+2. **`NODE_COUNT` 两边必须相同**，`NODE_RANK` 必须互不相同。
+3. **每个节点的 worker 数必须相同**（`N_GPUS × WORKERS_PER_GPU`）。全局分片数是按本
+   节点的 worker 数乘 `NODE_COUNT` 算的，所以一台 8 卡配一台 4 卡会让后半个语料没人
+   认领。脚本校验 `NODE_RANK` 的范围，但它看不见另一台机器，这一条只能靠约定。
+
+`CLIPS_DIR` 建议放共享盘：`--resume` 和 `clips-audit` 都是看盘上已有的成品，放一起
+才能两边都正确跳过已完成的片，最后的审计也才是全局的数。各写本地盘也能跑，事后
+rsync 到一处再审计即可。
 
 ### 线程：叠 worker 的另一半
 
@@ -508,7 +548,12 @@ ADE20K 只有**一个** `animal` 标签，分不出马鹿狗鸟，所以野生�
                     cityscapes  12 类，SegFormer，街景更准但没有室内类
                     synthetic   假数据，只用来验证接线
 
---depth-backend     depth_anything_v3  DA3 嵌套模型，米制（默认，见下）
+--refiner           none        不做一致性细化（默认）
+                    sam2        SAM 2 masklet 一致性层，治语义闪烁（见下）
+                    sam3        开集概念补充，治「trunk 根本没这个类」
+
+--depth-backend     moge3              MoGe-3，锁相机 + 锁米制尺度，治深度闪烁（见下）
+                    depth_anything_v3  DA3 嵌套模型，米制（默认，见下）
                     depth_anything     DA V2 单帧米制，装完即用的兜底
                     mapanything        多帧 + 可吃 GT 相机，但取权重会卡（见下）
                     synthetic          假数据
@@ -516,6 +561,76 @@ ADE20K 只有**一个** `animal` 标签，分不出马鹿狗鸟，所以野生�
 
 实际约束不是精度，而是**权重能不能在这台机器上拿到**，以及**它肯不肯声明自己是
 米制**。
+
+### 闪烁：`moge3` + `sam2`
+
+先说清楚一件事：**换 checkpoint 不治闪烁**。单目模型逐帧跑的时候，每帧会重新决定两个
+**全局**量，而这两个量一动，整帧所有像素同时动：
+
+1. **视场角。** 米制深度是经焦距换算出来的，所以 FOV 抖一度，每个像素的深度就偏几个
+   百分点，而且是整帧一起偏。
+2. **米制尺度。** 相机钉住之后，米制头的输出逐帧仍然不完全稳。
+
+这正好是 `temporal.py` 的窗口中值**碰不到**的那一部分：中值是逐像素投票的，而这里整帧
+每个像素都错了同一个倍率，它拿来投票的邻居错得一模一样。语义那边是对称的问题：逐帧
+分割各自独立，所以同一块路面可能这帧是 road、下帧是 terrain。
+
+两个后端分别把这两件事从「每帧决定一次」改成「整段决定一次」：
+
+```bash
+--depth-backend moge3 --refiner sam2
+```
+
+**`moge3` 做两件事。** 一是先在整段里均匀抽 8 帧探一次 FOV，取**中位数**（不是均值，
+也不是第一帧的：某一帧被读成特写就是个离群焦距，均值会把这一帧的错误摊到全部 124 帧
+上，换来一个「稳定但稳定在错值」的结果，比原来的闪烁更难发现），然后把同一个 `fov_x`
+喂给每一帧。相机已知时（`annotations.tar` 的 COLMAP `cameras.txt` 有像素焦距）直接
+`--depth-backend-option fov_x=...` 跳过探测，既更快也更准。二是 `temporal.lock_depth_scale`
+把 log 尺度的高频抖动除掉，而**保留整段的绝对米制水平**。
+
+第二点是这里唯一真正危险的地方，值得单独说：**逐段重归一化是这个数据集能遭遇的最坏
+破坏，而它跟「去抖动」在所有 shape/dtype/range 检查下长得一模一样**。
+`PROXY_DUV_SPEC.md` 第 2 节讲的就是这个 —— 深度通道不再是全语料同一个物理量，但每个
+文件都合法，训练跑得动、分数也出得来，只是什么都没学到。所以这个函数给的保证是
+**整段 log 修正量的均值恒为 0**，也就是编码器 log 码所在的几何均值深度进出不变；报告
+里的 `scale_mean_log_correction` 就是让人能自己核对这一条，而不是只能信文档。
+
+分给 `moge3` 的两个锁**都是 per call 的**：`--chunk-frames 32` 跑 124 帧窗口会把一段
+切成 4 次独立重建，FOV 重探 4 次、尺度重调 4 次，第 32/64/96 帧各留一个台阶。报告里的
+`frames_in_call` 就是为了让人看见这件事 —— 这个数跟窗口长度不一致，就是台阶的解释。
+走 clip 路线时 `--chunk-frames` 要 ≥ 窗口长度，或者干脆别传。
+
+**`sam2` 不是分类器，这里也没把它当分类器用。** 它是类别无关的，自己给不出任何 CWM
+类别 id。它有而逐帧分割器没有的东西是**跨视频的记忆**，拿的就是这个。所以是组合而不是
+替换：闭集 trunk（`panoptic.py`）说**是什么**、逐帧、会闪；SAM 2 说**哪些像素跟上一帧
+是同一个面**、跨整段、不闪。接法是从 trunk 的连通域播种 masklet，用 SAM 2 的记忆传播，
+然后**每个 masklet 在整段上投一次票**定类别——一个 masklet 一个决定，不是一帧一个。
+
+最后一步是全部意义所在，也是它跟 `temporal.py` 性质不同的地方：那边是事后**压制**
+闪烁，而 README 里的 `test_a_majority_vote_alone_cannot_remove_it` 说明了这条路的上限
+——奇数长度窗口以该像素为中心，总会多含一份它自己的类别，所以完美交替会自己把自己
+选回来。这里一个 masklet 整段只有一个标签，所以 masklet 内部的逐帧交替不是被压制，而是
+**根本表达不出来**。残余闪烁只剩在 masklet 边界和没被任何 masklet 覆盖的地方，而那部分
+恰好是 `temporal.py` 还擅长的——所以两级都开，而且这一级先跑。
+
+`sam2` 治不了的是 trunk 从来没预测过的类别：masklet 的票是从 trunk 的标签里抽的，
+ADE20K 没这个词，masklet 就是「稳定地错」而不是「闪烁地错」。那个缺口是 `sam3.py`
+的事，两者独立，可以同时开。
+
+两条部署提醒：
+
+- 两个包都**不在 PyPI**，都得从 git 装；SAM 2 的 checkpoint 没有门禁（不像 SAM 3），
+  所以不需要 hub login：
+
+  ```bash
+  .venv/bin/python -m pip install git+https://github.com/facebookresearch/sam2.git
+  .venv/bin/python -m pip install git+https://github.com/microsoft/MoGe.git
+  .venv/bin/python scripts/fetch_models.py --set flicker
+  ```
+
+- **本机（macOS）跑不了 `moge3`。** MoGe-3 依赖 FlexGEMM，FlexGEMM 基于 Triton，
+  Triton 没有 macOS wheel。测试用替身跑，所以 `pytest` 在本机是全绿的，真后端只能在
+  服务器上验。
 
 **`depth_anything_v3` 是默认值。** 三个里唯一同时满足两个条件的：DINOv2 主干烘焙在
 它自己的 `model.safetensors` 里，所以只要连得上 HF 就能拿全所有权重，不像 mapanything

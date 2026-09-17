@@ -348,8 +348,13 @@ annotations/prompt.json     结构（VLM 产出，贵，只做一次）
 <clip>/prompt.txt           用户句（确定性投影，随时可重来）
         │  FastVideo clip_dir_to_encode_manifest.py
         ▼
-h3_abot_train.jsonl         encode manifest → VAE / text 打包
+_captions/train.jsonl       encode manifest → VAE / text 打包
 ```
+
+前两段的产物都落在片目录里，所以天然跟着数据集走。第三段的 manifest 以及各步的
+report / 日志属于**这一份语料的**元数据，放语料根下的 `_captions/`，不要另起一棵
+`runs/` 树——名字和路径都从数据集继承，换个语料就自然是另一份。`_captions` 不匹配
+`clip_*`、也不含 `clip_report.json`，两边的扫描都不会把它当成一个 clip。
 
 **`prompt.txt` 放在片根目录，不在 `annotations/` 下。** 这是整个 clip-prompts 里唯一
 一处不放 `annotations/` 的文件，因为路径是消费方定的：`clip_dir_to_encode_manifest.py`

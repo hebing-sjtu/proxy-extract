@@ -41,6 +41,14 @@ DEPTH="${DEPTH:-depth_anything_v3}"
 # fall back to whatever `python` is on PATH so an activated environment still
 # works. Not `python3`: inside an activated venv that can resolve outside it.
 _repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# An activated environment wins over a repo-local .venv. That ordering matters
+# inside the FastVideo Docker image, where the interpreter belongs to the image
+# and a stale ./.venv left by an earlier attempt would otherwise silently take
+# over - with a torch built for a different CUDA than the driver. See
+# RUNBOOK_DOCKER.md.
+if [[ -z "${PYTHON:-}" && -n "${VIRTUAL_ENV:-}" && -x "$VIRTUAL_ENV/bin/python" ]]; then
+  PYTHON="$VIRTUAL_ENV/bin/python"
+fi
 if [[ -z "${PYTHON:-}" && -x "$_repo/.venv/bin/python" ]]; then
   PYTHON="$_repo/.venv/bin/python"
 fi

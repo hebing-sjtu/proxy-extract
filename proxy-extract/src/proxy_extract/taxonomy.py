@@ -357,6 +357,63 @@ CWM_TO_STANDARD11: dict[int, int] = {
 }
 
 
+# PROXY_DUV_SPEC.md section 1's table, transcribed. It is the consumer's own
+# `GTA_TO_CWM`, and the instruction there is to copy it literally, so this is
+# not a mapping to be improved.
+#
+# Two entries look wrong and are not:
+#
+#   ped -> animal   The consumer's adapter is trained from scratch on a base
+#                   model that has never seen a DUV frame, and the CWM LoRA
+#                   that ties a code to its meaning is not loaded. To the model
+#                   a class id is two bytes in G/B, so any injective assignment
+#                   trains identically. What is not free is *agreeing with the
+#                   existing `gta_v2_*` caches* - a different table is a
+#                   different experiment, and the two sets stop being mixable.
+#   ground -> infrastructure
+#                   DATA_F.md's `ground` is pavement, kerbs and markings, which
+#                   is what CWM calls infrastructure. It is not `terrain`; that
+#                   id belongs to the engine's own natural ground.
+#
+# So the only properties that have to hold are injectivity and corpus-wide
+# stability, and injectivity is asserted below rather than left to the reader
+# to check by eye.
+STANDARD11_TO_CWM: dict[int, int] = {
+    S11_SKY: SKY,
+    S11_PLAYER: HUMAN,
+    S11_PED: ANIMAL,
+    S11_VEHICLE: VEHICLE,
+    S11_BUILDING: BUILDING_STRUCTURE,
+    S11_ROAD: ROAD_PAVED,
+    S11_GROUND: INFRASTRUCTURE,
+    S11_VEGETATION: VEGETATION,
+    S11_TERRAIN: TERRAIN,
+    S11_WATER: WATER,
+    S11_PROP: PROP,
+}
+
+assert len(set(STANDARD11_TO_CWM.values())) == NUM_STANDARD11, (
+    "STANDARD11_TO_CWM must be injective: two source classes sharing a CWM id "
+    "would be indistinguishable in the delivered semantic channel"
+)
+
+
+def to_cwm12(standard11_labels: np.ndarray) -> np.ndarray:
+    """Project the delivered 11-class ids onto the 12 CWM classes.
+
+    The inverse direction from `to_standard11`, and deliberately not its
+    inverse: that one folds `animal` into `ped` and `infrastructure` into
+    `prop` because the 11-class schema has nowhere else to put them, while this
+    one is the consumer's own table. Round-tripping through both does not
+    return where it started, which is why neither is written in terms of the
+    other.
+    """
+    lut = np.array(
+        [STANDARD11_TO_CWM[cls] for cls in range(NUM_STANDARD11)], dtype=np.uint8
+    )
+    return lut[np.clip(np.asarray(standard11_labels), 0, NUM_STANDARD11 - 1)]
+
+
 def standard11_lut() -> np.ndarray:
     return build_lut(ADE20K_CLASSES, ADE20K_TO_STANDARD11, default=S11_PROP)
 

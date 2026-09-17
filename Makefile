@@ -5,7 +5,11 @@
 # The maintained deployment path. These nodes already carry a working main
 # environment, so the pipeline installs into its own directory and is uninstalled
 # by deleting it.
-VENV ?= $(CURDIR)/.venv
+# An already-activated environment wins over a repo-local one. That is what
+# makes these targets work unchanged inside the FastVideo Docker image, where
+# the interpreter belongs to the image rather than to this checkout and must not
+# be rebuilt from our pins - see RUNBOOK_DOCKER.md.
+VENV ?= $(if $(VIRTUAL_ENV),$(VIRTUAL_ENV),$(CURDIR)/.venv)
 VPY  := $(VENV)/bin/python
 
 # Where the corpus is and where the delivered set goes. The same defaults
@@ -32,7 +36,20 @@ LIMIT ?=
 CLIPS_DIR ?= $(OUT_DIR)-clips
 PER_SCENE ?= 5
 
-.PHONY: help venv venv-core venv-test venv-fetch doctor scenes scenes-audit preview clips clip-episodes clips-audit
+# The anti-flicker configuration, and PROXY_DUV_SPEC.md's per-frame deliverable.
+# All three default to the cheaper behaviour; see RUNBOOK section 5 for what
+# each one costs and why neither model alone is enough.
+DEPTH     ?= depth_anything_v3
+REFINER   ?= none
+PROXY_DUV ?= 0
+
+# Several nodes over one corpus. Every node needs the same NODE_COUNT and a
+# distinct NODE_RANK; the shard space is global, so the nodes never talk to
+# each other. See RUNBOOK section 3.
+NODE_COUNT ?= 1
+NODE_RANK  ?= 0
+
+.PHONY: help venv venv-core venv-test venv-fetch doctor scenes scenes-audit preview clips clip-episodes clips-audit proxy-duv-manifest proxy-duv-audit
 
 help:
 	@echo "VENV     = $(VENV)"
@@ -55,6 +72,12 @@ help:
 	@echo "  make clips          把交付好的长段切成 $(PER_SCENE) 段 124 帧 / 24fps 短片"
 	@echo "  make clip-episodes  不要长段时用这条：直接从语料切，模型只算留下的帧"
 	@echo "  make clips-audit    统计切完的 / 半截的"
+	@echo
+	@echo "治闪烁 + PROXY_DUV 交付（RUNBOOK 第 5 节）"
+	@echo "  make clip-episodes DEPTH=moge3 REFINER=sam2 PROXY_DUV=1"
+	@echo "  make proxy-duv-manifest   写 encode_manifest.jsonl"
+	@echo "  make proxy-duv-audit      跑跨段验收，逐段归一化只有这条能查出来"
+	@echo "  双节点：两边都加 NODE_COUNT=2，一边 NODE_RANK=0 一边 NODE_RANK=1"
 	@echo
 	@echo "路径用 DATA_DIR= 和 OUT_DIR= 覆盖，worker 数用 WORKERS_PER_GPU=。"
 	@echo "换节点先试几条：make scenes LIMIT=4，编号与全量一致，见 RUNBOOK 第 3 节。"
@@ -95,7 +118,18 @@ clips:
 # the target is resampled once instead of twice. See RUNBOOK section 8.
 clip-episodes:
 	DATA_DIR=$(DATA_DIR) CLIPS_DIR=$(CLIPS_DIR) PER_SCENE=$(PER_SCENE) LIMIT=$(LIMIT) \
-	  WORKERS_PER_GPU=$(WORKERS_PER_GPU) scripts/run_clip_episodes.sh
+	  WORKERS_PER_GPU=$(WORKERS_PER_GPU) \
+	  DEPTH=$(DEPTH) REFINER=$(REFINER) PROXY_DUV=$(PROXY_DUV) \
+	  NODE_COUNT=$(NODE_COUNT) NODE_RANK=$(NODE_RANK) scripts/run_clip_episodes.sh
+
+# The PROXY_DUV_SPEC.md deliverable's own two steps, after clip-episodes.
+# The audit is the one that matters: its cross-segment depth median check is
+# the only thing that catches per-segment normalisation.
+proxy-duv-manifest:
+	$(VPY) -m proxy_extract proxy-duv-manifest --root $(CLIPS_DIR) $(if $(PROMPTS),--prompts $(PROMPTS),)
+
+proxy-duv-audit:
+	$(VPY) -m proxy_extract proxy-duv-audit --root $(CLIPS_DIR) --report $(CLIPS_DIR)/proxy_duv_audit.json
 
 clips-audit:
 	$(VPY) -m proxy_extract clips-audit --clips-out $(CLIPS_DIR)

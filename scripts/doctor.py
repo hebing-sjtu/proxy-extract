@@ -217,6 +217,58 @@ def check_backends() -> list[Result]:
         )
     else:
         results.append(Result("semantic backend", "ok", "transformers and scipy installed"))
+
+    results.extend(check_flicker_backends())
+    return results
+
+
+def check_flicker_backends() -> list[Result]:
+    """The two optional backends that exist to fix a flickering delivery.
+
+    Both are absent from a default install and neither is an error when
+    missing, because the pipeline runs without them. What makes them worth a
+    line here is that they are asked for by name on the command line, so the
+    alternative to this check is an ImportError several minutes into a shard.
+
+    MoGe-3 is reported as unavailable rather than missing on macOS: its
+    FlexGEMM dependency builds on Triton, which publishes no macOS wheels, so
+    there is no install to suggest.
+    """
+    results = []
+
+    if _installed("moge"):
+        results.append(Result("moge3 (depth flicker)", "ok", "moge installed"))
+    elif sys.platform == "darwin":
+        results.append(
+            Result(
+                "moge3 (depth flicker)",
+                "warn",
+                "not installable on macOS (FlexGEMM needs Triton, which has no "
+                "macOS wheels); use DEPTH=depth_anything_v3 here",
+            )
+        )
+    else:
+        results.append(
+            Result(
+                "moge3 (depth flicker)",
+                "warn",
+                "moge missing; --depth-backend moge3 is unavailable",
+                "pip install git+https://github.com/microsoft/MoGe.git",
+            )
+        )
+
+    if _installed("sam2"):
+        results.append(Result("sam2 (semantic flicker)", "ok", "sam2 installed"))
+    else:
+        results.append(
+            Result(
+                "sam2 (semantic flicker)",
+                "warn",
+                "sam2 missing; --refiner sam2 is unavailable",
+                "pip install git+https://github.com/facebookresearch/sam2.git",
+            )
+        )
+
     return results
 
 

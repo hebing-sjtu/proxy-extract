@@ -52,7 +52,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from . import contract, frames, proxy
+from . import contract, frames, proxy, proxy_duv
 from .video import probe
 
 if TYPE_CHECKING:  # `delivery` imports enough to be worth keeping out of import time
@@ -219,10 +219,8 @@ def _to_duv_grid(plane: np.ndarray, reduce) -> np.ndarray:
     return reduce(plane)
 
 
-def _duv_frame(
-    scene_dir: Path, ordinal: int, *, driving: bool, inverted: bool
-) -> np.ndarray:
-    """One 336x192 DUV frame, composed from the arrays rather than resized.
+def _duv_planes(scene_dir: Path, ordinal: int) -> tuple[np.ndarray, np.ndarray]:
+    """One ordinal's metric depth and class ids, reduced onto the 336x192 grid.
 
     Never a resize of the delivered `duv.mp4`: its red channel is a log-depth
     code and its green and blue are a class palette, so interpolating it
@@ -230,14 +228,18 @@ def _duv_frame(
     predicted. The median keeps a depth that occurred rather than averaging
     across a silhouette into a surface that does not exist, and the vote keeps
     whichever class owns the block.
+
+    Returned as two planes rather than a composed frame because both consumers
+    want them: `proxy.compose_proxy_frame` for DATA_F.md's `duv.mp4`, and
+    `proxy_duv` for the per-frame form, which needs the float depth that the
+    composition quantises onto eight bits. Reducing once and handing out the
+    result is also what keeps the two byte-identical in what they describe.
     """
     metres = frames.read_array(scene_dir, "depth", ordinal).astype(np.float32)
     ids = frames.read_array(scene_dir, "semantic", ordinal).astype(np.uint8)
-    return proxy.compose_proxy_frame(
+    return (
         _to_duv_grid(metres, contract.downsample_depth),
         _to_duv_grid(ids, contract.downsample_semantic),
-        driving=driving,
-        inverted_depth=inverted,
     )
 
 
@@ -390,11 +392,18 @@ def abot_sparse_members(members: dict) -> list[str]:
 # ----------------------------------------------------------------- one clip
 
 
-def already_cut(clip_dir: Path, length: int = CLIP_FRAMES) -> bool:
+def already_cut(
+    clip_dir: Path, length: int = CLIP_FRAMES, *, proxy_duv_frames: bool = False
+) -> bool:
     """Whether a previous run left a complete clip here.
 
     Frame counts rather than existence, for the same reason `delivery` checks
     them: a run killed mid-encode leaves two openable files that are short.
+
+    `proxy_duv_frames` has to be passed in rather than inferred from what is on
+    disk. A clip cut before the flag existed is complete by its own standard and
+    has no `duv/`, so asking "does it have one" would answer "yes, complete" for
+    exactly the clips a `--proxy-duv` rerun exists to fill in.
     """
     clip_dir = Path(clip_dir)
     videos = (
@@ -405,10 +414,31 @@ def already_cut(clip_dir: Path, length: int = CLIP_FRAMES) -> bool:
         return False
     if not (clip_dir / TARGET_DIRNAME / ANCHOR_NAME).is_file():
         return False
+    if proxy_duv_frames and not _duv_frames_complete(clip_dir, length):
+        return False
     try:
         return all(probe(path).frames == length for path in videos)
     except (OSError, ValueError):
         return False
+
+
+def _duv_frames_complete(clip_dir: Path, length: int) -> bool:
+    """Whether `duv/` holds a readable pair for every ordinal the clip claims.
+
+    Byte counts, not a file listing: the consumer asserts on the size of every
+    `.depth.f32` it opens, so a write cut short by a full disk has to fail here
+    rather than at the far end of a cache build.
+    """
+    duv = proxy_duv.duv_dir_for(clip_dir)
+    if not duv.is_dir():
+        return False
+    for ordinal in range(length):
+        depth, semantic = contract.frame_paths(duv, ordinal)
+        if not semantic.is_file():
+            return False
+        if not depth.is_file() or depth.stat().st_size != contract.DEPTH_BYTES:
+            return False
+    return True
 
 
 def cut_clip(
@@ -420,8 +450,16 @@ def cut_clip(
     source_video: Path | None = None,
     color_crf: int = proxy.DEFAULT_COLOR_CRF,
     fps: float = CLIP_FPS,
+    proxy_duv_frames: bool = False,
 ) -> dict:
-    """Write one clip: target video, anchor, DUV, annotations, report."""
+    """Write one clip: target video, anchor, DUV, annotations, report.
+
+    `proxy_duv_frames` additionally writes PROXY_DUV_SPEC.md's per-frame form
+    into `duv/`. Additionally rather than instead: the two describe the same
+    reduced planes, and the composed video is what DATA_F.md's readers expect,
+    so a clip can serve both consumers. What must not happen is a manifest that
+    names both - see `proxy_duv.manifest_entry`.
+    """
     import cv2
 
     scene_dir, clip_dir = Path(scene_dir), Path(clip_dir)
@@ -430,6 +468,7 @@ def cut_clip(
         report.get("semantic", {}).get("hero_split", {}).get("driving", False)
     )
     inverted = bool(report.get("duv_depth_inverted", False))
+    taxonomy = report.get("semantic", {}).get("taxonomy", "standard11")
 
     (clip_dir / TARGET_DIRNAME).mkdir(parents=True, exist_ok=True)
     (clip_dir / PROXY_DIRNAME).mkdir(parents=True, exist_ok=True)
@@ -449,9 +488,19 @@ def cut_clip(
         clip_dir / PROXY_DIRNAME / DUV_NAME, DUV_WIDTH, DUV_HEIGHT, fps, kind="proxy"
     )
     try:
-        for frame, ordinal in zip(targets, window.ordinals):
+        for index, (frame, ordinal) in enumerate(zip(targets, window.ordinals)):
             rgb.write(frame)
-            duv.write(_duv_frame(scene_dir, ordinal, driving=driving, inverted=inverted))
+            metres, ids = _duv_planes(scene_dir, ordinal)
+            duv.write(
+                proxy.compose_proxy_frame(
+                    metres, ids, driving=driving, inverted_depth=inverted
+                )
+            )
+            if proxy_duv_frames:
+                # Numbered from the clip's own zero, not the episode's: the
+                # consumer opens `range(num_frames)` and an ordinal that starts
+                # at the source frame number is an ENOENT on the first read.
+                proxy_duv.write_frame(clip_dir, index, metres, ids, taxonomy=taxonomy)
     finally:
         rgb.close()
         duv.close()
@@ -478,6 +527,18 @@ def cut_clip(
         "duv_size": [DUV_WIDTH, DUV_HEIGHT],
         "duv_depth_inverted": inverted,
         "taxonomy": report.get("config", {}).get("semantic_backend"),
+        # Which class table `duv/` holds, when it was written. The ids alone
+        # cannot say: both schemas are small integers in the same range, and
+        # PROXY_DUV_SPEC.md opens by warning that mixing them is silent.
+        "proxy_duv": (
+            {
+                "dir": proxy_duv.DUV_DIRNAME,
+                "taxonomy": "cwm12",
+                "projected_from": taxonomy,
+            }
+            if proxy_duv_frames
+            else None
+        ),
         "deliverable": report.get("deliverable", True),
         "annotations": _write_annotations(annotations, window, clip_dir, report),
     }
@@ -539,6 +600,7 @@ def cut_scene(
     fps: float = CLIP_FPS,
     color_crf: int = proxy.DEFAULT_COLOR_CRF,
     target_from_source: bool = False,
+    proxy_duv_frames: bool = False,
     resume: bool = False,
     progress=None,
 ) -> list[dict]:
@@ -551,7 +613,7 @@ def cut_scene(
     reports = []
     for window in windows_for_scene(scene_dir, count=count, length=length, fps=fps):
         clip_dir = clips_root / clip_name(window.scene, window.index)
-        if resume and already_cut(clip_dir, length):
+        if resume and already_cut(clip_dir, length, proxy_duv_frames=proxy_duv_frames):
             existing = clip_dir / CLIP_REPORT_NAME
             reports.append(
                 json.loads(existing.read_text())
@@ -570,6 +632,7 @@ def cut_scene(
                 source_video=source,
                 color_crf=color_crf,
                 fps=fps,
+                proxy_duv_frames=proxy_duv_frames,
             )
         )
     return reports
@@ -618,6 +681,7 @@ def cut_episode(
     depth_backend=None,
     semantic_backend=None,
     refiner=None,
+    proxy_duv_frames: bool = False,
     resume: bool = False,
     keep_work: bool = False,
     progress=None,
@@ -662,7 +726,7 @@ def cut_episode(
     reports = []
     for window in windows:
         clip_dir = clips_root / clip_name(scene, window.index)
-        if resume and already_cut(clip_dir, length):
+        if resume and already_cut(clip_dir, length, proxy_duv_frames=proxy_duv_frames):
             existing = clip_dir / CLIP_REPORT_NAME
             reports.append(
                 json.loads(existing.read_text())
@@ -704,6 +768,7 @@ def cut_episode(
                 fps=fps,
                 annotations=annotations,
                 color_crf=config.color_crf,
+                proxy_duv_frames=proxy_duv_frames,
             )
         )
         if not keep_work:
@@ -722,6 +787,7 @@ def _assemble_clip(
     fps: float,
     annotations: Path | None,
     color_crf: int,
+    proxy_duv_frames: bool = False,
 ) -> dict:
     """Turn one window's predicted frames into the clip's three outputs.
 
@@ -735,6 +801,7 @@ def _assemble_clip(
 
     driving = bool(scene_report.get("semantic", {}).get("hero_split", {}).get("driving", False))
     inverted = bool(scene_report.get("duv_depth_inverted", False))
+    taxonomy = scene_report.get("semantic", {}).get("taxonomy", "standard11")
     width, height = scene_report["size"]
 
     rgb = proxy.open_encoder(
@@ -750,18 +817,24 @@ def _assemble_clip(
             if anchor is None:
                 anchor = colour
             rgb.write(colour)
+            # This route's work size is already a whole multiple of the DUV
+            # grid - the CLI refuses a --work-size that is not - so these are
+            # exact block reductions rather than the nearest-neighbour fallback.
+            metres = contract.downsample_depth(
+                frames.read_array(work, "depth", index).astype(np.float32)
+            )
+            ids = contract.downsample_semantic(
+                frames.read_array(work, "semantic", index).astype(np.uint8)
+            )
             duv.write(
                 proxy.compose_proxy_frame(
-                    contract.downsample_depth(
-                        frames.read_array(work, "depth", index).astype(np.float32)
-                    ),
-                    contract.downsample_semantic(
-                        frames.read_array(work, "semantic", index).astype(np.uint8)
-                    ),
-                    driving=driving,
-                    inverted_depth=inverted,
+                    metres, ids, driving=driving, inverted_depth=inverted
                 )
             )
+            if proxy_duv_frames:
+                proxy_duv.write_frame(
+                    clip_dir, index - offset, metres, ids, taxonomy=taxonomy
+                )
     finally:
         rgb.close()
         duv.close()
@@ -785,6 +858,15 @@ def _assemble_clip(
         "target_from": "the source video, resampled once",
         "duv_size": [DUV_WIDTH, DUV_HEIGHT],
         "duv_depth_inverted": inverted,
+        "proxy_duv": (
+            {
+                "dir": proxy_duv.DUV_DIRNAME,
+                "taxonomy": "cwm12",
+                "projected_from": taxonomy,
+            }
+            if proxy_duv_frames
+            else None
+        ),
         "halo_frames": offset,
         # The per-window diagnostics, which are per-clip here rather than per
         # episode: whether the protagonist was resolved and how much the labels

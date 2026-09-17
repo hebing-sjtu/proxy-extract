@@ -18,7 +18,10 @@ import sys
 from proxy_extract.depth.depth_anything import INDOOR_CHECKPOINT, OUTDOOR_CHECKPOINT
 from proxy_extract.depth.depth_anything_v3 import METRIC_CHECKPOINT, NESTED_CHECKPOINT
 from proxy_extract.depth.mapanything import APACHE_CHECKPOINT, DEFAULT_CHECKPOINT
+from proxy_extract.depth.moge3 import CHECKPOINT as MOGE3_CHECKPOINT
+from proxy_extract.depth.moge3 import LARGE_CHECKPOINT as MOGE3_LARGE_CHECKPOINT
 from proxy_extract.semantic.panoptic import ADE20K_CHECKPOINT, CITYSCAPES_CHECKPOINT
+from proxy_extract.semantic.sam2 import CHECKPOINT as SAM2_CHECKPOINT
 
 # Grouped by what a run actually needs, so nobody waits on a 6 GB download for
 # a backend they are not using.
@@ -35,6 +38,18 @@ SETS: dict[str, tuple[str, ...]] = {
     # ships inside the checkpoint rather than through torch.hub.
     "da3": (NESTED_CHECKPOINT,),
     "da3-apache": (METRIC_CHECKPOINT,),
+    # The anti-flicker pair, and the reason to fetch them together: neither one
+    # alone fixes a flickering delivery. MoGe-3 locks the camera and the metric
+    # scale over the clip, SAM 2 makes a label a property of a masklet instead
+    # of a frame. See PROXY_DUV_SPEC.md and RUNBOOK section 6.
+    "flicker": (MOGE3_CHECKPOINT, SAM2_CHECKPOINT),
+    # MoGe-3 only. MIT licence, and small: the ViT-L is 370M, so unlike da3
+    # this is a fetch nobody needs to plan around.
+    "moge3": (MOGE3_CHECKPOINT,),
+    "moge3-large": (MOGE3_LARGE_CHECKPOINT,),
+    # SAM 2.1 only. Ungated, unlike SAM 3's, so this needs no hub login - but
+    # the `sam2` package is not on PyPI and has to come from git.
+    "sam2": (SAM2_CHECKPOINT,),
 }
 
 

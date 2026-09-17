@@ -9,6 +9,13 @@ Voting across a temporal window naively assumes a pixel looks at the same
 surface in every frame, which a moving camera breaks - at these clips' measured
 ~2.8 px/frame it smears edges by several pixels over a 5-frame window. So the
 neighbours are warped into the current frame with optical flow before voting.
+
+Depth has a second, coarser failure the window cannot touch. A monocular metric
+model decides one scale for the whole frame, so when that number moves, every
+pixel moves together and a per-pixel median has no dissenting neighbour to
+prefer. `lock_depth_scale` handles that one, and its docstring is worth reading
+before changing it: the fix and the worst available mistake - renormalising per
+clip - differ only in which frequencies they touch.
 """
 
 from __future__ import annotations
@@ -27,6 +34,21 @@ DEFAULT_MIN_RUN = 2
 # whole-episode buffer affordable, so it cannot represent a threshold a byte
 # cannot hold. Nothing near this is a sensible flicker setting anyway.
 MAX_MIN_RUN = 255
+
+# Half-width of the window that defines "real motion" for `lock_depth_scale`.
+# Twelve frames is half a second at 24 fps: a metric head's scale jitter is
+# frame-to-frame, and nothing a camera does to the depth level of a whole scene
+# happens and reverses inside half a second.
+DEFAULT_SCALE_RADIUS = 12
+# Largest log correction the scale lock will apply, i.e. +/-28%. Past this the
+# level curve has not measured jitter, it has measured a cut or a collapsed
+# flow solve, and applying it would be worse than leaving the frame alone.
+MAX_LOG_CORRECTION = 0.25
+# A frame pair needs this share of the frame co-visible and valid in both
+# frames before its depth ratio is believed. Below it the pair is skipped: at a
+# scene cut the two frames share no surfaces at all, so any ratio measured
+# across it is a comparison of unrelated geometry.
+MIN_COVISIBLE_FRACTION = 0.05
 
 
 def _flow_between(source: np.ndarray, target: np.ndarray, *, downscale: int = 1) -> np.ndarray:
@@ -139,6 +161,224 @@ def _median_at(
         warnings.simplefilter("ignore", RuntimeWarning)
         merged = np.nanmedian(np.stack(stack), axis=0)
     return np.nan_to_num(merged, nan=0.0).astype(np.float32)
+
+
+def lock_depth_scale(
+    depth: np.ndarray,
+    *,
+    guide_frames: list[np.ndarray] | None = None,
+    radius: int = DEFAULT_SCALE_RADIUS,
+    flow_downscale: int = 4,
+    max_correction: float = MAX_LOG_CORRECTION,
+    min_covisible_fraction: float = MIN_COVISIBLE_FRACTION,
+) -> tuple[np.ndarray, dict]:
+    """Remove the per-frame global scale jitter from a metric depth stack,
+    without touching the clip's absolute metric level.
+
+    A monocular metric model decides the scale of the whole frame in one number,
+    and that number is not stable frame to frame. The result moves every pixel
+    at once, which is the part of depth flicker a windowed median cannot reach:
+    the median is per pixel, and here every pixel of the frame is wrong by the
+    same factor, so the neighbours it votes against are wrong too.
+
+    The thing that makes this delicate is that renormalising per clip is the
+    single most destructive thing that can be done to this dataset, and it
+    looks identical to this. `PROXY_DUV_SPEC.md` section 2 is about exactly
+    that failure: the depth channel stops being the same quantity across the
+    corpus, every shape and frame count stays right, and the run trains and
+    scores while learning nothing. So the split is:
+
+        real camera motion   low frequency   kept
+        metric head jitter   high frequency  removed
+        the clip's own level  a constant     provably untouched
+
+    Concretely: the frame-to-frame log ratio is measured on co-visible pixels
+    and chained into a level curve, a straight line is fitted to that curve
+    over ±`radius` frames and taken as the real motion, and only the residual
+    is divided out. The residual is then re-centred so that **the mean log
+    correction over the clip is exactly zero** — that is the guarantee, and it
+    is what makes this not a renormalisation: the geometric mean of the clip's
+    depths, which is where the encoder's log codes are centred, comes out of
+    this function the same as it went in. `test_the_clips_own_level_survives`
+    pins it, and `test_a_steady_approach_is_not_mistaken_for_jitter` pins the
+    other half - that real motion is not what gets removed.
+
+    Flow compensation matters less here than it does for the label vote: the
+    statistic is one robust median over the whole frame, so the few percent of
+    pixels that cross an occlusion boundary in one frame cannot move it. Hence
+    `flow_downscale=4` rather than the stabiliser's 2.
+    """
+    depth = np.asarray(depth, dtype=np.float32)
+    if depth.ndim != 3:
+        raise ValueError(f"depth must be (N, H, W), got {depth.shape}")
+    if radius < 1:
+        raise ValueError(f"radius must be >= 1, got {radius}")
+    if len(depth) < 3:
+        return depth, {"scale_locked": False, "reason": "fewer than three frames"}
+
+    shape = depth.shape[1:]
+    guide = _gray_stack(guide_frames, shape) if guide_frames is not None else None
+    if guide is not None and len(guide) != len(depth):
+        raise ValueError(f"guide has {len(guide)} frames for {len(depth)} depth maps")
+
+    ratios, uninformative = _frame_to_frame_log_ratios(
+        depth,
+        guide,
+        flow_downscale=flow_downscale,
+        min_covisible_fraction=min_covisible_fraction,
+    )
+    # The measured level of each frame relative to the first. Real motion and
+    # jitter are both in here; the next two lines are what separates them.
+    level = np.concatenate([[0.0], np.cumsum(ratios)])
+    residual = level - _local_linear_trend(level, radius)
+
+    correction = -(residual - float(residual.mean()))
+    clamped = int(np.count_nonzero(np.abs(correction) > max_correction))
+    correction = np.clip(correction, -max_correction, max_correction)
+    correction = _recentre(correction, max_correction)
+
+    factors = np.exp(correction).astype(np.float32)
+    locked = np.where(
+        depth > 0.0, depth * factors[:, None, None], 0.0
+    ).astype(np.float32)
+
+    return locked, {
+        "scale_locked": True,
+        "scale_lock_radius": radius,
+        "scale_lock_flow": guide is not None,
+        # The size of the jitter that was taken out, as a percentage of depth.
+        # This is the number that says whether the lock did anything: a few
+        # percent is a model that was breathing, and near zero means the frames
+        # already agreed and the cost bought nothing.
+        "scale_jitter_removed_pct": round(
+            100.0 * float(np.max(np.abs(np.expm1(correction)))), 4
+        ),
+        "scale_jitter_rms_pct": round(
+            100.0 * float(np.sqrt(np.mean(np.expm1(correction) ** 2))), 4
+        ),
+        "scale_frames_clamped": clamped,
+        # Frame pairs with too little co-visible depth to measure — a scene cut,
+        # or a frame that is nearly all sky. Their ratio is taken as zero, which
+        # freezes the level curve across the gap rather than inventing a step.
+        "scale_pairs_uninformative": uninformative,
+        # Zero by construction. Reported anyway because it is the claim this
+        # function makes about itself, and a reader of the report should be able
+        # to check it rather than take the docstring's word.
+        "scale_mean_log_correction": round(float(correction.mean()), 12),
+    }
+
+
+def _recentre(correction: np.ndarray, limit: float) -> np.ndarray:
+    """Force the mean to zero without pushing any frame back past `limit`.
+
+    Both properties are wanted and a single subtraction cannot have them.
+    Clipping is asymmetric whenever a clip has one bad frame, so it leaves a
+    mean behind; subtracting that mean from everything then moves the clipped
+    frame further out than the clip allowed - which is how a 0.25 limit
+    produced a 0.28 correction and is what `test_a_correction_is_clamped`
+    caught.
+
+    So the offset is taken out of the frames that have room for it instead. The
+    zero mean is the property that must not bend: it is the difference between
+    this function and the per-clip renormalisation the spec forbids, whereas
+    the limit is a robustness heuristic about one frame. If nothing has room -
+    every frame clipped, which means the level solve failed outright - the mean
+    wins and the limit gives way, since a corpus-wide calibration error is
+    worse than one over-corrected clip.
+    """
+    correction = np.asarray(correction, dtype=np.float64).copy()
+    for _attempt in range(4):
+        offset = float(correction.mean())
+        if offset == 0.0:
+            return correction
+        free = np.abs(correction) < limit
+        if not free.any():
+            return correction - offset
+        correction[free] -= offset * len(correction) / int(free.sum())
+        correction = np.clip(correction, -limit, limit)
+    return correction - float(correction.mean())
+
+
+def _frame_to_frame_log_ratios(
+    depth: np.ndarray,
+    guide: list[np.ndarray] | None,
+    *,
+    flow_downscale: int,
+    min_covisible_fraction: float,
+) -> tuple[np.ndarray, int]:
+    """The median log depth ratio between each consecutive pair, and how many
+    pairs had too little overlap to say.
+
+    Median of per-pixel log ratios rather than a ratio of medians: the two
+    differ whenever the co-visible set is not the whole frame, and the per-pixel
+    form is the one that compares a surface against itself.
+    """
+    ratios = np.zeros(len(depth) - 1, dtype=np.float64)
+    uninformative = 0
+    floor = min_covisible_fraction * depth.shape[1] * depth.shape[2]
+
+    for index in range(1, len(depth)):
+        previous = depth[index - 1]
+        if guide is not None:
+            flow = _flow_between(guide[index], guide[index - 1], downscale=flow_downscale)
+            previous = _warp(previous, flow, nearest=False)
+
+        current = depth[index]
+        both = (previous > 0.0) & (current > 0.0)
+        if int(both.sum()) < floor:
+            uninformative += 1
+            continue
+        ratios[index - 1] = float(
+            np.median(np.log(current[both]) - np.log(previous[both]))
+        )
+    return ratios, uninformative
+
+
+def _local_linear_trend(values: np.ndarray, radius: int) -> np.ndarray:
+    """The level curve's local trend: a straight line fitted in each window.
+
+    A moving average would be the obvious choice and it is wrong at the ends.
+    Averaging a sloped curve over a window that has been clipped or padded at a
+    boundary returns something offset from the curve, so the first and last
+    `radius` frames get a residual that is pure edge artifact - and this
+    function's output is subtracted, so that artifact would be *applied* to
+    them as a correction. A camera walking steadily forward would come out with
+    its first and last half-second of depth wrong by a few percent, at both
+    ends of every clip in the corpus, in the same direction every time.
+
+    A degree-1 fit has no such bias: it reproduces any straight line exactly,
+    including from a one-sided window, so constant-speed approach - which is
+    what most of this footage is - passes through untouched. Jitter, being
+    zero-mean about the line, does not survive the fit.
+
+    Degree 1 and not higher: each extra degree lets the trend absorb more of
+    the wobble it is supposed to leave behind, and at the clip lengths here a
+    quadratic already starts fitting the jitter itself.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    count = len(values)
+    trend = np.empty(count, dtype=np.float64)
+    for index in range(count):
+        low = max(index - radius, 0)
+        high = min(index + radius + 1, count)
+        window = np.arange(low, high, dtype=np.float64)
+        if len(window) < 2:
+            trend[index] = values[index]
+            continue
+        centred = window - index
+        # Solved in closed form rather than through polyfit: the value wanted
+        # is the fit at x = index, and centring the window on it makes that the
+        # intercept, so only two sums are needed and there is no conditioning
+        # question about a Vandermonde matrix.
+        mean_x = centred.mean()
+        mean_y = values[low:high].mean()
+        variance = float(((centred - mean_x) ** 2).sum())
+        if variance <= 0.0:  # pragma: no cover - a window of identical indices
+            trend[index] = mean_y
+            continue
+        slope = float(((centred - mean_x) * (values[low:high] - mean_y)).sum()) / variance
+        trend[index] = mean_y - slope * mean_x
+    return trend
 
 
 def suppress_short_runs(

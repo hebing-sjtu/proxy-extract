@@ -29,6 +29,10 @@ def get_backend(name: str, **kwargs) -> DepthBackend:
         from .depth_anything_v3 import DepthAnythingV3Backend
 
         return DepthAnythingV3Backend(**kwargs)
+    if name == "moge3":
+        from .moge3 import MoGe3Backend
+
+        return MoGe3Backend(**kwargs)
     if name == "synthetic":
         from .synthetic import SyntheticDepthBackend
 

@@ -1,0 +1,103 @@
+{
+  "contract": "scene",
+  "version": 3,
+  "chunks": 4,
+  "scene": {
+    "medium": "video game",
+    "environment": "city street",
+    "lighting": "bright daylight"
+  },
+  "entities": [
+    {
+      "id": "char_0",
+      "kind": "man",
+      "look": "a man wearing a dark green jacket and dark jeans",
+      "protagonist": true
+    }
+  ],
+  "initial": {
+    "bindings": []
+  },
+  "events": [
+    {
+      "id": "e0",
+      "type": "self",
+      "entity": "char_0",
+      "phrase": "stands still",
+      "target": null,
+      "caused_by": null,
+      "channel": null,
+      "mode": null,
+      "chunks": [
+        0
+      ]
+    },
+    {
+      "id": "e1",
+      "type": "self",
+      "entity": "char_0",
+      "phrase": "walks forward",
+      "target": null,
+      "caused_by": null,
+      "channel": null,
+      "mode": null,
+      "chunks": [
+        1,
+        2,
+        3
+      ]
+    }
+  ],
+  "uid": "560a1e1e88a1311c",
+  "clip": "seg_0000",
+  "origin_clip": "gta_web_0831/seg_0000",
+  "tag": "walk",
+  "duration": 5.167,
+  "derived_from": "minimax_h3/output.mp4",
+  "source": "vlm:target:gemini-3.8-flash",
+  "segmentation": {
+    "source": "uniform",
+    "chunks": 4,
+    "boundaries": [
+      0.0,
+      1.292,
+      2.583,
+      3.875,
+      5.167
+    ]
+  },
+  "enrichment": {
+    "scene": {
+      "medium": "third-person action video game",
+      "environment": "broad urban boulevard lined with classical multi-story stone buildings, sidewalks, street trees, and traffic signals",
+      "lighting": "bright clear daylight with sharp shadows on the pavement"
+    },
+    "looks": {
+      "char_0": "a man with closely cropped dark hair wearing a dark green bomber jacket over a white undershirt, dark jeans, and white sneakers"
+    },
+    "renderings": {
+      "e0": "stands completely still in the middle of the roadway",
+      "e1": "walks steadily along the asphalt roadway toward an intersection"
+    }
+  },
+  "compiled": {
+    "lean": {
+      "global": "Video game. City street. Bright daylight. A man wearing a dark green jacket and dark jeans stands still, the man walks forward.",
+      "chunks": [
+        "The man stands still.",
+        "The man walks forward.",
+        "The man walks forward.",
+        "The man walks forward."
+      ]
+    },
+    "rich": {
+      "global": "Third-person action video game. Broad urban boulevard lined with classical multi-story stone buildings, sidewalks, street trees, and traffic signals. Bright clear daylight with sharp shadows on the pavement. A man with closely cropped dark hair wearing a dark green bomber jacket over a white undershirt, dark jeans, and white sneakers stands completely still in the middle of the roadway, the man walks steadily along the asphalt roadway toward an intersection.",
+      "chunks": [
+        "The man stands completely still in the middle of the roadway.",
+        "The man walks steadily along the asphalt roadway toward an intersection.",
+        "The man walks steadily along the asphalt roadway toward an intersection.",
+        "The man walks steadily along the asphalt roadway toward an intersection."
+      ]
+    }
+  }
+}
