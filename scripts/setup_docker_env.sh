@@ -279,9 +279,20 @@ if [[ "${SKIP_TESTS:-0}" == "1" ]]; then
   echo "  $py -m pytest $here/proxy-extract/tests -q"
 else
   "$py" -m pytest "$here/proxy-extract/tests" -q || die "the test suite does not pass here.
-       Do not start a run on this node yet. If the failures are all in
-       test_depth_anything_v3.py the cause is a missing torch, which should be
-       impossible in this image. Re-run with SKIP_TESTS=1 to proceed anyway."
+       Do not start a run on this node yet. Two failures have a known meaning:
+
+         test_delivery.py, 'depth codes changed'
+           This node's ffmpeg or OpenCV is not carrying the depth codes
+           through unchanged. Find out which side, and whether the written
+           file or only the reader is at fault:
+             $py scripts/diagnose_depth_encode.py
+           SKIP_TESTS does not make this safe. If the encode is the lossy
+           side, every depth frame this node writes is quietly rescaled.
+
+         test_depth_anything_v3.py, all of them
+           A missing torch, which should be impossible in this image.
+
+       SKIP_TESTS=1 re-runs the install without the gate."
 fi
 
 cat <<EOF

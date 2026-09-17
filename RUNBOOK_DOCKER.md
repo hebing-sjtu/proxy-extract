@@ -51,12 +51,19 @@ torch 换成我们钉的版本，代价是丢掉 GPU 和 flash-attn，收益是�
 ## 2. 装（两个节点各做一遍）
 
 ```bash
+# 第一次：
 cd /workspace
 git clone https://github.com/hebing-sjtu/proxy-extract.git fastvideo_datapipe
 cd fastvideo_datapipe
 
+# 已经克隆过、要拿最新修复再装一遍：
+cd /workspace/fastvideo_datapipe && git pull
+
 scripts/setup_docker_env.sh --with-flicker
 ```
+
+装之前**先 `git pull`**。这个脚本重复执行是安全的（装过的不会再装），所以修好一个节点
+上的问题以后，两个节点都重跑一遍是最省事的做法。
 
 `--with-flicker` 会连 `moge3`（深度）和 `sam2`（语义）一起装；这两个是治闪烁的那对，
 都只有 git 源，不在 PyPI 上。只想先把管线本身跑通就不加这个参数。
@@ -224,6 +231,7 @@ make proxy-duv-audit                              # 第 8 节的验收检查
 | --- | --- |
 | `torch.cuda.is_available()` 变成 False | 有人装了别的 torch。第 1 节。`pip install --reinstall 'torch==2.12.0'` |
 | 每个 shard 都是同一个 ImportError | `moge`/`sam2` 没装。启动器有预检会先拦，见第 2 节 |
+| 装的时候 `test_delivery.py` 报 `depth codes changed` | 这个节点的 ffmpeg 或 OpenCV 没把深度码值原样带过去。跑 `python scripts/diagnose_depth_encode.py` 分清是**写坏了**（交付作废）还是**只是读错了**（文件没事）。不要用 `SKIP_TESTS` 绕过 |
 | 卡上全是 OOM | `WORKERS_PER_GPU` 太大。第 5 节 |
 | 全部 GPU 0% 占用、没有任何报错 | 叠了 worker 没限线程。`RUNBOOK.md` 第 3 节「线程」 |
 | 审计数目比 2000×5 少 | 双节点三条约定之一没对上。第 6 节 |
@@ -240,6 +248,9 @@ preflight 是遇到第一个问题就退（对启动器是对的：用错的环�
 # 一次性（每节点）
 cd /workspace && git clone https://github.com/hebing-sjtu/proxy-extract.git fastvideo_datapipe
 cd fastvideo_datapipe && scripts/setup_docker_env.sh --with-flicker
+
+# 重装 / 拿最新修复（每节点，可重复执行）
+cd /workspace/fastvideo_datapipe && git pull && scripts/setup_docker_env.sh --with-flicker
 python scripts/doctor.py
 export HF_HOME=/data/binghe/cache/huggingface
 python scripts/fetch_models.py --set flicker
