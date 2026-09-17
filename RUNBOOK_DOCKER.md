@@ -167,8 +167,35 @@ SAM 2 的 video predictor 会为每个 masklet 维护一份跨整段的记忆（
 nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv -l 5
 ```
 
-利用率没到顶而显存还有富余就往上加。**加过头的后果是有界的**：一个 worker 一个进程，
+利用率没到顶而显存还有富余就往上加。**加过头的后果是有界的**：一个 worker 一个进程,
 CUDA OOM 只杀一个 shard，重跑会从已经写好的片接着走。
+
+### 但显存往往不是上限
+
+看到 `60/140 GiB` 就加 worker 是最容易踩的一脚，因为先撑不住的通常是另外两样，而它们
+都不会给出干净的报错：
+
+**宿主内存。** 这条路线上一次调用就是一个窗口（不能切，见第 7 节），那一批彩色帧在内存里
+同时存在三份 —— 一份在算、两份被 prefetch 预读 —— 再加上由它导出的 float32 深度栈。128
+帧 1344×768 大约是 1.2 + 0.5 + 0.13 GiB，所以按**每 worker 2.5 GiB**估：
+
+| `WORKERS_PER_GPU` | 8 卡的 worker 数 | 约需宿主内存 |
+| --- | --- | --- |
+| 6 | 48 | 117 GiB |
+| 8 | 64 | 156 GiB |
+| 10 | 80 | 195 GiB |
+| 12 | 96 | 234 GiB |
+
+启动器现在会读 `/proc/meminfo` 的 `MemAvailable` 做预检，不够就拒绝启动并算给你上限;
+banner 里的 `memory` 一行是它的估算。量准了可以用 `MIB_PER_WORKER_RAM=` 覆盖。内存超卖
+不会干净地失败：它开始换页，所有 worker 一起变慢，显卡反而空着。
+
+**CPU 核数。** 每个 worker 都要在 CPU 上解 H.264 来喂自己的卡，`THREADS_PER_WORKER` 是
+`nproc / worker 数`（上限 4）。低于每 worker 一个核之后，worker 就是在排队等核，加得再多
+也不会更快 —— 而现象恰恰是显卡看起来更忙、总时间没变短，很容易被读成"还有余量"。低于
+这条线时启动器会提示。
+
+先用 `nproc` 和 `free -g` 把这两个天花板算出来，再决定加到多少。
 
 试跑完要看的三件事：
 

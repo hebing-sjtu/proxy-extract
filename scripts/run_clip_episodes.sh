@@ -97,6 +97,17 @@ if [[ -z "${THREADS_PER_WORKER:-}" ]]; then
   ((THREADS_PER_WORKER < 1)) && THREADS_PER_WORKER=1
   ((THREADS_PER_WORKER > 4)) && THREADS_PER_WORKER=4
 fi
+# The other ceiling on WORKERS_PER_GPU, and the one with no error message: every
+# worker decodes H.264 on the CPU to feed its GPU, so past one core each the
+# workers queue for cores instead of running. The cards then look busier while
+# finishing no faster, which reads as "there is still headroom" and invites
+# raising the count again.
+if ((cores < n_workers)); then
+  echo "note: $n_workers workers on $cores cores - under one core each, so the decode" >&2
+  echo "      side is now the limit and more workers will not finish sooner. GPU" >&2
+  echo "      memory being free is not evidence to the contrary." >&2
+  echo >&2
+fi
 export OMP_NUM_THREADS="$THREADS_PER_WORKER"
 export MKL_NUM_THREADS="$THREADS_PER_WORKER"
 export OPENBLAS_NUM_THREADS="$THREADS_PER_WORKER"
@@ -181,12 +192,49 @@ fi
 
 gib() { awk -v m="$1" 'BEGIN {printf "%.1f", m / 1024}'; }
 
+# Host memory, which is what actually limits WORKERS_PER_GPU on this route and
+# is easy to mistake for GPU memory. nvidia-smi showing the cards half empty
+# invites raising the worker count, and the cards are not the constraint: one
+# window is one batch - the depth backends lock the field of view and the metric
+# scale per call, so it cannot be split - and that batch is resident in RAM
+# three times over, once being worked on and twice prefetched, plus the float32
+# depth stack derived from it.
+#
+#   colour   FRAMES+halo frames x WORK_SIZE x 3 bytes, x3 for the prefetch queue
+#   depth    the same frame count as float32, x4 bytes
+#   labels   the same again as uint8
+#
+# At 128 frames of 1344x768 that is about 1.2 GiB + 0.5 + 0.13, so the default
+# allows 2 GiB a worker and rounds up for the models' host-side copies. An
+# over-subscribed node does not fail cleanly either: it starts swapping, every
+# worker slows together, and the GPUs go idle while the operator watches a
+# throughput number fall for no visible reason.
+MIB_PER_WORKER_RAM="${MIB_PER_WORKER_RAM:-2500}"
+
+ram_need_mib=$((n_workers * MIB_PER_WORKER_RAM))
+ram_avail_mib=""
+if [[ -r /proc/meminfo ]]; then
+  # MemAvailable rather than MemFree: the page cache is reclaimable, and on a
+  # node that has just decoded a corpus MemFree reads near zero regardless.
+  ram_avail_mib="$(awk '/^MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo)"
+fi
+if [[ -n "$ram_avail_mib" && "$ram_avail_mib" -lt "$ram_need_mib" ]]; then
+  die "this node has $(gib "$ram_avail_mib") GiB of memory available but $n_workers workers
+       need about $(gib "$ram_need_mib") GiB - one $((FRAMES + 4))-frame window each, held three
+       times over for the prefetch, plus the depth stack.
+
+       GPU memory is not the limit here; host memory is. Lower WORKERS_PER_GPU
+       (currently $WORKERS_PER_GPU on $N_GPUS GPU(s)) to at most $((ram_avail_mib / MIB_PER_WORKER_RAM / N_GPUS)), or override the
+       estimate with MIB_PER_WORKER_RAM if you have measured it on this node."
+fi
+
 cat <<EOF
 data       $DATA_DIR ($episodes episodes${LIMIT:+, limited})
 clips      $CLIPS_DIR ($clips clips at ~$mib_per_clip MiB, $(gib "$avail_mib") GiB free, need ~$(gib "$need_mib") GiB)
 shape      $PER_SCENE x $FRAMES frames at $FPS fps, models at $WORK_SIZE
 shards     $shard_base..$((shard_base + n_workers - 1)) of $n_shards ($N_GPUS GPU(s) x $WORKERS_PER_GPU worker(s), node $NODE_RANK of $NODE_COUNT)
 threads    $THREADS_PER_WORKER per worker, of $cores core(s)
+memory     ~$(gib "$ram_need_mib") GiB needed${ram_avail_mib:+, $(gib "$ram_avail_mib") GiB available}
 backends   semantic=$SEMANTIC depth=$DEPTH refiner=$REFINER proxy_duv=$PROXY_DUV
 
 EOF
