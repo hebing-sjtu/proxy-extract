@@ -106,7 +106,8 @@ python scripts/doctor.py
 | 项 | 要求 |
 | --- | --- |
 | `proxy_extract` 能否导入 | ok |
-| ffmpeg | ok（镜像有 `imageio-ffmpeg`，够用） |
+| ffmpeg | ok |
+| `depth encode` | **ok（bit-exact）**，见下 |
 | torch / cuda available | ok，且 **2.12.0+cu126** |
 | `moge3 (depth flicker)` | ok（装了 `--with-flicker` 的话） |
 | `sam2 (semantic flicker)` | ok（同上） |
@@ -114,6 +115,23 @@ python scripts/doctor.py
 
 `moge3` 那行如果说 macOS 不支持，说明 `DATA_DIR`/脚本被在本地跑了 —— 在这个镜像里不会
 出现，MoGe-3 的 FlexGEMM 依赖 Triton，Triton 没有 macOS wheel，但 Linux 上没这个问题。
+
+### `depth encode` 这行是干什么的
+
+这个镜像的 `/usr/bin/ffmpeg` 是 Ubuntu 22.04 的 **4.4.2**，它写深度时有个会安静毁数据的
+毛病。深度码值是「装成像素的数字」，x264 不吃 `gray`，所以码值被放进亮度平面；这只有在
+文件**标明是全范围**时才可逆。ffmpeg 7/8 会写成 `yuvj420p` 并打上 `pc` 标记，4.4.2 写的
+是 `yuv420p` 且 `color_range=unknown` —— 存进去的码值其实没动，但没人知道这件事，于是任何
+解码器都按有限范围把 16..235 拉回 0..255，两端截断、码值合并。**产出看起来完全正常，而每
+一个深度值都是错的。**
+
+所以现在深度那条流不再依赖默认行为：格式明确写成 `yuvj420p` 并显式带 `-color_range pc`。
+更要紧的是加了一道运行时闸门 —— 真正编码前会用一张含全部 256 个码值的测试帧过一遍这台机
+器上的 ffmpeg，读回来不是逐位相同就不用它。`/usr/bin/ffmpeg` 过不了的话会自动改用
+`imageio-ffmpeg` 自带的 7.1（镜像里就有，已验证没问题），并在 stderr 说明换了；如果一个都
+过不了，它会**拒绝编码**而不是交付被缩放过的深度。
+
+`$FFMPEG` 是例外：你显式指名的二进制不会被悄悄替换掉，过不了闸门就直接报错。
 
 ## 4. 拉权重（两个节点各做一遍）
 
@@ -231,7 +249,9 @@ make proxy-duv-audit                              # 第 8 节的验收检查
 | --- | --- |
 | `torch.cuda.is_available()` 变成 False | 有人装了别的 torch。第 1 节。`pip install --reinstall 'torch==2.12.0'` |
 | 每个 shard 都是同一个 ImportError | `moge`/`sam2` 没装。启动器有预检会先拦，见第 2 节 |
-| 装的时候 `test_delivery.py` 报 `depth codes changed` | 这个节点的 ffmpeg 或 OpenCV 没把深度码值原样带过去。跑 `python scripts/diagnose_depth_encode.py` 分清是**写坏了**（交付作废）还是**只是读错了**（文件没事）。不要用 `SKIP_TESTS` 绕过 |
+| 装的时候 `test_delivery.py` 报 `depth codes changed` | 系统 ffmpeg 4.4.2 丢了全范围标记。已修（第 3 节「`depth encode`」）；`git pull` 后重跑。细节用 `python scripts/diagnose_depth_encode.py` |
+| stderr 出现 `not using the ffmpeg from PATH` | 正常，闸门在绕开 4.4.2 改用 7.1。不用管 |
+| `Refusing to encode` / `depth encode` FAIL | 这台机器没有一个能用的 ffmpeg。`pip install imageio-ffmpeg` 或 `export FFMPEG=` 指一个 7 以上的 |
 | 卡上全是 OOM | `WORKERS_PER_GPU` 太大。第 5 节 |
 | 全部 GPU 0% 占用、没有任何报错 | 叠了 worker 没限线程。`RUNBOOK.md` 第 3 节「线程」 |
 | 审计数目比 2000×5 少 | 双节点三条约定之一没对上。第 6 节 |

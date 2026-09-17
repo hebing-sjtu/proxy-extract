@@ -57,8 +57,10 @@ def describe(want: np.ndarray, got: np.ndarray) -> str:
     total = want.size
     worst = int(np.abs(want.astype(int) - got.astype(int)).max())
     lines = [
-        f"CHANGED: {changed}/{total} pixels ({100.0 * changed / total:.1f}%), "
-        f"largest error {worst}",
+        (
+            f"CHANGED: {changed}/{total} pixels ({100.0 * changed / total:.1f}%), "
+            f"largest error {worst}"
+        ),
         f"  input  range {int(want.min())}..{int(want.max())}",
         f"  output range {int(got.min())}..{int(got.max())}",
     ]
@@ -104,7 +106,7 @@ def main() -> int:
 
     binary = proxy.ffmpeg_binary()
     version = subprocess.run(
-        [binary, "-version"], capture_output=True, text=True
+        [binary, "-version"], capture_output=True, text=True, check=False
     ).stdout.splitlines()
     print("=== the tools ===")
     print(f"ffmpeg binary  {binary}")
@@ -146,7 +148,7 @@ def main() -> int:
                         "-show_entries", "stream=pix_fmt,color_range,color_space",
                         "-of", "default=noprint_wrappers=1", str(path),
                     ],
-                    capture_output=True, text=True,
+                    capture_output=True, text=True, check=False,
                 )
                 break
             except (FileNotFoundError, PermissionError):
@@ -171,6 +173,7 @@ def main() -> int:
                 "-f", "rawvideo", "-pix_fmt", "gray", "-",
             ],
             capture_output=True,
+            check=False,
         )
         if raw.returncode != 0:
             print(f"  ffmpeg failed to decode: {raw.stderr.decode(errors='replace')[:400]}")

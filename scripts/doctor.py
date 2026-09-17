@@ -92,6 +92,52 @@ def check_ffmpeg() -> Result:
     return Result("ffmpeg", "ok", f"{binary}{' (bundled)' if bundled else ''}")
 
 
+def check_depth_encode() -> Result:
+    """Can the ffmpeg that will write depth read its own codes back?
+
+    Separate from `check_ffmpeg` because "ffmpeg exists" and "ffmpeg can carry
+    a depth code" turned out to be different questions. Ubuntu 22.04's 4.4.2
+    writes the depth plane with no range tag, so every reader expands the codes
+    and the result is a depth video that looks right and is wrong throughout.
+    Cheap to ask here, and the answer decides whether a run is worth starting.
+    """
+    try:
+        from proxy_extract.proxy import (
+            EncodeError,
+            carries_depth_codes,
+            delivery_ffmpeg,
+        )
+    except ImportError:
+        return Result("depth encode", "fail", "proxy_extract not importable", "fix proxy_extract first")
+    try:
+        binary = delivery_ffmpeg("depth")
+    except EncodeError as error:
+        return Result(
+            "depth encode",
+            "fail",
+            str(error).splitlines()[0],
+            "pip install imageio-ffmpeg, then python scripts/diagnose_depth_encode.py",
+        )
+    except Exception as error:  # never let a diagnostic crash the doctor
+        return Result("depth encode", "warn", str(error).splitlines()[0], "")
+    ok, detail = carries_depth_codes(binary)
+    if not ok:
+        return Result("depth encode", "fail", detail, "python scripts/diagnose_depth_encode.py")
+    chosen = ""
+    if binary != _quiet_ffmpeg_binary():
+        chosen = f" (not the one on PATH, which cannot: {_quiet_ffmpeg_binary()})"
+    return Result("depth encode", "ok", f"bit-exact through {binary}{chosen}")
+
+
+def _quiet_ffmpeg_binary() -> str:
+    try:
+        from proxy_extract.proxy import ffmpeg_binary
+
+        return ffmpeg_binary()
+    except Exception:
+        return "?"
+
+
 def check_torch() -> list[Result]:
     if not _installed("torch"):
         return [Result("torch", "fail", "not installed", "EXTRAS=full scripts/setup_venv.sh")]
@@ -470,7 +516,7 @@ def check_conflicting_pins() -> list[Result]:
 
 
 def main() -> int:
-    results: list[Result] = [check_python(), check_package(), check_ffmpeg()]
+    results: list[Result] = [check_python(), check_package(), check_ffmpeg(), check_depth_encode()]
     results += check_torch()
     audio = check_torchaudio()
     if audio:

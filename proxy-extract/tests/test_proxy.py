@@ -248,3 +248,89 @@ def test_the_resolved_binary_is_what_actually_gets_executed(monkeypatch, tmp_pat
     monkeypatch.setenv("FFMPEG", "/definitely/not/here/ffmpeg")
     with pytest.raises(proxy.EncodeError, match="check .FFMPEG"):
         proxy.open_encoder(tmp_path / "x.mp4", 16, 16, 24.0, kind="depth")
+
+
+def _ffmpeg_that_drops_the_range_tag(tmp_path):
+    """A stand-in for Ubuntu 22.04's ffmpeg 4.4.2.
+
+    That build takes the request for a full-range depth plane and writes plain
+    `yuv420p` with `color_range=unknown`, which leaves every decoder to expand
+    16..235 back over 0..255. It cannot be installed next to a modern one just
+    to be tested, so the one behaviour that matters is reproduced by rewriting
+    the arguments on their way to a real ffmpeg.
+    """
+    real = shutil.which("ffmpeg")
+    if not real:
+        pytest.skip("needs a real ffmpeg to delegate to")
+    script = tmp_path / "ffmpeg-4.4.2"
+    script.write_text(
+        "#!/usr/bin/env bash\nargs=()\nfor a in \"$@\"; do\n"
+        '  case "$a" in\n'
+        "    yuvj420p) args+=(yuv420p) ;;\n"
+        "    pc) args+=(unspecified) ;;\n"
+        '    *) args+=("$a") ;;\n'
+        "  esac\ndone\n"
+        f'exec {real} "${{args[@]}}"\n'
+    )
+    script.chmod(0o755)
+    return str(script)
+
+
+def test_an_ffmpeg_that_loses_the_range_tag_is_caught(tmp_path):
+    """The whole point: this failure is invisible in the output itself."""
+    pretender = _ffmpeg_that_drops_the_range_tag(tmp_path)
+    ok, detail = proxy.carries_depth_codes(pretender)
+    assert not ok
+    assert "depth codes came back changed" in detail
+
+
+def test_a_working_ffmpeg_passes_the_same_check(tmp_path):
+    real = shutil.which("ffmpeg") or pytest.importorskip("imageio_ffmpeg").get_ffmpeg_exe()
+    ok, detail = proxy.carries_depth_codes(real)
+    assert ok, detail
+
+
+def test_depth_falls_back_past_a_system_ffmpeg_that_cannot_carry_the_codes(
+    monkeypatch, tmp_path, capsys
+):
+    """The FastVideo image is exactly this: a broken 4.4.2 in front of a good 7.1."""
+    monkeypatch.delenv("FFMPEG", raising=False)
+    good = pytest.importorskip("imageio_ffmpeg").get_ffmpeg_exe()
+    bad = _ffmpeg_that_drops_the_range_tag(tmp_path)
+    monkeypatch.setattr(proxy, "_ffmpeg_candidates", lambda: [("PATH", bad), ("imageio", good)])
+
+    assert proxy.delivery_ffmpeg("depth") == good
+    assert "not using the ffmpeg from PATH" in capsys.readouterr().err
+
+
+def test_no_usable_ffmpeg_for_depth_refuses_rather_than_delivering_rescaled_codes(
+    monkeypatch, tmp_path
+):
+    monkeypatch.delenv("FFMPEG", raising=False)
+    bad = _ffmpeg_that_drops_the_range_tag(tmp_path)
+    monkeypatch.setattr(proxy, "_ffmpeg_candidates", lambda: [("PATH", bad)])
+
+    with pytest.raises(proxy.EncodeError) as caught:
+        proxy.delivery_ffmpeg("depth")
+    message = str(caught.value)
+    assert "Refusing to encode" in message
+    assert "pip install imageio-ffmpeg" in message
+
+
+def test_an_explicitly_named_ffmpeg_is_not_silently_replaced(monkeypatch, tmp_path):
+    """Naming a binary and getting a different one is its own kind of surprise."""
+    bad = _ffmpeg_that_drops_the_range_tag(tmp_path)
+    monkeypatch.setenv("FFMPEG", bad)
+
+    with pytest.raises(proxy.EncodeError, match=r"\$FFMPEG points at"):
+        proxy.delivery_ffmpeg("depth")
+
+
+def test_the_other_streams_are_not_gated_on_the_depth_check(monkeypatch):
+    """`libx264rgb` has no range to get wrong, so this check does not apply."""
+    monkeypatch.delenv("FFMPEG", raising=False)
+    monkeypatch.setattr(
+        proxy, "carries_depth_codes", lambda binary: pytest.fail("should not be probed")
+    )
+    for kind in ("semantic", "proxy", "color"):
+        assert proxy.delivery_ffmpeg(kind) == proxy.ffmpeg_binary()

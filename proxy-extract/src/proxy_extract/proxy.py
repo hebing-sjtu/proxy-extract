@@ -21,11 +21,14 @@ ffmpeg does the writing because OpenCV's VideoWriter cannot ask for
 
 from __future__ import annotations
 
+import functools
 import json
 import math
 import os
 import shutil
 import subprocess
+import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -222,10 +225,35 @@ class _Encoder:
 # would convert to YUV and subsample neighbouring IDs into classes that were
 # never predicted.
 _STREAM_FORMATS: dict[str, tuple[str, str, str]] = {
-    "depth": ("gray", "libx264", "gray"),
+    "depth": ("gray", "libx264", "yuvj420p"),
     "semantic": ("rgb24", "libx264rgb", "rgb24"),
     "proxy": ("rgb24", "libx264rgb", "rgb24"),
     "color": ("rgb24", "libx264", "yuv420p"),
+}
+
+# Extra arguments a stream needs on top of codec and pixel format.
+#
+# Depth is the one that needs them, and the reason is worth stating because it
+# cost a node's worth of debugging. x264 cannot take `gray`, so ffmpeg carries
+# the codes in a luma plane. That is only reversible if the file says the plane
+# is *full* range - without the tag, every decoder assumes limited and expands
+# 16..235 out to 0..255, clipping both ends and collapsing codes.
+#
+# Which tag gets written turned out to be version-dependent. ffmpeg 7 and 8 ask
+# for `gray`, quietly pick `yuvj420p` and tag it `pc`, so the round trip is
+# exact. Ubuntu 22.04's ffmpeg 4.4.2 writes plain `yuv420p` with
+# `color_range=unknown` - the stored codes are untouched, but nothing can know
+# that, so reading it back expands every one of them. So the format is now
+# named explicitly (`yuvj420p` *is* full range, by definition) and the range is
+# stated as well, rather than relying on a default that moved between versions.
+_STREAM_EXTRA_OUTPUT_ARGS: dict[str, tuple[str, ...]] = {
+    "depth": ("-color_range", "pc"),
+}
+
+# And the same claim about the input, so no build is left to guess whether the
+# raw `gray` it is being fed is full range and "helpfully" rescale it.
+_STREAM_EXTRA_INPUT_ARGS: dict[str, tuple[str, ...]] = {
+    "depth": ("-color_range", "pc"),
 }
 
 LOSSLESS_CRF = 0
@@ -266,22 +294,190 @@ def ffmpeg_binary() -> str:
         ) from None
 
 
-def open_encoder(
-    path: Path, width: int, height: int, fps: float, *, kind: str, crf: int | None = None
-) -> _Encoder:
-    """Start an ffmpeg process writing one delivery stream, at any resolution."""
-    if kind not in _STREAM_FORMATS:
-        raise EncodeError(f"unknown stream kind {kind!r}; expected one of {sorted(_STREAM_FORMATS)}")
-    in_pix_fmt, codec, out_pix_fmt = _STREAM_FORMATS[kind]
-    if crf is None:
-        crf = DEFAULT_COLOR_CRF if kind == "color" else LOSSLESS_CRF
+def _ffmpeg_candidates() -> list[tuple[str, str]]:
+    """The ffmpegs this node may choose between, best first, as (source, path).
 
+    `$FFMPEG` is deliberately absent: it is an instruction, not a candidate.
+    """
+    candidates: list[tuple[str, str]] = []
+    found = shutil.which("ffmpeg")
+    if found:
+        candidates.append(("PATH", found))
+    try:
+        import imageio_ffmpeg
+
+        candidates.append(("imageio-ffmpeg", imageio_ffmpeg.get_ffmpeg_exe()))
+    except (ImportError, RuntimeError):
+        pass
+    return candidates
+
+
+def depth_staircase(height: int = 128, width: int = 64) -> np.ndarray:
+    """A frame containing all 256 depth codes, in horizontal bands."""
+    frame = np.zeros((height, width), np.uint8)
+    for code in range(256):
+        frame[(code * height) // 256 : ((code + 1) * height) // 256, :] = code
+    return frame
+
+
+@functools.lru_cache(maxsize=8)
+def carries_depth_codes(binary: str) -> tuple[bool, str]:
+    """Whether this ffmpeg can write depth codes and read them back unchanged.
+
+    Depth is a number wearing a pixel's clothing, and the failure this guards
+    against is silent: a build that drops the full-range tag stores the codes
+    intact but leaves every reader to expand 16..235 back over 0..255. The
+    output looks like depth, passes every structural check, and is wrong
+    everywhere. So the capability is measured on this node, with this build,
+    using the real encode command - not assumed from a version number.
+
+    Cached per binary because it costs an encode, and a node does not grow a
+    new ffmpeg mid-run.
+    """
+    frame = depth_staircase()
+    height, width = frame.shape
+    with tempfile.TemporaryDirectory() as scratch:
+        path = Path(scratch) / "probe.mp4"
+        command = _encode_command(
+            binary, path, width, height, 30.0, kind="depth", crf=LOSSLESS_CRF
+        )
+        try:
+            writer = subprocess.Popen(
+                command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+            )
+        except (FileNotFoundError, PermissionError) as exc:
+            return False, f"cannot execute it ({exc.__class__.__name__})"
+        assert writer.stdin is not None
+        try:
+            # A handful of frames: one would let an encoder pass on a keyframe
+            # alone, and inter-coded frames are where a range mistake compounds.
+            for _ in range(4):
+                writer.stdin.write(frame.tobytes())
+            writer.stdin.close()
+        except BrokenPipeError:
+            pass
+        if writer.wait() != 0:
+            stderr = writer.stderr.read().decode(errors="replace") if writer.stderr else ""
+            return False, f"the encode failed: {stderr.strip().splitlines()[-1] if stderr.strip() else 'no output'}"
+
+        read = subprocess.run(
+            [binary, "-v", "error", "-i", str(path), "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+            capture_output=True,
+            check=False,
+        )
+        if read.returncode != 0:
+            return False, "it could not decode its own output"
+        decoded = np.frombuffer(read.stdout, np.uint8)
+        if decoded.size < frame.size:
+            return False, f"it read back {decoded.size} bytes of an expected {frame.size}"
+        first = decoded[: frame.size].reshape(frame.shape)
+        if np.array_equal(first, frame):
+            return True, "depth codes survive the round trip"
+        moved = int(np.count_nonzero(first != frame))
+        worst = int(np.abs(first.astype(int) - frame.astype(int)).max())
+        return False, (
+            f"{moved} of {frame.size} depth codes came back changed, by up to {worst}. "
+            "Run scripts/diagnose_depth_encode.py for the full picture"
+        )
+
+
+def delivery_ffmpeg(kind: str = "color") -> str:
+    """The ffmpeg to encode `kind` with, checked when the check matters.
+
+    For depth this is not simply the first ffmpeg on PATH. Ubuntu 22.04 ships
+    4.4.2, which writes the depth plane without a range tag, and a node running
+    the FastVideo image has exactly that in front of the working build that
+    `imageio-ffmpeg` vendors. Picking by position would hand that node a whole
+    corpus of rescaled depth, so the candidates are tried in order of
+    preference and the first one that can actually carry the codes wins.
+
+    Every other stream keeps the old behaviour: `semantic` and `proxy` go
+    through `libx264rgb`, where there is no range to get wrong, and `color` is
+    a photograph.
+    """
+    if kind != "depth":
+        return ffmpeg_binary()
+
+    override = os.environ.get("FFMPEG")
+    if override:
+        # An operator who names a binary gets that binary. Quietly using a
+        # different one would be the same class of surprise this function
+        # exists to prevent, so a bad `$FFMPEG` is an error rather than a
+        # fallback. A path that does not exist at all is left to
+        # `open_encoder`, whose "check $FFMPEG" is the clearer message for it.
+        if not os.access(shutil.which(override) or override, os.X_OK):
+            return override
+        ok, detail = carries_depth_codes(override)
+        if ok:
+            return override
+        raise EncodeError(
+            f"$FFMPEG points at {override}, and it changes the depth codes: {detail}.\n"
+            "That is not something to work around - a depth video with rescaled codes\n"
+            "looks exactly like a good one. Either point $FFMPEG at a build that works\n"
+            "(ffmpeg 7 or newer), or unset it and let this pick one."
+        )
+
+    candidates = _ffmpeg_candidates()
+    if not candidates:
+        ffmpeg_binary()  # raises with the install instructions
+    rejected = []
+    for source, binary in candidates:
+        ok, detail = carries_depth_codes(binary)
+        if ok:
+            if rejected:
+                first_source, first_binary, first_detail = rejected[0]
+                print(
+                    f"note: not using the ffmpeg from {first_source} ({first_binary}) for "
+                    f"depth - {first_detail}.\n"
+                    f"      using {binary} from {source} instead, which round-trips cleanly.",
+                    file=sys.stderr,
+                )
+            return binary
+        rejected.append((source, binary, detail))
+
+    lines = [
+        "no ffmpeg on this node can write depth without changing the codes, and a",
+        "depth video with rescaled codes is indistinguishable from a good one.",
+        "Refusing to encode rather than delivering that. Tried:",
+    ]
+    lines += [f"  {source:15} {binary}\n  {'':15} {detail}" for source, binary, detail in rejected]
+    lines += [
+        "",
+        "The usual cause is an old system ffmpeg: 4.4.2 omits the full-range tag that",
+        "makes the grey depth plane reversible. The fix needs no root:",
+        "  pip install imageio-ffmpeg     # vendors a 7.1 build that works",
+        "or point at a newer one directly:",
+        "  export FFMPEG=/path/to/ffmpeg",
+        "Then confirm with:  python scripts/diagnose_depth_encode.py",
+    ]
+    raise EncodeError("\n".join(lines))
+
+
+def _encode_command(
+    binary: str,
+    path: Path,
+    width: int,
+    height: int,
+    fps: float,
+    *,
+    kind: str,
+    crf: int,
+    threads: int | None = None,
+) -> list[str]:
+    """The exact ffmpeg invocation for one delivery stream.
+
+    Split out from `open_encoder` so `carries_depth_codes` can check the real
+    command rather than an approximation of it - a probe that tests different
+    arguments to the ones used in anger proves nothing.
+    """
+    in_pix_fmt, codec, out_pix_fmt = _STREAM_FORMATS[kind]
     command = [
-        ffmpeg_binary(),
+        binary,
         "-hide_banner",
         "-loglevel",
         "error",
         "-y",
+        *_STREAM_EXTRA_INPUT_ARGS.get(kind, ()),
         "-f",
         "rawvideo",
         "-pix_fmt",
@@ -297,17 +493,39 @@ def open_encoder(
         codec,
         "-crf",
         str(crf),
+        *_STREAM_EXTRA_OUTPUT_ARGS.get(kind, ()),
         "-pix_fmt",
         out_pix_fmt,
-        str(path),
     ]
     # x264 sizes its own pool at about 1.5x the core count, which is right for
     # one encode on an idle machine and catastrophic for sixty-four of them on
     # a shared one. Left alone when no budget is set, so an interactive encode
     # still gets the whole machine.
-    threads = accel.thread_budget()
     if threads:
-        command[-1:-1] = ["-threads", str(threads)]
+        command += ["-threads", str(threads)]
+    command.append(str(path))
+    return command
+
+
+def open_encoder(
+    path: Path, width: int, height: int, fps: float, *, kind: str, crf: int | None = None
+) -> _Encoder:
+    """Start an ffmpeg process writing one delivery stream, at any resolution."""
+    if kind not in _STREAM_FORMATS:
+        raise EncodeError(f"unknown stream kind {kind!r}; expected one of {sorted(_STREAM_FORMATS)}")
+    if crf is None:
+        crf = DEFAULT_COLOR_CRF if kind == "color" else LOSSLESS_CRF
+
+    command = _encode_command(
+        delivery_ffmpeg(kind),
+        path,
+        width,
+        height,
+        fps,
+        kind=kind,
+        crf=crf,
+        threads=accel.thread_budget(),
+    )
     try:
         process = subprocess.Popen(
             command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE

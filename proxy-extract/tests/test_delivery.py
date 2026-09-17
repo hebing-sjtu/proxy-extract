@@ -150,11 +150,13 @@ def test_depth_round_trips_within_the_quantiser_step(scene):
 def test_depth_codes_survive_the_gray_encode_bit_exactly(tmp_path):
     """Every one of the 256 codes has to come back unchanged.
 
-    ffmpeg does not hand `gray` to x264 as-is; it converts to `yuvj420p` and
-    carries the values in the luma plane. That is only lossless because `yuvj`
-    is *full range*, so 0..255 maps one-to-one. Plain `yuv420p` would compress
-    them into 16..235 and quantise, silently corrupting depth everywhere - so
-    this pins the behaviour rather than trusting the conversion.
+    x264 cannot take `gray`, so the codes ride in a luma plane. That is only
+    reversible while the plane is *full range*, where 0..255 maps one-to-one;
+    an untagged `yuv420p` leaves every decoder to expand 16..235 back over
+    0..255, clipping both ends and collapsing codes. Which of those you get
+    was a default that moved between ffmpeg versions, which is why the encode
+    now names `yuvj420p` and `-color_range pc` outright - and why this test
+    checks the round trip on the build at hand instead of trusting either.
     """
     import cv2
 
