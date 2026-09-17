@@ -43,15 +43,18 @@ def staircase(shift: int = 0) -> np.ndarray:
     return frame
 
 
-def describe(want: np.ndarray, got: np.ndarray) -> str:
+def describe(want: np.ndarray, got: np.ndarray) -> tuple[str, str]:
     """Say *how* the codes moved, not just that they did.
 
     The shape of the damage is the diagnosis: a limited-range squeeze maps 0 to
     16 and 255 to 235 and is linear in between, which is a completely different
     finding from a couple of codes off by one at a block boundary.
+
+    Returns the report and a one-word kind - `exact`, `squeeze`, `expansion` or
+    `other` - because the verdict at the end turns on which one it is.
     """
     if np.array_equal(want, got):
-        return "bit-exact"
+        return "bit-exact", "exact"
 
     changed = int(np.count_nonzero(want != got))
     total = want.size
@@ -79,6 +82,7 @@ def describe(want: np.ndarray, got: np.ndarray) -> str:
     interior = (y > 1) & (y < 254)
     if interior.sum() >= 64:
         x, y = x[interior], y[interior]
+    kind = "other"
     if np.ptp(x) > 0:
         gain, offset = np.polyfit(x, y, 1)
         residual = float(np.abs(y - (gain * x + offset)).max())
@@ -87,17 +91,20 @@ def describe(want: np.ndarray, got: np.ndarray) -> str:
             limited_to_full = 255.0 / (235.0 - 16.0)  # ~1.164
             full_to_limited = 1.0 / limited_to_full  # ~0.859
             if abs(gain - full_to_limited) < 0.02:
+                kind = "squeeze"
                 lines.append(
                     "    That gain is a FULL->LIMITED squeeze (0..255 into 16..235).\n"
-                    "    Depth codes have been quantised away and cannot be recovered."
+                    "    Codes were quantised on the way in and are not recoverable."
                 )
             elif abs(gain - limited_to_full) < 0.02:
+                kind = "expansion"
                 lines.append(
-                    "    That gain is a LIMITED->FULL expansion: something read this\n"
-                    "    full-range file as if it were limited range, and clipped both\n"
-                    "    ends. The stored codes are fine; the reader is wrong."
+                    "    That gain is a LIMITED->FULL expansion, and it is one-way: a\n"
+                    "    squeeze followed by an expansion would land back near 1.0. So\n"
+                    "    the codes went in untouched and the file simply never said the\n"
+                    "    plane was full range, leaving every reader to expand them."
                 )
-    return "\n".join(lines)
+    return "\n".join(lines), kind
 
 
 def main() -> int:
@@ -124,10 +131,26 @@ def main() -> int:
 
     with TemporaryDirectory() as scratch:
         path = Path(scratch) / "depth.mp4"
-        encoder = proxy.open_encoder(path, WIDTH, HEIGHT, 30.0, kind="depth")
-        for frame in frames:
-            encoder.write(frame)
-        encoder.close()
+        # Driven straight at this binary rather than through `open_encoder`,
+        # which now refuses a build that fails this very check. A diagnostic
+        # that cannot run on a broken node is no diagnostic at all - and the
+        # question here is what *this* ffmpeg does, not which one the pipeline
+        # would pick instead. The command is still the real one.
+        command = proxy._encode_command(
+            binary, path, WIDTH, HEIGHT, 30.0, kind="depth", crf=proxy.LOSSLESS_CRF
+        )
+        writer = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert writer.stdin is not None
+        try:
+            for frame in frames:
+                writer.stdin.write(frame.tobytes())
+            writer.stdin.close()
+        except BrokenPipeError:
+            pass
+        if writer.wait() != 0:
+            stderr = writer.stderr.read().decode(errors="replace") if writer.stderr else ""
+            print(f"\nthe encode itself failed:\n{stderr.strip()[:600]}")
+            return 1
 
         print("\n=== what was written ===")
         # The sibling of the ffmpeg that wrote the file, so the report describes
@@ -185,9 +208,10 @@ def main() -> int:
             return 1
         decoded = decoded.reshape(FRAMES, HEIGHT, WIDTH)
         ffmpeg_ok = True
+        ffmpeg_kind = "exact"
         for index, (want, got) in enumerate(zip(frames, decoded)):
-            verdict = describe(want, got)
-            if verdict != "bit-exact":
+            verdict, ffmpeg_kind = describe(want, got)
+            if ffmpeg_kind != "exact":
                 ffmpeg_ok = False
                 print(f"  frame {index}: {verdict}")
                 break
@@ -210,8 +234,8 @@ def main() -> int:
         if not cv2_ok:
             print(f"  read {len(read)} frames, expected {FRAMES}")
         for index, (want, got) in enumerate(zip(frames, read)):
-            verdict = describe(want, got)
-            if verdict != "bit-exact":
+            verdict, kind = describe(want, got)
+            if kind != "exact":
                 cv2_ok = False
                 print(f"  frame {index}: {verdict}")
                 break
@@ -224,10 +248,22 @@ def main() -> int:
         return 0
     if not ffmpeg_ok:
         print(
-            "THE ENCODE IS LOSSY. Do not run a delivery on this node: depth.mp4\n"
-            "would carry rescaled codes, which no downstream check can detect.\n"
-            "Report the `what was written` block above."
+            "THE WRITTEN FILE IS WRONG, so this is the encode side. A depth.mp4\n"
+            "written here reads back rescaled, and nothing downstream can detect it."
         )
+        if ffmpeg_kind == "expansion":
+            print(
+                "\nThe codes themselves went in intact - what is missing is the tag\n"
+                "saying the plane is full range, which is what Ubuntu 22.04's ffmpeg\n"
+                "4.4.2 omits. proxy-extract now states the range explicitly and, more\n"
+                "to the point, refuses to use an ffmpeg that fails this check: it will\n"
+                "fall back to the 7.1 build imageio-ffmpeg vendors. If you are seeing\n"
+                "this, `git pull` and re-run - or force it yourself:\n"
+                "  export FFMPEG=$(python -c "
+                "'import imageio_ffmpeg;print(imageio_ffmpeg.get_ffmpeg_exe())')"
+            )
+        else:
+            print("\nReport the `what was written` block above.")
         return 1
     print(
         "The FILE is correct and only this node's OpenCV misreads it.\n"
