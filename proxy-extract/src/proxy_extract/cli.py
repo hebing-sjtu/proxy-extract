@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import traceback
 from pathlib import Path
 
 from . import accel
@@ -290,7 +291,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--semantic-backend-option", action="append", default=[], metavar="KEY=VALUE"
     )
     episodes.add_argument("--refiner", choices=REFINERS, default="none")
-    episodes.add_argument("--chunk-frames", type=int, default=None, metavar="N")
+    episodes.add_argument(
+        "--chunk-frames", type=int, default=None, metavar="N",
+        help="frames handed to the models at a time. Unset, and by default, one window "
+        "is one batch, which is what the depth backends want: MoGe-3 solves the field of "
+        "view and levels the metric scale per call, so splitting a window puts a step in "
+        "the depth at the seam. Set it only to fit a smaller GPU, and expect that step",
+    )
     episodes.add_argument("--color-crf", type=int, default=None, metavar="N")
     episodes.add_argument("--temporal-radius", type=int, default=DEFAULT_RADIUS)
     episodes.add_argument("--temporal-min-run", type=int, default=DEFAULT_MIN_RUN, metavar="N")
@@ -407,6 +414,49 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 VIDEO_SUFFIXES = (".mp4", ".mov", ".mkv", ".webm")
+
+
+# The pipeline's own way of saying "this input cannot be processed". Anything
+# else reaching the per-item handler is a bug in this code, and the two want
+# reporting differently.
+def _expected_failure(error: BaseException) -> bool:
+    from .clips import ClipError
+    from .contract import ContractError
+    from .delivery import DeliveryError
+    from .proxy import EncodeError
+    from .proxy_duv import ProxyDuvError
+
+    return isinstance(error, ClipError | ContractError | DeliveryError | EncodeError | ProxyDuvError)
+
+
+def report_item_failure(name: str, error: BaseException) -> None:
+    """Print one failed episode or segment in a way that can be acted on.
+
+    `--keep-going` exists so one bad input cannot end a shard of hundreds, but
+    it used to reduce every failure to `error: seg_000000: <message>`. For the
+    pipeline's own errors that is the right amount - they are written to be
+    read. For a `TypeError` from somewhere in the middle of inference it is
+    close to useless: it names neither the type nor a single line of code, and
+    the same message repeated two thousand times is what a shard log becomes.
+
+    So an unexpected exception gets its type and its traceback. It is a bug,
+    the shard is probably failing on every item for the same reason, and the
+    traceback is the whole difference between fixing it and guessing.
+    """
+    if _expected_failure(error):
+        print(f"error: {name}: {error}", file=sys.stderr)
+        return
+    print(f"error: {name}: {type(error).__name__}: {error}", file=sys.stderr)
+    print(
+        "".join(traceback.format_exception(type(error), error, error.__traceback__)).rstrip(),
+        file=sys.stderr,
+    )
+    print(
+        "       ^ that is a traceback rather than a message about your data, which\n"
+        "         means it is a bug in proxy-extract. Every item in this shard will\n"
+        "         probably fail the same way.",
+        file=sys.stderr,
+    )
 
 
 def parse_backend_options(pairs: list[str]) -> dict:
@@ -705,7 +755,7 @@ def _run_clips(args: argparse.Namespace) -> int:
             if not args.keep_going:
                 raise
             failed += 1
-            print(f"error: {scene}: {error}", file=sys.stderr)
+            report_item_failure(scene, error)
 
     # Every shard writes a manifest, so the name has to carry the shard: they
     # finish within seconds of each other and a shared name would have them
@@ -812,7 +862,7 @@ def _run_clip_episodes(args: argparse.Namespace) -> int:
             if not args.keep_going:
                 raise
             failed += 1
-            print(f"error: {item.scene}: {error}", file=sys.stderr)
+            report_item_failure(item.scene, error)
 
     name = None if label == "all" else f"clips_manifest.{label.replace('/', '-of-')}.json"
     manifest = clips.write_clips_manifest(args.clips_out, reports, name=name)

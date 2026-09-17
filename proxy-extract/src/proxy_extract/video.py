@@ -96,6 +96,17 @@ def iter_frames(
     """
     import cv2
 
+    # `None` is checked separately because it is what a caller passing an
+    # unresolved `--chunk-frames` default sends, and comparing it to 1 raises a
+    # TypeError from here with no hint of where it came from. "How many frames"
+    # has no sensible default this far down - a clip wants one batch and an
+    # episode cannot afford one - so it is refused rather than guessed at.
+    if chunk is None:
+        raise ValueError(
+            "chunk is None. Whoever called this has an unresolved 'no chunking' "
+            "default; decide the batch size there - for a clip route that is the "
+            "length of the window, so the depth backend reconstructs it in one go"
+        )
     if chunk < 1:
         raise ValueError(f"chunk must be >= 1, got {chunk}")
     wanted = None if select is None else set(select)

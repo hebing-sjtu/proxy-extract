@@ -744,13 +744,26 @@ def cut_episode(
             f"({len(select)} predicted, {length} kept)"
         )
         work = clip_dir / WORK_DIRNAME
+        # One window, one batch. The depth backends lock per `estimate()` call -
+        # MoGe-3 solves the field of view and levels the metric scale over the
+        # frames it is handed - so a window arriving in two batches comes back
+        # as two independent reconstructions with a step at the seam, which is
+        # the flicker this route exists to remove. `chunk_frames=None` therefore
+        # means "as long as this window is" rather than inheriting a fixed size,
+        # and windows differ: the halo is clipped at the episode's ends.
+        chunk = len(select) if config.chunk_frames is None else config.chunk_frames
         # The colour and the two arrays, and no DUV: this composes its own at
         # 336x192 from the arrays, so a 1344x768 one would be written and
         # deleted 10,000 times over.
         scene_report = delivery.extract_scene(
             video,
             work,
-            config=replace(config, keep_frames=("color", "depth", "semantic"), fps=fps),
+            config=replace(
+                config,
+                keep_frames=("color", "depth", "semantic"),
+                fps=fps,
+                chunk_frames=chunk,
+            ),
             depth_backend=depth_backend,
             semantic_backend=semantic_backend,
             refiner=refiner,

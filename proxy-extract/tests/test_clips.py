@@ -503,6 +503,50 @@ def test_the_source_route_writes_the_same_shape_as_the_delivered_one(delivered, 
         assert (clip / clips.TARGET_DIRNAME / clips.ANCHOR_NAME).is_file()
 
 
+def test_no_chunk_size_means_the_whole_window_in_one_batch(delivered, tmp_path, monkeypatch):
+    """`--chunk-frames` is unset by default on this route, and has to work.
+
+    Two things are pinned. It must not crash: an unresolved None used to reach
+    `iter_frames` and come back as a TypeError about NoneType and int, on every
+    episode of every shard. And it must not quietly become a fixed batch size
+    either - the depth backends lock the field of view and the metric scale per
+    call, so a window split in two arrives as two reconstructions with a step
+    between them.
+    """
+    seen: list[int] = []
+    real = delivery.extract_scene
+
+    def record(video, work, **kwargs):
+        seen.append(kwargs["config"].chunk_frames)
+        return real(video, work, **kwargs)
+
+    monkeypatch.setattr(delivery, "extract_scene", record)
+
+    source = delivered.parent / "video.mp4"
+    reports = clips.cut_episode(
+        source,
+        tmp_path / "unchunked",
+        scene="seg_000000",
+        config=delivery.DeliveryConfig(
+            depth_backend="synthetic",
+            semantic_backend="synthetic",
+            size=(clips.TARGET_WIDTH, clips.TARGET_HEIGHT),
+            chunk_frames=None,
+            stabilise_block=8,
+        ),
+        count=2,
+        length=8,
+        fps=24.0,
+    )
+
+    assert len(reports) == 2
+    assert len(seen) == 2, "extract_scene was never called"
+    for report, chunk in zip(reports, seen):
+        kept = len(report["source_ordinals"])
+        assert chunk is not None
+        assert chunk >= kept, f"a {kept}-frame window was split into batches of {chunk}"
+
+
 def test_both_routes_pick_the_same_source_frames(delivered, tmp_path):
     """The window arithmetic is shared, so this is a guard against it forking."""
     source = delivered.parent / "video.mp4"
