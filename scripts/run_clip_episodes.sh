@@ -246,6 +246,22 @@ echo
 
 done_at_start="$(find "$CLIPS_DIR" -maxdepth 2 -name clip_report.json 2>/dev/null | wc -l | tr -d ' ')"
 
+# Say so up front when the output root is not empty. The heartbeat counts every
+# clip under it, so a root left over from an earlier run reads as though this
+# one were nearly finished the moment it starts - and the question that matters
+# is not how many clips are there but what made them. Resume reuses a clip only
+# when it was cut with the same depth backend, refiner and --proxy-duv setting,
+# so a run with different models redoes them rather than keeping a corpus that
+# is half old predictions. It still costs the disk for both.
+if ((done_at_start > 0)); then
+  echo "note: $CLIPS_DIR already holds $done_at_start of $clips clips."
+  echo "      Those were cut by an earlier run. This one reuses only the ones made"
+  echo "      with DEPTH=$DEPTH, REFINER=$REFINER and PROXY_DUV=$PROXY_DUV; the rest"
+  echo "      are cut again. For a clean corpus in its own directory instead:"
+  echo "        CLIPS_DIR=/data/binghe/datasets/<new-name> $0"
+  echo
+fi
+
 heartbeat() {
   local every="${HEARTBEAT_SECONDS:-60}"
   ((every > 0)) || return 0
@@ -261,8 +277,8 @@ heartbeat() {
     else
       load="load $(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}' || true)"
     fi
-    printf '[%s] %s/%s clips (+%s this run), %s/%s alive, %s\n' \
-      "$(date +%H:%M:%S)" "$done_n" "$clips" "$((done_n - done_at_start))" \
+    printf '[%s] %s new this run, %s/%s clips on disk, %s/%s alive, %s\n' \
+      "$(date +%H:%M:%S)" "$((done_n - done_at_start))" "$done_n" "$clips" \
       "$alive" "$n_workers" "$load"
   done
 }

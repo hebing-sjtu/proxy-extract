@@ -392,8 +392,25 @@ def abot_sparse_members(members: dict) -> list[str]:
 # ----------------------------------------------------------------- one clip
 
 
+def clip_provenance(clip_dir: Path) -> dict | None:
+    """How the clip sitting here was made, or None if it cannot be established."""
+    try:
+        report = json.loads((Path(clip_dir) / CLIP_REPORT_NAME).read_text())
+    except (OSError, ValueError):
+        return None
+    return {
+        "depth": (report.get("depth") or {}).get("backend"),
+        "refiner": (report.get("semantic") or {}).get("refiner"),
+        "proxy_duv": bool(report.get("proxy_duv")),
+    }
+
+
 def already_cut(
-    clip_dir: Path, length: int = CLIP_FRAMES, *, proxy_duv_frames: bool = False
+    clip_dir: Path,
+    length: int = CLIP_FRAMES,
+    *,
+    proxy_duv_frames: bool = False,
+    expect: dict | None = None,
 ) -> bool:
     """Whether a previous run left a complete clip here.
 
@@ -404,8 +421,19 @@ def already_cut(
     disk. A clip cut before the flag existed is complete by its own standard and
     has no `duv/`, so asking "does it have one" would answer "yes, complete" for
     exactly the clips a `--proxy-duv` rerun exists to fill in.
+
+    `expect` is how the caller intends to make the clip - the depth backend, the
+    refiner, whether the per-frame form is wanted. Given, a clip that was made
+    some other way does not count as done. Completeness alone is the wrong test
+    across a change of backend: an output root holding a finished corpus is
+    exactly what a rerun with better models is pointed at, and resume would skip
+    all of it, leaving a corpus that is mostly the old predictions with a
+    manifest that cannot tell the two apart. A clip whose provenance cannot be
+    read is treated as not matching, since the alternative is to assume it.
     """
     clip_dir = Path(clip_dir)
+    if expect is not None and clip_provenance(clip_dir) != expect:
+        return False
     videos = (
         clip_dir / TARGET_DIRNAME / TARGET_NAME,
         clip_dir / PROXY_DIRNAME / DUV_NAME,
@@ -711,6 +739,15 @@ def cut_episode(
     halo = config.temporal_radius if halo is None else halo
     say = progress or (lambda _line: None)
 
+    # What this call will produce, so `already_cut` can tell a clip it made
+    # from one an earlier run with different models left behind. `none` becomes
+    # None to match what the report records, which is the refiner object's name.
+    expect = {
+        "depth": config.depth_backend,
+        "refiner": None if config.semantic_refiner in {"none", ""} else config.semantic_refiner,
+        "proxy_duv": bool(proxy_duv_frames),
+    }
+
     info = probe(video)
     # The rate the episode was recorded at, which is what the frame dropping is
     # computed from. `config.fps` is the rate a delivered scene is *labelled*
@@ -726,7 +763,9 @@ def cut_episode(
     reports = []
     for window in windows:
         clip_dir = clips_root / clip_name(scene, window.index)
-        if resume and already_cut(clip_dir, length, proxy_duv_frames=proxy_duv_frames):
+        if resume and already_cut(
+            clip_dir, length, proxy_duv_frames=proxy_duv_frames, expect=expect
+        ):
             existing = clip_dir / CLIP_REPORT_NAME
             reports.append(
                 json.loads(existing.read_text())

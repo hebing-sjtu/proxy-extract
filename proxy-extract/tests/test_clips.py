@@ -503,6 +503,116 @@ def test_the_source_route_writes_the_same_shape_as_the_delivered_one(delivered, 
         assert (clip / clips.TARGET_DIRNAME / clips.ANCHOR_NAME).is_file()
 
 
+def test_a_clip_made_by_other_models_does_not_count_as_already_cut(delivered, tmp_path):
+    """Otherwise a rerun with better models silently keeps the old corpus.
+
+    Pointing a moge3 run at a root that a previous backend already filled is
+    the normal way to redo a corpus, and resume used to skip every clip in it -
+    the output would be almost entirely the old predictions, with a manifest
+    that could not tell which clip came from which model.
+    """
+    source = delivered.parent / "video.mp4"
+    out = tmp_path / "corpus"
+    first = _direct(source, out)
+    assert first and "skipped" not in first[0]
+
+    clip_dir = out / first[0]["clip"]
+    assert clips.already_cut(clip_dir, 8), "the clip it just made is not complete"
+
+    made_with = clips.clip_provenance(clip_dir)
+    assert made_with == {"depth": "synthetic", "refiner": None, "proxy_duv": False}
+
+    # Same clip, same frames, asked for by a run configured differently.
+    assert not clips.already_cut(clip_dir, 8, expect={**made_with, "depth": "moge3"})
+    assert not clips.already_cut(clip_dir, 8, expect={**made_with, "refiner": "sam2"})
+    # And unchanged configuration still resumes, or no restart would ever skip.
+    assert clips.already_cut(clip_dir, 8, expect=made_with)
+
+
+def test_a_clip_whose_provenance_cannot_be_read_is_recut(delivered, tmp_path):
+    """Unknown provenance is not the same as matching provenance."""
+    source = delivered.parent / "video.mp4"
+    out = tmp_path / "corpus"
+    reports = _direct(source, out)
+    clip_dir = out / reports[0]["clip"]
+
+    (clip_dir / clips.CLIP_REPORT_NAME).unlink()
+    assert clips.clip_provenance(clip_dir) is None
+    assert clips.already_cut(clip_dir, 8), "without expect, completeness is the test"
+    assert not clips.already_cut(
+        clip_dir, 8, expect={"depth": "synthetic", "refiner": None, "proxy_duv": False}
+    )
+
+
+def test_a_rerun_with_a_different_backend_actually_redoes_the_clips(
+    delivered, tmp_path, monkeypatch
+):
+    """The guard is only worth having if `cut_episode` acts on it.
+
+    Counted by how often the models are asked to run, because a skipped clip
+    returns the report it was written with rather than a marker - that is what
+    keeps a resumed manifest complete, and it means the reports cannot say
+    whether the work happened.
+    """
+    source = delivered.parent / "video.mp4"
+    out = tmp_path / "corpus"
+    _direct(source, out)
+
+    calls: list[str] = []
+    real = delivery.extract_scene
+
+    def counted(video, work, **kwargs):
+        calls.append(str(work))
+        return real(video, work, **kwargs)
+
+    monkeypatch.setattr(delivery, "extract_scene", counted)
+
+    asked: list[dict | None] = []
+    real_already_cut = clips.already_cut
+
+    def watched(clip_dir, length=clips.CLIP_FRAMES, **kwargs):
+        asked.append(kwargs.get("expect"))
+        return real_already_cut(clip_dir, length, **kwargs)
+
+    monkeypatch.setattr(clips, "already_cut", watched)
+
+    def rerun(refiner):
+        calls.clear()
+        asked.clear()
+        clips.cut_episode(
+            source,
+            out,
+            scene="seg_000000",
+            config=delivery.DeliveryConfig(
+                depth_backend="synthetic",
+                semantic_backend="synthetic",
+                size=(clips.TARGET_WIDTH, clips.TARGET_HEIGHT),
+                chunk_frames=16,
+                stabilise_block=8,
+                semantic_refiner=refiner,
+            ),
+            count=2,
+            length=8,
+            fps=24.0,
+            resume=True,
+        )
+        return len(calls)
+
+    assert rerun("none") == 0, "an unchanged rerun re-did work it had already done"
+    assert asked == [
+        {"depth": "synthetic", "refiner": None, "proxy_duv": False}
+    ] * 2, "the configuration was not passed to the resume check"
+
+    # Nothing on disk changed, but these clips were not made with a refiner, so
+    # they cannot stand in for clips that were. Asserted at the decision rather
+    # than by running it: the work would load SAM 2, which is a git-only
+    # dependency this suite does not require.
+    for clip in ("clip_000000_0", "clip_000000_1"):
+        assert not clips.already_cut(
+            out / clip, 8, expect={"depth": "synthetic", "refiner": "sam2", "proxy_duv": False}
+        ), f"{clip} was counted as done for a run configured with a refiner it never saw"
+
+
 def test_no_chunk_size_means_the_whole_window_in_one_batch(delivered, tmp_path, monkeypatch):
     """`--chunk-frames` is unset by default on this route, and has to work.
 
