@@ -531,7 +531,7 @@ def _open_state(scene_dir: Path, fingerprint: str) -> dict:
         try:
             state = json.loads(path.read_text())
             if state.get("fingerprint") == fingerprint:
-                return state
+                return _rewound_to_what_is_on_disk(scene_dir, state)
         except (ValueError, OSError):
             pass
     for stream in frames.ALL_STREAMS:
@@ -548,11 +548,49 @@ def _open_state(scene_dir: Path, fingerprint: str) -> dict:
     }
 
 
+# What each stage reads whole, from frame 0, when it is resumed into. A state
+# naming one of these cannot be believed unless its inputs are still there.
+_STAGE_INPUTS = {
+    "derive": ("color", "depth", frames.STAGING_STREAM),
+    "encode": ("color", "depth", "semantic"),
+}
+
+
+def _rewound_to_what_is_on_disk(scene_dir: Path, state: dict) -> dict:
+    """The state, moved back to a stage the frames on disk can still feed.
+
+    The fingerprint says the frames on disk belong to this run. It does not say
+    they are all still there, and one of them is deleted by design: the staged
+    labels go as soon as `derive` has consumed them. `state.json` lives in that
+    same `.stage/` directory, so if the write recording the new stage is the
+    one that does not survive, what is left is a state naming a stage whose
+    input has already been dropped.
+
+    Believing the label then fails identically on every retry - the stage reads
+    frame 0 of a stream that is gone and raises - so an episode that lost a
+    state write can never be cut again, which is not a failure mode worth
+    keeping. Rewinding pays for the inference a second time and gets the clip.
+    """
+    needed = _STAGE_INPUTS.get(state.get("stage", "infer"))
+    count = int(state.get("frames", 0))
+    if needed is None or (count and frames.complete_through(scene_dir, needed) >= count):
+        return state
+    return {**state, "stage": "infer"}
+
+
 def _save_state(scene_dir: Path, state: dict) -> None:
     path = _state_path(scene_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state))
+    # Flushed to the device before the rename rather than left to the page
+    # cache. This file is what says which frames may be skipped, and the frames
+    # it describes are deleted on the strength of it, so a rename that lands
+    # while the contents do not is the one inconsistency that cannot be
+    # recovered from by looking at the directory.
+    with open(tmp, "w") as handle:
+        handle.write(json.dumps(state))
+        handle.flush()
+        os.fsync(handle.fileno())
     tmp.replace(path)
 
 

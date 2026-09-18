@@ -355,6 +355,105 @@ def test_resume_rejects_a_scene_whose_videos_are_short(scene):
     assert not delivery.already_done(out), "a truncated scene must be redone, not accepted"
 
 
+def poison_state(out: Path, config, *, fps: float, stage: str, count: int) -> None:
+    """Leave behind the state a lost `state.json` write produces.
+
+    `.stage/labels/` is deleted the moment `derive` has consumed it, and
+    `state.json` sits in that same directory, so the pair really can end up
+    saying "resume into derive" with derive's input already gone.
+    """
+    delivery._save_state(
+        out,
+        {
+            "fingerprint": delivery._fingerprint(config, out.parent / "ep" / "video.mp4", fps),
+            "stage": stage,
+            "frames": count,
+            "batches": 1,
+            "metric": True,
+            "depth_meta": {},
+            "semantic_meta": {},
+        },
+    )
+
+
+def test_a_state_naming_a_stage_whose_input_is_gone_is_rewound(tmp_path):
+    """The failure this reproduces is permanent, which is what makes it worth fixing.
+
+    `derive` reads the staged labels from frame 0. If the state says `derive`
+    and the labels are not there, believing it raises at the same place on
+    every retry, so the episode can never be cut - re-running is not a repair.
+    """
+    scene_dir = tmp_path / "seg_000000"
+    frames_mod = delivery.frames
+    frames_mod.make_dirs(scene_dir)
+    for ordinal in range(4):
+        frames_mod.write_image(scene_dir, "color", ordinal, np.zeros((8, 8, 3), np.uint8))
+        frames_mod.write_array(scene_dir, "depth", ordinal, np.ones((8, 8), np.float32))
+
+    state = {"fingerprint": "abc", "stage": "derive", "frames": 4}
+    delivery._save_state(scene_dir, state)
+
+    assert delivery._open_state(scene_dir, "abc")["stage"] == "infer"
+
+
+def test_a_stage_whose_input_is_all_there_is_believed(tmp_path):
+    """The rewind must cost nothing when nothing was lost, or every resume redoes the models."""
+    scene_dir = tmp_path / "seg_000000"
+    frames_mod = delivery.frames
+    frames_mod.make_dirs(scene_dir)
+    for ordinal in range(4):
+        frames_mod.write_image(scene_dir, "color", ordinal, np.zeros((8, 8, 3), np.uint8))
+        frames_mod.write_array(scene_dir, "depth", ordinal, np.ones((8, 8), np.float32))
+        frames_mod.write_array(
+            scene_dir, frames_mod.STAGING_STREAM, ordinal, np.zeros((8, 8), np.uint8)
+        )
+
+    delivery._save_state(scene_dir, {"fingerprint": "abc", "stage": "derive", "frames": 4})
+
+    assert delivery._open_state(scene_dir, "abc")["stage"] == "derive"
+
+
+def test_a_short_staged_stream_counts_as_gone_rather_than_partly_usable(tmp_path):
+    """`derive` reads the stack whole, so two of four labels is no more resumable than none."""
+    scene_dir = tmp_path / "seg_000000"
+    frames_mod = delivery.frames
+    frames_mod.make_dirs(scene_dir)
+    for ordinal in range(4):
+        frames_mod.write_image(scene_dir, "color", ordinal, np.zeros((8, 8, 3), np.uint8))
+        frames_mod.write_array(scene_dir, "depth", ordinal, np.ones((8, 8), np.float32))
+    for ordinal in range(2):
+        frames_mod.write_array(
+            scene_dir, frames_mod.STAGING_STREAM, ordinal, np.zeros((8, 8), np.uint8)
+        )
+
+    delivery._save_state(scene_dir, {"fingerprint": "abc", "stage": "derive", "frames": 4})
+
+    assert delivery._open_state(scene_dir, "abc")["stage"] == "infer"
+
+
+def test_an_episode_that_lost_its_state_write_can_still_be_cut(episode, tmp_path):
+    """End to end, this is the 115 failures in the run: a sticky FileNotFoundError.
+
+    A second pass over the same directory used to read frame 0 of a deleted
+    stream and raise. It has to finish instead.
+    """
+    out = tmp_path / "seg_000000"
+    config = delivery.DeliveryConfig(
+        depth_backend="synthetic",
+        semantic_backend="synthetic",
+        size=SIZE,
+        chunk_frames=7,
+        flow_compensate=False,
+    )
+    first = delivery.extract_scene(episode, out, config=config)
+    poison_state(out, config, fps=first["fps"], stage="derive", count=first["frames"])
+
+    again = delivery.extract_scene(episode, out, config=config)
+
+    assert again["frames"] == first["frames"]
+    assert probe(out / "proxy" / "depth.mp4").frames == first["frames"]
+
+
 def test_resume_survives_a_video_it_cannot_even_open(scene):
     """A worker killed mid-encode leaves an mp4 with no `moov` atom.
 
