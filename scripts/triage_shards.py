@@ -31,7 +31,10 @@ FINISHED = re.compile(r"\d+ clips, \d+ episodes failed, manifest at ")
 ERROR_LINE = re.compile(r"^error: (?P<item>\S+?): (?P<rest>.*)$")
 # `report_item_failure` puts the type in front for anything unexpected.
 TYPED_ERROR = re.compile(r"^error: \S+?: (?P<kind>[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception)): ")
-TAIL_LINES = 12
+# The note it prints after a traceback it caught and carried on from. Its
+# presence after the last traceback is what distinguishes a shard that survived
+# its errors from one that stopped at them.
+HANDLED_TRAILER = "that is a traceback rather than a message about your data"
 
 
 def classify(text: str) -> tuple[str, str]:
@@ -42,32 +45,57 @@ def classify(text: str) -> tuple[str, str]:
     if FINISHED.search(lines[-1]):
         return "finished", lines[-1]
 
-    # Nothing raised on the way out. Python prints a traceback for any
-    # exception that reaches the top, and the launcher redirects stderr here,
-    # so a log that simply stops was stopped from outside.
-    tail = "\n".join(lines[-3:])
-    if "Traceback (most recent call last)" not in text and "error:" not in tail:
+    # Whether it raised is decided by the *last* traceback, not by whether one
+    # appears anywhere. Under --keep-going a healthy shard prints a traceback
+    # for every episode it survives, so "contains a traceback" is true of
+    # almost every log here and says nothing about how this one stopped.
+    #
+    # The two are told apart by the note `report_item_failure` prints after a
+    # traceback it handled. A traceback with that trailer was survived; one
+    # without it is where the shard stopped.
+    _, marker, ending = text.rpartition("Traceback (most recent call last)")
+    if not marker or HANDLED_TRAILER in ending:
         return "killed", f"stops after: {lines[-1][:120]}"
-    if "MemoryError" in text or "Cannot allocate memory" in text:
-        return "out of memory", "the allocation failed rather than being killed"
-    if "CUDA out of memory" in text:
-        return "cuda out of memory", "this one is per-worker; lower WORKERS_PER_GPU"
-    if "No space left on device" in text:
+
+    if "No space left on device" in ending:
         return "disk full", "the output filesystem filled mid-run"
-    return "raised", "\n".join(lines[-3:])
+    if "CUDA out of memory" in ending or "OutOfMemoryError" in ending:
+        return "cuda out of memory", _final_exception(ending)
+    if "MemoryError" in ending or "Cannot allocate memory" in ending:
+        return "host out of memory", _final_exception(ending)
+    return "raised", _final_exception(ending)
 
 
-def error_kinds(text: str) -> dict[str, int]:
-    """Per-item failures inside a shard, counted by exception type."""
-    kinds: dict[str, int] = defaultdict(int)
+def _final_exception(tail: str) -> str:
+    """The exception a log ends on, rather than the last few lines of progress."""
+    for line in reversed(tail.splitlines()):
+        if re.match(r"^\S*(?:Error|Exception)\b", line.strip()):
+            return line.strip()[:200]
+    return tail.splitlines()[-1][:200] if tail.strip() else "(nothing)"
+
+
+def error_kinds(text: str) -> dict[str, tuple[int, str]]:
+    """Per-item failures inside a shard, as {kind: (count, one example)}.
+
+    With an example, because the type alone does not say what to do: 43
+    FileNotFoundError is a missing input if it names a source file and a
+    self-inflicted wound if it names something under `.work`.
+    """
+    kinds: dict[str, tuple[int, str]] = {}
+
+    def add(kind: str, example: str) -> None:
+        count, first = kinds.get(kind, (0, example))
+        kinds[kind] = (count + 1, first)
+
     for line in text.splitlines():
         typed = TYPED_ERROR.match(line)
         if typed:
-            kinds[typed.group("kind")] += 1
+            add(typed.group("kind"), line.split(": ", 2)[-1].strip())
             continue
-        if ERROR_LINE.match(line):
-            kinds["(handled: a message, not a bug)"] += 1
-    return dict(kinds)
+        handled = ERROR_LINE.match(line)
+        if handled:
+            add("(handled: a message, not a bug)", handled.group("rest").strip())
+    return kinds
 
 
 def main() -> int:
@@ -83,13 +111,14 @@ def main() -> int:
         return 2
 
     grouped: dict[str, list[tuple[str, str]]] = defaultdict(list)
-    kinds_total: dict[str, int] = defaultdict(int)
+    kinds_total: dict[str, tuple[int, str]] = {}
     for path in logs:
         text = path.read_text(errors="replace")
         verdict, detail = classify(text)
         grouped[verdict].append((path.stem.replace("shard-", ""), detail))
-        for kind, count in error_kinds(text).items():
-            kinds_total[kind] += count
+        for kind, (count, example) in error_kinds(text).items():
+            running, first = kinds_total.get(kind, (0, example))
+            kinds_total[kind] = (running + count, first)
 
     print(f"{len(logs)} shard logs\n")
     for verdict in sorted(grouped, key=lambda name: -len(grouped[name])):
@@ -104,9 +133,10 @@ def main() -> int:
         print()
 
     if kinds_total:
-        print("per-episode failures inside the shards, by kind:")
-        for kind, count in sorted(kinds_total.items(), key=lambda item: -item[1]):
+        print("per-episode failures inside the shards (survived, but the clips are missing):")
+        for kind, (count, example) in sorted(kinds_total.items(), key=lambda item: -item[1][0]):
             print(f"  {count:6}  {kind}")
+            print(f"          e.g. {example[:160]}")
         print()
 
     if "killed" in grouped:
