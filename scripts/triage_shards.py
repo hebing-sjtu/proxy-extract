@@ -35,6 +35,23 @@ TYPED_ERROR = re.compile(r"^error: \S+?: (?P<kind>[A-Za-z_][A-Za-z0-9_.]*(?:Erro
 # presence after the last traceback is what distinguishes a shard that survived
 # its errors from one that stopped at them.
 HANDLED_TRAILER = "that is a traceback rather than a message about your data"
+# The `[index/count]` the run prints before it starts. Anchored to the end of
+# the line so it cannot match the `[3/812]` that heads every episode line.
+BANNER = re.compile(r"\[(?P<index>\d+)/(?P<count>\d+)\]\s*$", re.MULTILINE)
+
+
+def declared_shards(text: str) -> int | None:
+    """How many shards the run that wrote this log split itself into.
+
+    The launcher truncates the log of every shard it starts, but only of those
+    it starts. Re-running with a smaller WORKERS_PER_GPU therefore leaves the
+    surplus logs of the previous, wider run untouched on disk, where they read
+    as part of this one - with their old failures, their old counts, and an
+    ending that was never revisited. Asking each log which run wrote it is the
+    only way to tell, because the mtimes of a run lasting hours overlap.
+    """
+    match = BANNER.search(text)
+    return int(match.group("count")) if match else None
 
 
 def classify(text: str) -> tuple[str, str]:
@@ -98,6 +115,56 @@ def error_kinds(text: str) -> dict[str, tuple[int, str]]:
     return kinds
 
 
+Log = tuple[Path, str]
+
+
+def shard_no(path: Path) -> int:
+    return int(re.sub(r"\D", "", path.stem) or 0)
+
+
+def brace(numbers: list[int]) -> str:
+    """`[64, 65, ..., 127]` as `64..127`, so the printed `rm` can be pasted.
+
+    Brace expansion takes no spaces, and a comma list of sixty-four shards is
+    not something anyone should have to check by eye before running it.
+    """
+    runs: list[tuple[int, int]] = []
+    for number in sorted(numbers):
+        if runs and number == runs[-1][1] + 1:
+            runs[-1] = (runs[-1][0], number)
+        else:
+            runs.append((number, number))
+    return ",".join(f"{lo}..{hi}" if hi > lo else str(lo) for lo, hi in runs)
+
+
+def this_run(read: list[Log]) -> tuple[list[Log], list[Log]]:
+    """Split the logs into the current run's and an earlier run's leftovers.
+
+    Logs that name different shard counts cannot be from one run. The current
+    one is the group whose size its own logs agree with: a 64-shard run writes
+    64 logs saying `/64`, while the 64 logs of the 128-shard run it replaced
+    are the half that was not started again, and there are fewer of them than
+    they claim. Falling back to mtime when that is ambiguous, which is the
+    weaker signal - a long run's logs are written over hours.
+    """
+    by_count: dict[int | None, list[Log]] = defaultdict(list)
+    for entry in read:
+        by_count[declared_shards(entry[1])].append(entry)
+    if len(by_count) < 2:
+        return read, []
+
+    def freshness(count: int | None) -> tuple[bool, float]:
+        group = by_count[count]
+        return (
+            count is not None and len(group) == count,
+            max(path.stat().st_mtime for path, _ in group),
+        )
+
+    current = max(by_count, key=freshness)
+    stale = [entry for count, group in by_count.items() if count != current for entry in group]
+    return by_count[current], sorted(stale, key=lambda entry: shard_no(entry[0]))
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         print(f"usage: {Path(sys.argv[0]).name} CLIPS_DIR", file=sys.stderr)
@@ -110,17 +177,27 @@ def main() -> int:
         print(f"no shard logs under {sys.argv[1]}/logs", file=sys.stderr)
         return 2
 
+    read = [(path, path.read_text(errors="replace")) for path in logs]
+    read, stale = this_run(read)
+    if stale:
+        spans = brace([shard_no(path) for path, _ in stale])
+        print(
+            f"ignoring {len(stale)} log(s) left by an earlier, wider run: shards {spans}.\n"
+            "The launcher only truncates the logs of the shards it starts, so these\n"
+            "still describe the previous run and would be counted as part of this one.\n"
+            f"  rm {logs[0].parent}/shard-{{{spans}}}.log\n"
+        )
+
     grouped: dict[str, list[tuple[str, str]]] = defaultdict(list)
     kinds_total: dict[str, tuple[int, str]] = {}
-    for path in logs:
-        text = path.read_text(errors="replace")
+    for path, text in read:
         verdict, detail = classify(text)
         grouped[verdict].append((path.stem.replace("shard-", ""), detail))
         for kind, (count, example) in error_kinds(text).items():
             running, first = kinds_total.get(kind, (0, example))
             kinds_total[kind] = (running + count, first)
 
-    print(f"{len(logs)} shard logs\n")
+    print(f"{len(read)} shard logs\n")
     for verdict in sorted(grouped, key=lambda name: -len(grouped[name])):
         entries = grouped[verdict]
         shards = ", ".join(shard for shard, _ in entries)
