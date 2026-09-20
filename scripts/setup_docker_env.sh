@@ -190,6 +190,18 @@ say "installing proxy-extract (--no-deps)"
 # land a second cv2 next to the image's.
 run $PIP install --no-deps -e "$here/proxy-extract"
 
+say "installing clip-prompts (--no-deps)"
+# The captions are a separate package but not an optional step: the manifest
+# carries a prompt per segment, and there is nothing else in this repo that
+# writes one. Leaving it out meant the runbook's caption commands failed with
+# `No module named clip_prompts` on a node the setup script had just called
+# finished.
+#
+# --no-deps for the same reason as above, and it costs nothing here: its only
+# dependencies are numpy and opencv, both of which proxy-extract has just been
+# confirmed to have. Its VLM transport is standard library throughout.
+run $PIP install --no-deps -e "$here/clip-prompts"
+
 install_fenced() {
   # Strict fence first, then the one without local labels. Two attempts rather
   # than starting loose because the strict pins are unsatisfiable from the
@@ -242,6 +254,12 @@ import proxy_extract
 from proxy_extract.proxy import EncodeError, ffmpeg_binary
 
 print(f"proxy_extract   {proxy_extract.__file__}")
+try:
+    import clip_prompts
+
+    print(f"clip_prompts    {clip_prompts.__file__}")
+except ImportError as error:
+    print(f"clip_prompts    MISSING ({error})")
 try:
     print(f"ffmpeg          {ffmpeg_binary()}")
 except EncodeError as error:

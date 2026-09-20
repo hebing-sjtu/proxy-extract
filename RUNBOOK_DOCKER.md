@@ -257,7 +257,7 @@ NODE_COUNT=2 NODE_RANK=1 make clip-episodes \
 
 ```bash
 make clips-audit                                  # 切完的 / 半截的
-make proxy-duv-manifest PROMPTS=prompts.json      # encode_manifest.jsonl
+make proxy-duv-manifest                           # encode_manifest.jsonl
 make proxy-duv-audit                              # 第 8 节的验收检查
 ```
 
@@ -267,8 +267,24 @@ make proxy-duv-audit                              # 第 8 节的验收检查
 出来，而这是唯一一个能让整批数据作废的错误（`PROXY_DUV_SPEC.md` 第 2 节）。有 warning
 就退非 0，所以可以直接当 CI 门禁。
 
-`--prompts` 忘了不会报错，但会得到一份没有 prompt 的 manifest —— 它能加载、能训练，
-只是不是训练想要的。命令会把没带 prompt 的段数打出来。
+**manifest 里的 prompt 从哪来。** 每段自己的 `prompt.txt`，也就是
+`clip-prompts captions-export --write-txt` 写的那个文件；`make proxy-duv-manifest`
+会自己去捡，不需要 `PROMPTS=`（那个参数只留给文字来自别处的语料）。没有 prompt 不会
+报错，但会得到一份没有文字条件的 manifest —— 它能加载、能训练，只是不是训练想要的。
+命令会把没带 prompt 的段数打出来。
+
+caption 本身怎么产见 `clip-prompts/README.md`。`setup_docker_env.sh` 已经把
+`clip-prompts` 一起装进这个 venv 了。如果语料是重新切的，而上一次的 caption 还在，
+**不要重新调 VLM** —— 切窗规则是纯函数，同样参数下同名 clip 是同样的源帧：
+
+```bash
+python scripts/reuse_prompts.py <旧 clips> <新 clips> --dry-run   # 先看 source_ordinals 对不对得上
+python -m clip_prompts captions-recompile --clips "$CLIPS_DIR" --reverify
+python -m clip_prompts captions-export    --clips "$CLIPS_DIR" --write-txt
+```
+
+`--reverify` 会拿**新**的 DUV 重新对账（不调模型）：旧 caption 是对着旧后端的 DUV 验
+过的，换了 moge3/sam2 之后还通不通过是个新问题，没通过的片不会被导出成训练文本。
 
 ## 9. 出错了先看哪
 
@@ -279,6 +295,7 @@ make proxy-duv-audit                              # 第 8 节的验收检查
 | 装的时候 `test_delivery.py` 报 `depth codes changed` | 系统 ffmpeg 4.4.2 丢了全范围标记。已修（第 3 节「`depth encode`」）；`git pull` 后重跑。细节用 `python scripts/diagnose_depth_encode.py` |
 | stderr 出现 `not using the ffmpeg from PATH` | 正常，闸门在绕开 4.4.2 改用 7.1。不用管 |
 | `Refusing to encode` / `depth encode` FAIL | 这台机器没有一个能用的 ffmpeg。`pip install imageio-ffmpeg` 或 `export FFMPEG=` 指一个 7 以上的 |
+| `No module named clip_prompts` | 装的时候还没带上它。`git pull` 后重跑 `scripts/setup_docker_env.sh` |
 | 卡上全是 OOM | `WORKERS_PER_GPU` 太大。第 5 节 |
 | 全部 GPU 0% 占用、没有任何报错 | 叠了 worker 没限线程。`RUNBOOK.md` 第 3 节「线程」 |
 | 审计数目比 2000×5 少 | 双节点三条约定之一没对上。第 6 节 |
@@ -311,5 +328,5 @@ make clip-episodes LIMIT=8 WORKERS_PER_GPU=2 DEPTH=moge3 REFINER=sam2 PROXY_DUV=
 NODE_COUNT=2 NODE_RANK=$R make clip-episodes DEPTH=moge3 REFINER=sam2 PROXY_DUV=1   # 全量
 
 # 收货
-make clips-audit && make proxy-duv-manifest PROMPTS=prompts.json && make proxy-duv-audit
+make clips-audit && make proxy-duv-manifest && make proxy-duv-audit
 ```
