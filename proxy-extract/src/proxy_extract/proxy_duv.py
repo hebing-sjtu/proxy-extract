@@ -433,6 +433,27 @@ def segment_dirs(root: Path) -> list[Path]:
     )
 
 
+# What `clip-prompts captions-export --write-txt` leaves in each segment: the
+# flat CWM user sentence, already canonicalised. See CWM_TEXT_EXPORT.md.
+PROMPT_TXT_NAME = "prompt.txt"
+
+
+def prompt_beside(seg_dir: Path) -> str | None:
+    """The exported user sentence sitting in a segment, if there is one.
+
+    Read as bytes and decoded rather than through `read_text`, which applies
+    universal newline translation and would turn the CRLF the export
+    deliberately wrote into LF. CWM's released Qwen caches were encoded from
+    CRLF bytes, so that rewrite changes the token ids of every caption while
+    leaving a file that looks identical in an editor.
+    """
+    path = Path(seg_dir) / PROMPT_TXT_NAME
+    if not path.is_file():
+        return None
+    text = path.read_bytes().decode("utf-8")
+    return text or None
+
+
 def manifest_from_root(
     root: Path, *, prompts: dict[str, str] | None = None
 ) -> list[dict]:
@@ -441,6 +462,11 @@ def manifest_from_root(
     Only segments that have both a target and a `duv/` are listed: a half-cut
     segment in a manifest is a training run that dies partway through its first
     epoch, hours after the run that produced it finished.
+
+    A segment's own `prompt.txt` is used when `prompts` does not name it, so the
+    file `clip-prompts` was told to write is the file this reads. An explicit
+    mapping still wins, because that is the only way to caption a corpus whose
+    text came from somewhere else.
     """
     root = Path(root)
     prompts = prompts or {}
@@ -448,7 +474,10 @@ def manifest_from_root(
     for seg in segment_dirs(root):
         if find_target(seg) is None:
             continue
-        entries.append(manifest_entry(seg, root, prompt=prompts.get(seg.name)))
+        prompt = prompts.get(seg.name)
+        if prompt is None:
+            prompt = prompt_beside(seg)
+        entries.append(manifest_entry(seg, root, prompt=prompt))
     return entries
 
 

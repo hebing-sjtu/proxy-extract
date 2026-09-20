@@ -283,6 +283,46 @@ def test_the_manifest_is_one_json_object_per_line(tmp_path):
     assert not list(tmp_path.glob("*.tmp")), "the atomic write left scratch behind"
 
 
+def test_a_segments_own_prompt_txt_is_picked_up(tmp_path):
+    """What `clip-prompts captions-export --write-txt` leaves is what this reads.
+
+    Without this the operator has to collect a hundred prompt.txt files into a
+    prompts.json by hand, and that copy goes stale the first time a caption is
+    recompiled.
+    """
+    _write_segment(tmp_path, "seg_000000")
+    _write_segment(tmp_path, "seg_000001")
+    (tmp_path / "seg_000000" / "prompt.txt").write_bytes(b"[0.00s-5.17s] A city street.")
+
+    entries = proxy_duv.manifest_from_root(tmp_path)
+
+    assert entries[0]["prompt"] == "[0.00s-5.17s] A city street."
+    assert "prompt" not in entries[1]
+
+
+def test_the_crlf_of_an_exported_prompt_survives_being_read(tmp_path):
+    """CWM's caches were encoded from CRLF bytes, so LF is a different token stream.
+
+    `read_text` would translate them and leave a file that looks identical.
+    """
+    _write_segment(tmp_path, "seg_000000")
+    (tmp_path / "seg_000000" / "prompt.txt").write_bytes(b"[0.00s-1.00s] One.\r\n[1.00s-2.00s] Two.")
+
+    entries = proxy_duv.manifest_from_root(tmp_path)
+
+    assert "\r\n" in entries[0]["prompt"]
+
+
+def test_an_explicit_mapping_beats_the_file_beside_the_segment(tmp_path):
+    """A corpus whose text came from elsewhere has to stay captionable."""
+    _write_segment(tmp_path, "seg_000000")
+    (tmp_path / "seg_000000" / "prompt.txt").write_bytes(b"[0.00s-5.17s] From the file.")
+
+    entries = proxy_duv.manifest_from_root(tmp_path, prompts={"seg_000000": "from the mapping"})
+
+    assert entries[0]["prompt"] == "from the mapping"
+
+
 # --------------------------------------------------------- frame arithmetic
 
 
