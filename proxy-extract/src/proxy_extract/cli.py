@@ -883,7 +883,19 @@ def _run_clips_audit(args: argparse.Namespace) -> int:
 def _run_proxy_duv_manifest(args: argparse.Namespace) -> int:
     from . import proxy_duv
 
-    prompts = json.loads(args.prompts.read_text()) if args.prompts else None
+    try:
+        prompts = json.loads(args.prompts.read_text()) if args.prompts else None
+    except OSError as error:
+        # Worth a sentence rather than a traceback: --prompts is optional, so
+        # the useful thing to say is that dropping it still produces a
+        # manifest, and what that manifest will be missing.
+        print(
+            f"error: cannot read --prompts {args.prompts}: {error.strerror}.\n"
+            "       Leave --prompts off to write a manifest without prompts; it loads\n"
+            "       and trains, but with no text conditioning.",
+            file=sys.stderr,
+        )
+        return 2
     entries = proxy_duv.manifest_from_root(args.root, prompts=prompts)
     if not entries:
         print(

@@ -27,8 +27,9 @@ broken", and only the second one is hard to find.
 
     python scripts/select_clips.py CLIPS_DIR --count 100
 
-Writes `selection.json` (what was picked and why) and `rclone-filter.txt` next
-to each other, and prints the rclone command that uses them.
+Each pick is rendered as one mp4 with colour, depth and semantics side by side,
+named so the worst cases sort to the top of the folder, and the whole directory
+is a few hundred MB rather than the 5 GB the clips themselves come to.
 """
 
 from __future__ import annotations
@@ -46,7 +47,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "proxy-extract" / "src"))
 
-from proxy_extract import contract, proxy_duv
+from proxy_extract import contract, preview, proxy_duv
 
 # Depth is read in full - 124 frames of 258 KB - while semantics is a few KB a
 # frame, so a pool of any size is dominated by depth I/O. Threads rather than
@@ -66,6 +67,7 @@ class Scored:
     semantic_flicker: float
     depth_jitter: float
     picked_as: str = ""
+    preview: str = ""
 
 
 def complete_clips(root: Path) -> list[Path]:
@@ -160,6 +162,8 @@ def main() -> int:
         help="how many candidates to measure; 0 measures every clip",
     )
     parser.add_argument("--seed", type=int, default=20260920)
+    parser.add_argument("--out", type=Path, help="where to write the mp4s (default CLIPS_DIR/review)")
+    parser.add_argument("--fps", type=float, default=24.0, help="play rate; the clip's own is 24")
     args = parser.parse_args()
 
     root = args.clips_dir
@@ -182,36 +186,47 @@ def main() -> int:
         print(f"{unreadable} candidate(s) could not be read and were skipped")
 
     selection = stratify(scored, args.count)
+    out_dir = args.out or root / "review"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    (root / "selection.json").write_text(
+    # Named so the worst cases sort to the top of a Drive folder listing. A
+    # reviewer opening the folder should not have to consult a JSON file to
+    # find out which of a hundred files is the one worth watching.
+    rendered, failed = [], []
+    for rank, item in enumerate(sorted(selection, key=lambda s: -s.semantic_flicker), start=1):
+        name = f"{rank:03d}_{item.clip}_sem{item.semantic_flicker:.3f}.mp4"
+        try:
+            preview.render_clip_review(root / item.clip, out_dir / name, fps=args.fps)
+        except (OSError, ValueError, RuntimeError) as error:
+            failed.append(f"{item.clip}: {error}")
+            continue
+        item.preview = name
+        rendered.append(item)
+        print(f"  [{len(rendered)}/{len(selection)}] {name}")
+
+    (out_dir / "selection.json").write_text(
         json.dumps(
             {
-                "count": len(selection),
+                "count": len(rendered),
                 "measured": len(scored),
                 "seed": args.seed,
-                "clips": [asdict(item) for item in selection],
+                "clips": [asdict(item) for item in rendered],
             },
             indent=2,
         )
     )
-    # A filter rather than --files-from: the latter does not expand a directory,
-    # and a clip is about 250 files.
-    lines = [f"+ /{item.clip}/**" for item in selection]
-    (root / "rclone-filter.txt").write_text("\n".join([*lines, "- *", ""]))
+    for note in failed:
+        print(f"could not render {note}", file=sys.stderr)
 
-    flicker = [item.semantic_flicker for item in selection]
+    flicker = [item.semantic_flicker for item in rendered]
     print(
-        f"\nselected {len(selection)} clips "
-        f"({sum(1 for item in selection if item.picked_as.startswith('worst'))} worst, "
-        f"{sum(1 for item in selection if item.picked_as == 'spread')} spread)\n"
-        f"semantic flicker across the sample: "
-        f"{min(flicker):.4f} to {max(flicker):.4f}\n"
-        f"  {root / 'selection.json'}\n"
-        f"  {root / 'rclone-filter.txt'}\n\n"
+        f"\nrendered {len(rendered)} review clips "
+        f"({sum(1 for item in rendered if item.picked_as.startswith('worst'))} worst, "
+        f"{sum(1 for item in rendered if item.picked_as == 'spread')} spread)\n"
+        f"semantic flicker across the sample: {min(flicker):.4f} to {max(flicker):.4f}\n"
+        f"  {out_dir}\n\n"
         f"upload with:\n"
-        f"  rclone copy {root} gdrive:clips-review \\\n"
-        f"    --filter-from {root / 'rclone-filter.txt'} \\\n"
-        f"    --progress --transfers 8 --checkers 16 --drive-chunk-size 128M"
+        f"  rclone copy {out_dir} gdrive:clips-review --progress --transfers 8"
     )
     return 0
 

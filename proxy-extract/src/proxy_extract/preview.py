@@ -267,6 +267,81 @@ def render_scene_preview(
     return out_path
 
 
+def render_clip_review(
+    clip_dir: Path,
+    out_path: Path,
+    *,
+    fps: float = 24.0,
+    panel_width: int = 448,
+) -> Path:
+    """Render one cut clip as colour, depth and semantics side by side.
+
+    For judging flicker, which is the one defect that cannot be seen in a still
+    frame and cannot be judged without the picture either: a class that changes
+    between two frames is a fault if the road stayed a road and correct if a
+    car drove over it, and only the colour panel says which. So this is not
+    `render_preview` with an extra panel - the extra panel is the point.
+
+    Played at the clip's own 24 fps rather than slowed down, because that is
+    the rate the flicker will have when something trains on it.
+
+    H.264 through the project's own encoder rather than OpenCV's `mp4v`, which
+    is MPEG-4 Part 2 and does not play in a browser - and a review file that
+    has to be downloaded before it can be watched will not be watched.
+    """
+    from . import proxy
+
+    clip_dir, out_path = Path(clip_dir), Path(out_path)
+    colour_path = clip_dir / "target" / "rgb.mp4"
+    duv = clip_dir / "duv"
+    if not colour_path.is_file():
+        raise FileNotFoundError(f"{clip_dir} has no target/rgb.mp4; is it a cut clip?")
+    ordinals = sorted(int(path.name[:6]) for path in duv.glob("??????.depth.f32"))
+    if not ordinals:
+        raise FileNotFoundError(f"{clip_dir} has no duv/ frames; cut with --proxy-duv")
+
+    colour = _read_video_rgb(colour_path)
+    count = min(len(colour), len(ordinals))
+    if count == 0:
+        raise ValueError(f"{clip_dir} decoded to no frames")
+
+    present: set[int] = set()
+    panels: list[np.ndarray] = []
+    for index in range(count):
+        depth, semantic = read_frame(duv, ordinals[index])
+        present.update(np.unique(semantic).tolist())
+        row = np.hstack(
+            [
+                _label(_fit(colour[index], panel_width), "color"),
+                # Nearest, not area: these are codes and a class id averaged
+                # with its neighbour is a third class that never occurred.
+                _label(_fit(colorize_depth(depth), panel_width), "depth"),
+                _label(_fit(colorize_semantic(semantic, CWM12), panel_width), "semantic"),
+            ]
+        )
+        panels.append(row)
+
+    strip = _legend(panels[0].shape[1], 24, sorted(present), CWM12)
+    height = panels[0].shape[0] + strip.shape[0]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    writer = proxy.open_encoder(out_path, panels[0].shape[1], height, fps, kind="color")
+    try:
+        for panel in panels:
+            writer.write(np.vstack([panel, strip]))
+    finally:
+        writer.close()
+    return out_path
+
+
+def _fit(rgb: np.ndarray, width: int) -> np.ndarray:
+    """Scale a panel to `width`, keeping its aspect and its exact values."""
+    import cv2
+
+    height = round(rgb.shape[0] * width / rgb.shape[1])
+    return cv2.resize(rgb, (width, height), interpolation=cv2.INTER_NEAREST)
+
+
 def render_preview(
     condition_root: Path,
     out_path: Path,
