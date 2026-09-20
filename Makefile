@@ -49,6 +49,14 @@ PROXY_DUV ?= 0
 NODE_COUNT ?= 1
 NODE_RANK  ?= 0
 
+# `make target CLIPS_DIR=$SOMETHING_UNSET` passes an empty value, and a command
+# line assignment beats the `?=` defaults above, so the recipe runs with the
+# variable blank. What the tool then reports is `--root: expected one argument`,
+# which names the flag rather than the variable and sends the reader looking in
+# the wrong file. proxy-duv-audit is worse than confusing: its --report would
+# land on `/proxy_duv_audit.json`, at the root of the filesystem.
+need = $(if $(strip $($(1))),,$(error $(1) is empty. Pass $(1)=/path/to/dir, or leave it unset for $(if $(2),$(2),the default)))
+
 .PHONY: help venv venv-core venv-test venv-fetch doctor scenes scenes-audit preview clips clip-episodes clips-audit proxy-duv-manifest proxy-duv-audit
 
 help:
@@ -126,12 +134,15 @@ clip-episodes:
 # The audit is the one that matters: its cross-segment depth median check is
 # the only thing that catches per-segment normalisation.
 proxy-duv-manifest:
+	$(call need,CLIPS_DIR)
 	$(VPY) -m proxy_extract proxy-duv-manifest --root $(CLIPS_DIR) $(if $(PROMPTS),--prompts $(PROMPTS),)
 
 proxy-duv-audit:
+	$(call need,CLIPS_DIR)
 	$(VPY) -m proxy_extract proxy-duv-audit --root $(CLIPS_DIR) --report $(CLIPS_DIR)/proxy_duv_audit.json
 
 clips-audit:
+	$(call need,CLIPS_DIR)
 	$(VPY) -m proxy_extract clips-audit --clips-out $(CLIPS_DIR)
 
 # The delivery format is unviewable by construction, so this is the only way to
