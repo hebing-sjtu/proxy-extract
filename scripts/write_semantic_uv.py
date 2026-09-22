@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Backfill `duv/semantic.json` into an existing PROXY_DUV corpus.
+"""Write one corpus-wide `semantic.json` into an existing PROXY_DUV root.
 
-New clips get this sidecar while their first frame is written. This command is
-for a corpus produced before the sidecar existed:
+Every clip uses the same class ids and UV bytes, so the mapping belongs beside
+the clips rather than inside each one:
 
     python scripts/write_semantic_uv.py /data/.../ABot-sub-2000-clips-moge3
 
-The same canonical mapping is written into every DUV directory, as required by
-PROXY_DUV_SPEC.md. Files are tiny; duplicating the mapping makes each clip
-self-describing when copied out of the corpus on its own.
+This also removes per-clip copies written by the short-lived first
+implementation. One authoritative file is safer than ten thousand identical
+files that can later disagree.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from proxy_extract import proxy_duv
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", type=Path, help="clips or segments root")
-    parser.add_argument("--check", action="store_true", help="report missing files without writing")
+    parser.add_argument("--check", action="store_true", help="check the root file without writing")
     args = parser.parse_args()
 
     duv_dirs = sorted(path for path in args.root.glob("*/duv") if path.is_dir())
@@ -33,16 +33,24 @@ def main() -> int:
         print(f"no */duv directories under {args.root}", file=sys.stderr)
         return 2
 
-    missing = [path for path in duv_dirs if not (path / proxy_duv.SEMANTIC_NAME).is_file()]
+    path = args.root / proxy_duv.SEMANTIC_NAME
+    duplicates = [duv / proxy_duv.SEMANTIC_NAME for duv in duv_dirs]
+    duplicates = [duplicate for duplicate in duplicates if duplicate.is_file()]
     if args.check:
-        print(f"{len(duv_dirs)} DUV directories; {len(missing)} missing semantic.json")
-        return 1 if missing else 0
+        print(
+            f"{len(duv_dirs)} DUV directories; root semantic.json "
+            f"{'present' if path.is_file() else 'missing'}; "
+            f"{len(duplicates)} per-clip duplicate(s)"
+        )
+        return 0 if path.is_file() and not duplicates else 1
 
-    for path in duv_dirs:
-        # Rewrite all, not just missing files: an earlier hand-written mapping
-        # is more dangerous than no mapping because it looks authoritative.
-        proxy_duv.write_semantic_json(path)
-    print(f"{len(duv_dirs)} DUV directories -> semantic.json")
+    proxy_duv.write_semantic_json(args.root)
+    for duplicate in duplicates:
+        duplicate.unlink()
+    print(
+        f"{len(duv_dirs)} DUV directories share {path}; "
+        f"removed {len(duplicates)} per-clip duplicate(s)"
+    )
     return 0
 
 

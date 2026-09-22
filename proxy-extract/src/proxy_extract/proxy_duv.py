@@ -156,13 +156,13 @@ def semantic_uv_metadata() -> dict:
     }
 
 
-def write_semantic_json(duv_dir: Path) -> Path:
-    """Atomically write the semantic/UV sidecar required beside DUV frames."""
-    duv_dir = Path(duv_dir)
-    duv_dir.mkdir(parents=True, exist_ok=True)
-    path = duv_dir / SEMANTIC_NAME
+def write_semantic_json(root: Path) -> Path:
+    """Atomically write the corpus-wide semantic/UV contract once."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / SEMANTIC_NAME
     payload = json.dumps(semantic_uv_metadata(), indent=2, ensure_ascii=False) + "\n"
-    handle, scratch = tempfile.mkstemp(dir=duv_dir, prefix=f"{SEMANTIC_NAME}.", suffix=".tmp")
+    handle, scratch = tempfile.mkstemp(dir=root, prefix=f"{SEMANTIC_NAME}.", suffix=".tmp")
     tmp = Path(scratch)
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as file:
@@ -190,9 +190,15 @@ def write_frame(
     about. There is no value of the data that distinguishes them, so the
     caller has to.
     """
+    seg_dir = Path(seg_dir)
     duv = duv_dir_for(seg_dir)
-    if ordinal == 0 or not (duv / SEMANTIC_NAME).is_file():
-        write_semantic_json(duv)
+    # The class table is corpus-wide: every clip uses the same ids and UV
+    # bytes. Keep one copy at the root rather than ten thousand copies beside
+    # identical frames. Concurrent shards may both observe it missing, but the
+    # atomic writer is safe and their payloads are byte-identical.
+    semantic = seg_dir.parent / SEMANTIC_NAME
+    if ordinal == 0 and not semantic.is_file():
+        write_semantic_json(seg_dir.parent)
     contract.write_frame(
         duv, ordinal, depth_metres, project_labels(labels, taxonomy)
     )
