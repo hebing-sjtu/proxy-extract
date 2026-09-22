@@ -76,15 +76,15 @@ def test_one_root_semantic_json_records_the_cwm_classes_and_bit_exact_uv_codes(t
     metadata = json.loads((tmp_path / "semantic.json").read_text())
 
     assert metadata["resolution"] == {"width": 336, "height": 192}
-    assert metadata["semantic_id"]["png_mode"] == "L"
-    assert metadata["semantic_id"]["valid_range"] == [0, 11]
-    assert metadata["uv_encoding"]["u_rgb_channel"] == "G"
-    assert metadata["uv_encoding"]["v_rgb_channel"] == "B"
-    assert metadata["classes"]["0"] == {"name": "void_unknown", "u": 32, "v": 43}
-    assert metadata["classes"]["3"] == {"name": "terrain", "u": 224, "v": 43}
-    assert metadata["classes"]["4"] == {"name": "road_paved", "u": 32, "v": 128}
-    assert metadata["classes"]["11"] == {"name": "prop", "u": 224, "v": 213}
-    assert len({(item["u"], item["v"]) for item in metadata["classes"].values()}) == 12
+    assert metadata["encoding"]["semantic_png_mode"] == "L"
+    assert metadata["encoding"]["valid_class_ids"] == [0, 11]
+    assert metadata["encoding"]["u_channel"] == "G"
+    assert metadata["encoding"]["v_channel"] == "B"
+    assert metadata["classes"]["0"] == {"id": 0, "name": "void_unknown", "uv": [32, 43]}
+    assert metadata["classes"]["3"] == {"id": 3, "name": "terrain", "uv": [224, 43]}
+    assert metadata["classes"]["4"] == {"id": 4, "name": "road_paved", "uv": [32, 128]}
+    assert metadata["classes"]["11"] == {"id": 11, "name": "prop", "uv": [224, 213]}
+    assert len({tuple(item["uv"]) for item in metadata["classes"].values()}) == 12
     assert not list(tmp_path.glob("*/duv/semantic.json"))
 
 

@@ -125,31 +125,37 @@ def semantic_uv_metadata() -> dict:
     """
     width = len(SEMANTIC_U)
     return {
-        "schema": "cwm12-semantic-uv",
-        "version": 1,
+        "semantic": "clip_*/duv/%06d.semantic_id.png",
         "resolution": {
             "width": contract.CONDITION_WIDTH,
             "height": contract.CONDITION_HEIGHT,
         },
-        "semantic_id": {
-            "file_pattern": "%06d.semantic_id.png",
-            "png_mode": "L",
-            "valid_range": [0, NUM_CLASSES - 1],
-        },
-        "uv_encoding": {
-            "u_rgb_channel": "G",
-            "v_rgb_channel": "B",
+        "encoding": {
+            "semantic_pixel": "class_id",
+            "semantic_png_mode": "L",
+            "duv_pixel_rgb": ["depth_code", "semantic_u", "semantic_v"],
+            "u_channel": "G",
+            "v_channel": "B",
             "u_levels": list(SEMANTIC_U),
             "v_levels": list(SEMANTIC_V),
             "u_formula": "u_levels[semantic_id % 4]",
             "v_formula": "v_levels[semantic_id // 4]",
-            "vae_normalization": "byte / 255.0",
+            "dtype": "uint8",
+            "valid_class_ids": [0, NUM_CLASSES - 1],
+            "vae_normalization": "uv_byte / 255.0",
+            "note": (
+                "semantic_id is stored directly in the L-mode PNG. When FastVideo "
+                "packs DUV, U is the G byte and V is the B byte; U changes fastest."
+            ),
         },
         "classes": {
             str(class_id): {
+                "id": class_id,
                 "name": name,
-                "u": SEMANTIC_U[class_id % width],
-                "v": SEMANTIC_V[class_id // width],
+                "uv": [
+                    SEMANTIC_U[class_id % width],
+                    SEMANTIC_V[class_id // width],
+                ],
             }
             for class_id, name in enumerate(CLASS_NAMES)
         },
