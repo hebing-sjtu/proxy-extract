@@ -67,6 +67,14 @@ DUV_DIRNAME = "duv"
 TARGET_NAME = "video.mp4"
 ANCHOR_NAME = "anchor.png"
 MANIFEST_NAME = "encode_manifest.jsonl"
+SEMANTIC_NAME = "semantic.json"
+
+# FastVideo's authoritative 4x3 semantic grid. U changes fastest: ids 0..3
+# walk across the first row, then ids 4..7 the second. Swapping the axes still
+# yields twelve distinct codes and therefore fails silently, so keep the
+# formula in the metadata as well as its evaluated values.
+SEMANTIC_U = (32, 96, 160, 224)
+SEMANTIC_V = (43, 128, 213)
 
 # The consumer's window. `--num-frames` must satisfy n % 17 == 5 for the H3
 # causal VAE, and 124 is the default it ships with; a segment shorter than this
@@ -107,6 +115,64 @@ def duv_dir_for(seg_dir: Path) -> Path:
     return Path(seg_dir) / DUV_DIRNAME
 
 
+def semantic_uv_metadata() -> dict:
+    """The CWM class-id to packed-DUV `(U, V)` mapping.
+
+    Byte values are what an RGB DUV frame carries in G and B. FastVideo divides
+    them by 255 before feeding the VAE; recording bytes rather than rounded
+    floats keeps the mapping bit-exact and lets any consumer choose its own
+    numeric representation.
+    """
+    width = len(SEMANTIC_U)
+    return {
+        "schema": "cwm12-semantic-uv",
+        "version": 1,
+        "resolution": {
+            "width": contract.CONDITION_WIDTH,
+            "height": contract.CONDITION_HEIGHT,
+        },
+        "semantic_id": {
+            "file_pattern": "%06d.semantic_id.png",
+            "png_mode": "L",
+            "valid_range": [0, NUM_CLASSES - 1],
+        },
+        "uv_encoding": {
+            "u_rgb_channel": "G",
+            "v_rgb_channel": "B",
+            "u_levels": list(SEMANTIC_U),
+            "v_levels": list(SEMANTIC_V),
+            "u_formula": "u_levels[semantic_id % 4]",
+            "v_formula": "v_levels[semantic_id // 4]",
+            "vae_normalization": "byte / 255.0",
+        },
+        "classes": {
+            str(class_id): {
+                "name": name,
+                "u": SEMANTIC_U[class_id % width],
+                "v": SEMANTIC_V[class_id // width],
+            }
+            for class_id, name in enumerate(CLASS_NAMES)
+        },
+    }
+
+
+def write_semantic_json(duv_dir: Path) -> Path:
+    """Atomically write the semantic/UV sidecar required beside DUV frames."""
+    duv_dir = Path(duv_dir)
+    duv_dir.mkdir(parents=True, exist_ok=True)
+    path = duv_dir / SEMANTIC_NAME
+    payload = json.dumps(semantic_uv_metadata(), indent=2, ensure_ascii=False) + "\n"
+    handle, scratch = tempfile.mkstemp(dir=duv_dir, prefix=f"{SEMANTIC_NAME}.", suffix=".tmp")
+    tmp = Path(scratch)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as file:
+            file.write(payload)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return path
+
+
 def write_frame(
     seg_dir: Path,
     ordinal: int,
@@ -124,8 +190,11 @@ def write_frame(
     about. There is no value of the data that distinguishes them, so the
     caller has to.
     """
+    duv = duv_dir_for(seg_dir)
+    if ordinal == 0 or not (duv / SEMANTIC_NAME).is_file():
+        write_semantic_json(duv)
     contract.write_frame(
-        duv_dir_for(seg_dir), ordinal, depth_metres, project_labels(labels, taxonomy)
+        duv, ordinal, depth_metres, project_labels(labels, taxonomy)
     )
 
 

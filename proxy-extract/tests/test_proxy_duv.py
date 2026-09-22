@@ -69,6 +69,23 @@ def test_a_frame_lands_where_the_consumer_opens_it(tmp_path):
         assert image.size == (W, H) == (336, 192)
 
 
+def test_semantic_json_records_the_cwm_classes_and_bit_exact_uv_codes(tmp_path):
+    seg = _write_segment(tmp_path, "seg_000000", frames=1)
+
+    metadata = json.loads((seg / "duv" / "semantic.json").read_text())
+
+    assert metadata["resolution"] == {"width": 336, "height": 192}
+    assert metadata["semantic_id"]["png_mode"] == "L"
+    assert metadata["semantic_id"]["valid_range"] == [0, 11]
+    assert metadata["uv_encoding"]["u_rgb_channel"] == "G"
+    assert metadata["uv_encoding"]["v_rgb_channel"] == "B"
+    assert metadata["classes"]["0"] == {"name": "void_unknown", "u": 32, "v": 43}
+    assert metadata["classes"]["3"] == {"name": "terrain", "u": 224, "v": 43}
+    assert metadata["classes"]["4"] == {"name": "road_paved", "u": 32, "v": 128}
+    assert metadata["classes"]["11"] == {"name": "prop", "u": 224, "v": 213}
+    assert len({(item["u"], item["v"]) for item in metadata["classes"].values()}) == 12
+
+
 def test_the_depth_is_little_endian_float32_metres(tmp_path):
     seg = _write_segment(tmp_path, "seg_000000", metres=7.5, frames=1)
 
