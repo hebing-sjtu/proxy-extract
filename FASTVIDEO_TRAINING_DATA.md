@@ -432,9 +432,12 @@ scripts/h3_proxy/prepare_data/encode_proxy_shards.sh \
   --proxy-height 192 \
   --proxy-width 336 \
   --anchor-short-edge 2048 \
-  --qwen-video-fps 24 \
+  --qwen-video-fps 2 \
   --cwm-system w0
 ```
+
+这里的 `--qwen-video-fps 2` 只控制 Qwen3-VL 观看 `<Video 1>` 时的时间采样率。
+源视频、target VAE 和 proxy VAE 仍使用完整的 124 帧（24 fps），不会降采样为 2 fps。
 
 `encode_proxy_shards.sh`：
 
@@ -495,7 +498,7 @@ python scripts/h3_proxy/describe_cache.py \
 - target 为 `768×1344`
 - proxy 为 `192×336`
 - `num_frames = 124`
-- `qwen_video_fps = 24`
+- `qwen_video_fps = 2`
 - `cwm_system = w0`
 - 整个 cache 的几何只有一种
 
