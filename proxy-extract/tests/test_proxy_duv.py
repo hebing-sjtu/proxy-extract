@@ -193,6 +193,25 @@ def test_a_consistent_corpus_raises_no_warning(tmp_path):
     assert summary["median_spread"] < proxy_duv.MAX_MEDIAN_SPREAD
 
 
+def test_the_audit_reports_progress_without_changing_its_result(tmp_path):
+    for index in range(2):
+        _write_segment(tmp_path, f"seg_{index:06d}", metres=10.0 + index)
+    events = []
+
+    summary = proxy_duv.audit_root(
+        tmp_path,
+        frames=FRAMES,
+        progress=lambda done, total, segment: events.append((done, total, segment)),
+    )
+
+    assert summary["audited"] == 2
+    assert events == [
+        (0, 2, ""),
+        (1, 2, "seg_000000"),
+        (2, 2, "seg_000001"),
+    ]
+
+
 def test_a_sky_written_as_a_surface_is_caught(tmp_path):
     """Valid everywhere means the sky became a ceiling at a finite depth.
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -362,6 +363,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="frames every segment must have at least (default: %(default)s)",
     )
     duv_audit.add_argument("--report", type=Path, help="also write the JSON here")
+    duv_audit.add_argument(
+        "--progress-every", type=int, default=10, metavar="N",
+        help="print progress and ETA every N segments; 0 disables it (default: %(default)s)",
+    )
     duv_audit.add_argument(
         "--per-segment", action="store_true",
         help="print every segment's statistics, not just the corpus summary",
@@ -919,7 +924,29 @@ def _run_proxy_duv_manifest(args: argparse.Namespace) -> int:
 def _run_proxy_duv_audit(args: argparse.Namespace) -> int:
     from . import proxy_duv
 
-    summary = proxy_duv.audit_root(args.root, frames=args.frames)
+    started = time.monotonic()
+
+    def report_progress(done: int, total: int, segment: str) -> None:
+        every = args.progress_every
+        if every <= 0 or total < every:
+            return
+        if done == 0:
+            print(f"audit: 0/{total} segments; this re-reads every DUV frame", file=sys.stderr, flush=True)
+            return
+        if done % every != 0 and done != total:
+            return
+        elapsed = time.monotonic() - started
+        rate = done / max(elapsed, 1e-9)
+        eta = (total - done) / max(rate, 1e-9)
+        print(
+            f"audit: {done}/{total} segments ({done / total:.1%}), "
+            f"{rate * 60:.1f} segments/min, elapsed {elapsed / 60:.1f}m, "
+            f"eta {eta / 60:.1f}m; last {segment}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    summary = proxy_duv.audit_root(args.root, frames=args.frames, progress=report_progress)
     detail = summary.pop("segment_stats")
     print(json.dumps(summary, indent=2))
     if args.per_segment:

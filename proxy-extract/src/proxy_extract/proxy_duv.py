@@ -54,6 +54,7 @@ import json
 import math
 import os
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -330,7 +331,12 @@ def audit_seg(seg_dir: Path, *, frames: int = SPEC_FRAMES) -> SegStats:
 _PERCENTILE_STRIDE = 8
 
 
-def audit_root(root: Path, *, frames: int = SPEC_FRAMES) -> dict:
+def audit_root(
+    root: Path,
+    *,
+    frames: int = SPEC_FRAMES,
+    progress: Callable[[int, int, str], None] | None = None,
+) -> dict:
     """Audit every segment under `root`, and compare them against each other.
 
     The cross-segment comparison is the point. Each of the warnings below
@@ -349,7 +355,9 @@ def audit_root(root: Path, *, frames: int = SPEC_FRAMES) -> dict:
 
     stats: list[SegStats] = []
     failures: list[dict] = []
-    for seg in segs:
+    if progress is not None:
+        progress(0, len(segs), "")
+    for index, seg in enumerate(segs, start=1):
         try:
             stats.append(audit_seg(seg, frames=frames))
         except (ValueError, OSError) as error:
@@ -359,6 +367,8 @@ def audit_root(root: Path, *, frames: int = SPEC_FRAMES) -> dict:
             # a full disk. Catching only the named ones let one bad segment end
             # the audit of two thousand, which is the opposite of the point.
             failures.append({"seg": seg.name, "error": f"{type(error).__name__}: {error}"})
+        if progress is not None:
+            progress(index, len(segs), seg.name)
 
     warnings: list[str] = []
     medians = sorted(item.percentiles["p50"] for item in stats if item.percentiles["p50"] > 0)
