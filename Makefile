@@ -22,6 +22,11 @@ OUT_DIR  ?= /data/binghe/datasets/ABot-sub-2000
 # rather than by VRAM; run_scenes.sh checks it and warns.
 WORKERS_PER_GPU ?= 6
 
+# The corpus audit is CPU/storage bound rather than GPU bound. Keep its default
+# conservative for shared mounts; large local/NVMe-backed nodes can pass
+# `AUDIT_WORKERS=32` explicitly.
+AUDIT_WORKERS ?= 1
+
 # Which per-frame streams outlive the encode. Only depth holds what the videos
 # cannot; see RUNBOOK section 4 before turning this down.
 KEEP_FRAMES ?= color,depth,semantic,duv
@@ -84,7 +89,7 @@ help:
 	@echo "治闪烁 + PROXY_DUV 交付（RUNBOOK 第 5 节）"
 	@echo "  make clip-episodes DEPTH=moge3 REFINER=sam2 PROXY_DUV=1"
 	@echo "  make proxy-duv-manifest   写 encode_manifest.jsonl"
-	@echo "  make proxy-duv-audit      跑跨段验收，逐段归一化只有这条能查出来"
+	@echo "  make proxy-duv-audit AUDIT_WORKERS=32   并行跑跨段验收"
 	@echo "  双节点：两边都加 NODE_COUNT=2，一边 NODE_RANK=0 一边 NODE_RANK=1"
 	@echo
 	@echo "路径用 DATA_DIR= 和 OUT_DIR= 覆盖，worker 数用 WORKERS_PER_GPU=。"
@@ -139,7 +144,8 @@ proxy-duv-manifest:
 
 proxy-duv-audit:
 	$(call need,CLIPS_DIR)
-	$(VPY) -m proxy_extract proxy-duv-audit --root $(CLIPS_DIR) --report $(CLIPS_DIR)/proxy_duv_audit.json
+	$(VPY) -m proxy_extract proxy-duv-audit --root $(CLIPS_DIR) \
+	  --report $(CLIPS_DIR)/proxy_duv_audit.json --workers $(AUDIT_WORKERS)
 
 clips-audit:
 	$(call need,CLIPS_DIR)

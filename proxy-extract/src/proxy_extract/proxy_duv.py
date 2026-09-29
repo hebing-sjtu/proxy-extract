@@ -55,6 +55,7 @@ import math
 import os
 import tempfile
 from collections.abc import Callable
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -274,16 +275,6 @@ def audit_seg(seg_dir: Path, *, frames: int = SPEC_FRAMES) -> SegStats:
     if not duv.is_dir():
         raise ProxyDuvError(f"{seg_dir} has no {DUV_DIRNAME}/ directory")
 
-    # Not `expected_frames=frames`: the spec asks for *at least* 124, and a
-    # longer segment is fine as long as the ordinals are contiguous from zero.
-    structural = contract.validate_condition_root(duv)
-    if structural["frames"] < frames:
-        raise ProxyDuvError(
-            f"{seg_dir.name} is short of the window: {structural['frames']} frames "
-            f"where {frames} are needed. The consumer opens range({frames}) and a "
-            "missing ordinal is an ENOENT partway through building the cache."
-        )
-
     valid_total = 0
     pixels = 0
     below = 0
@@ -294,8 +285,9 @@ def audit_seg(seg_dir: Path, *, frames: int = SPEC_FRAMES) -> SegStats:
     # decimal places. The stride is over pixels, not frames, so every frame
     # still contributes - a per-frame sample would miss a single bad frame.
     sampled: list[np.ndarray] = []
-    for ordinal in range(structural["frames"]):
-        depth, _ = contract.read_frame(duv, ordinal)
+
+    def collect_statistics(_ordinal: int, depth: np.ndarray, _semantic: np.ndarray) -> None:
+        nonlocal valid_total, pixels, below, above
         flat = depth.ravel()
         valid = flat > contract.DEPTH_VALID_EPSILON_METRES
         pixels += flat.size
@@ -304,6 +296,18 @@ def audit_seg(seg_dir: Path, *, frames: int = SPEC_FRAMES) -> SegStats:
         below += int((metres < contract.DEPTH_NEAR_METRES).sum())
         above += int((metres > contract.DEPTH_FAR_METRES).sum())
         sampled.append(metres[::_PERCENTILE_STRIDE])
+
+    # Not `expected_frames=frames`: the spec asks for *at least* 124, and a
+    # longer segment is fine as long as the ordinals are contiguous from zero.
+    # The observer gathers acceptance statistics during the contract's
+    # authoritative validation pass, avoiding a second read of every frame.
+    structural = contract.validate_condition_root(duv, frame_observer=collect_statistics)
+    if structural["frames"] < frames:
+        raise ProxyDuvError(
+            f"{seg_dir.name} is short of the window: {structural['frames']} frames "
+            f"where {frames} are needed. The consumer opens range({frames}) and a "
+            "missing ordinal is an ENOENT partway through building the cache."
+        )
 
     pooled = np.concatenate(sampled) if sampled else np.zeros(0, dtype=np.float32)
     percentiles = (
@@ -335,6 +339,7 @@ def audit_root(
     root: Path,
     *,
     frames: int = SPEC_FRAMES,
+    workers: int = 1,
     progress: Callable[[int, int, str], None] | None = None,
 ) -> dict:
     """Audit every segment under `root`, and compare them against each other.
@@ -352,23 +357,60 @@ def audit_root(
     segs = segment_dirs(root)
     if not segs:
         raise ProxyDuvError(f"no segment holds a {DUV_DIRNAME}/ directory under {root}")
+    if workers < 1:
+        raise ValueError(f"workers must be at least 1, got {workers}")
 
     stats: list[SegStats] = []
     failures: list[dict] = []
     if progress is not None:
         progress(0, len(segs), "")
-    for index, seg in enumerate(segs, start=1):
-        try:
-            stats.append(audit_seg(seg, frames=frames))
-        except (ValueError, OSError) as error:
+
+    def record(seg: Path, result: SegStats | BaseException) -> None:
+        if isinstance(result, BaseException):
             # ValueError rather than the two named subclasses: `contract` raises
             # bare ValueErrors from its byte-count and PNG-mode assertions, and
             # those are the most likely failures of all - a write cut short by
             # a full disk. Catching only the named ones let one bad segment end
             # the audit of two thousand, which is the opposite of the point.
-            failures.append({"seg": seg.name, "error": f"{type(error).__name__}: {error}"})
-        if progress is not None:
-            progress(index, len(segs), seg.name)
+            if not isinstance(result, (ValueError, OSError)):
+                raise result
+            failures.append({"seg": seg.name, "error": f"{type(result).__name__}: {result}"})
+        else:
+            stats.append(result)
+
+    if workers == 1:
+        for index, seg in enumerate(segs, start=1):
+            try:
+                result: SegStats | BaseException = audit_seg(seg, frames=frames)
+            except (ValueError, OSError) as error:
+                result = error
+            record(seg, result)
+            if progress is not None:
+                progress(index, len(segs), seg.name)
+    else:
+        executor = ProcessPoolExecutor(max_workers=min(workers, len(segs)))
+        futures = {}
+        try:
+            futures = {executor.submit(audit_seg, seg, frames=frames): seg for seg in segs}
+            for index, future in enumerate(as_completed(futures), start=1):
+                seg = futures[future]
+                try:
+                    result = future.result()
+                except (ValueError, OSError) as error:
+                    result = error
+                record(seg, result)
+                if progress is not None:
+                    progress(index, len(segs), seg.name)
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown()
+
+    stats.sort(key=lambda item: item.seg)
+    failures.sort(key=lambda item: item["seg"])
 
     warnings: list[str] = []
     medians = sorted(item.percentiles["p50"] for item in stats if item.percentiles["p50"] > 0)

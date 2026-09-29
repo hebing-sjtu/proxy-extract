@@ -15,13 +15,18 @@ import time
 import traceback
 from pathlib import Path
 
-from . import accel
+from . import accel, contract
 from . import cameras as camera_io
 from . import clips as clip_defaults
-from . import contract
 from . import proxy_duv as proxy_duv_defaults
 from .frames import STREAMS as FRAME_STREAMS
-from .pipeline import ExtractionConfig, condition_dir_for, extract_clip, extract_dataset, shard
+from .pipeline import (
+    ExtractionConfig,
+    condition_dir_for,
+    extract_clip,
+    extract_dataset,
+    shard,
+)
 from .proxy import DEFAULT_COLOR_CRF
 from .streaming import DEFAULT_BLOCK
 from .temporal import DEFAULT_MIN_RUN, DEFAULT_RADIUS
@@ -363,6 +368,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="frames every segment must have at least (default: %(default)s)",
     )
     duv_audit.add_argument("--report", type=Path, help="also write the JSON here")
+    duv_audit.add_argument(
+        "--workers", type=int, default=1, metavar="N",
+        help="process segments in N worker processes; storage bandwidth usually saturates before CPU (default: 1)",
+    )
     duv_audit.add_argument(
         "--progress-every", type=int, default=10, metavar="N",
         help="print progress and ETA every N segments; 0 disables it (default: %(default)s)",
@@ -924,6 +933,8 @@ def _run_proxy_duv_manifest(args: argparse.Namespace) -> int:
 def _run_proxy_duv_audit(args: argparse.Namespace) -> int:
     from . import proxy_duv
 
+    if args.workers < 1:
+        raise SystemExit(f"--workers must be at least 1, got {args.workers}")
     started = time.monotonic()
 
     def report_progress(done: int, total: int, segment: str) -> None:
@@ -931,7 +942,11 @@ def _run_proxy_duv_audit(args: argparse.Namespace) -> int:
         if every <= 0 or total < every:
             return
         if done == 0:
-            print(f"audit: 0/{total} segments; this re-reads every DUV frame", file=sys.stderr, flush=True)
+            print(
+                f"audit: 0/{total} segments with {args.workers} worker(s); each DUV frame is read once",
+                file=sys.stderr,
+                flush=True,
+            )
             return
         if done % every != 0 and done != total:
             return
@@ -946,7 +961,12 @@ def _run_proxy_duv_audit(args: argparse.Namespace) -> int:
             flush=True,
         )
 
-    summary = proxy_duv.audit_root(args.root, frames=args.frames, progress=report_progress)
+    summary = proxy_duv.audit_root(
+        args.root,
+        frames=args.frames,
+        workers=args.workers,
+        progress=report_progress,
+    )
     detail = summary.pop("segment_stats")
     print(json.dumps(summary, indent=2))
     if args.per_segment:

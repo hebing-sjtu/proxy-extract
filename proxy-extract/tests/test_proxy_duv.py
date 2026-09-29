@@ -157,6 +157,23 @@ def test_the_audit_reports_the_numbers_section_eight_asks_for(tmp_path):
     assert SKY in stats.classes_present
 
 
+def test_the_audit_reads_each_frame_only_once(tmp_path, monkeypatch):
+    seg = _write_segment(tmp_path, "seg_000000", metres=12.0)
+    original = proxy_duv.contract.read_frame
+    reads = 0
+
+    def counted_read(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(proxy_duv.contract, "read_frame", counted_read)
+
+    proxy_duv.audit_seg(seg, frames=FRAMES)
+
+    assert reads == FRAMES
+
+
 def test_a_segment_shorter_than_the_window_is_refused(tmp_path):
     seg = _write_segment(tmp_path, "seg_000000", frames=4)
 
@@ -191,6 +208,16 @@ def test_a_consistent_corpus_raises_no_warning(tmp_path):
 
     assert summary["warnings"] == []
     assert summary["median_spread"] < proxy_duv.MAX_MEDIAN_SPREAD
+
+
+def test_the_audit_can_process_segments_in_parallel(tmp_path):
+    for index, metres in enumerate((10.0, 12.0, 14.0, 11.0)):
+        _write_segment(tmp_path, f"seg_{index:06d}", metres=metres)
+
+    serial = proxy_duv.audit_root(tmp_path, frames=FRAMES)
+    parallel = proxy_duv.audit_root(tmp_path, frames=FRAMES, workers=2)
+
+    assert parallel == serial
 
 
 def test_the_audit_reports_progress_without_changing_its_result(tmp_path):

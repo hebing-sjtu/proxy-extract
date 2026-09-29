@@ -16,6 +16,7 @@ from __future__ import annotations
 import math
 import os
 import warnings
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -226,11 +227,18 @@ class ContractError(ValueError):
     """A condition_root does not satisfy what code-world-model will accept."""
 
 
-def validate_condition_root(root: Path, *, expected_frames: int | None = None) -> dict:
+def validate_condition_root(
+    root: Path,
+    *,
+    expected_frames: int | None = None,
+    frame_observer: Callable[[int, np.ndarray, np.ndarray], None] | None = None,
+) -> dict:
     """Re-read a written condition_root and apply every check the loader applies.
 
     Running this in-process after writing is much cheaper than discovering a
-    malformed frame when `prepare` throws 124 frames into a window.
+    malformed frame when `prepare` throws 124 frames into a window. When an
+    observer is supplied, it sees each frame after validation so callers can
+    collect additional statistics without reading the files a second time.
     """
     root = Path(root)
     if not root.is_dir():
@@ -262,6 +270,8 @@ def validate_condition_root(root: Path, *, expected_frames: int | None = None) -
             depth_min = min(depth_min, float(depth[valid].min()))
             depth_max = max(depth_max, float(depth[valid].max()))
         classes_seen.update(np.unique(semantic).tolist())
+        if frame_observer is not None:
+            frame_observer(ordinal, depth, semantic)
 
     pixels = len(ordinals) * CONDITION_HEIGHT * CONDITION_WIDTH
     return {

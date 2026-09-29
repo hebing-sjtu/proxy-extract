@@ -147,6 +147,23 @@ class TestValidation:
         with pytest.raises(contract.ContractError, match="expected 124"):
             contract.validate_condition_root(tmp_path, expected_frames=124)
 
+    def test_validation_can_observe_each_already_validated_frame(self, tmp_path, rng):
+        self._write_run(tmp_path, rng, 3)
+        seen = []
+
+        contract.validate_condition_root(
+            tmp_path,
+            frame_observer=lambda ordinal, depth, semantic: seen.append(
+                (ordinal, depth.shape, semantic.shape)
+            ),
+        )
+
+        assert seen == [
+            (ordinal, (contract.CONDITION_HEIGHT, contract.CONDITION_WIDTH),
+             (contract.CONDITION_HEIGHT, contract.CONDITION_WIDTH))
+            for ordinal in range(3)
+        ]
+
 
 class TestWindowArithmetic:
     @pytest.mark.parametrize(
