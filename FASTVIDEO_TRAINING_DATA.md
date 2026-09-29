@@ -243,8 +243,20 @@ mean_score  0.944
 ```
 
 因此原始 `encode_manifest.jsonl` 有 `9985` 行，其中 `325 = 264 + 61` 行没有可训练的
-`prompt`；文本门禁后最多有 `9660` 个候选 clip。`warned` 仍保留。最终训练数量还要扣除
-episode 级 validation holdout；同时必须先完成 DUV audit，不能在这一步写死。
+`prompt`；基础文本门禁后最多有 `9660` 个候选 clip。本轮采用更严格的训练门禁：`missing`、
+`failed`、`warned` 全部丢弃，并要求 `score >= 0.90`。
+
+最终 strict split 实测结果：
+
+```text
+source                         9985
+text missing/failed/warned     1218
+score below 0.90                432
+eligible                       8335
+train                          8238
+val                              97
+val episodes                     24
+```
 
 检查命令：
 
@@ -293,8 +305,8 @@ python scripts/write_semantic_uv.py "$CLIPS_DIR" --check
 `proxy_duv_audit.json` 的价值不只是结构检查。逐片归一化的深度可以让每一帧都合法，只有跨片比较
 深度中位数才能发现整批标度不可比较。
 
-当前首次并行 audit 已确认 `9985/9985` 个 segment 结构完整、每片至少 124 帧、`failed = 0`，
-深度 median p10/p90 为 `5.4762/12.2773 m`，spread 为 `2.242×`。同时发现旧 writer 没有强制
+首次并行 audit 已确认 `9985/9985` 个 segment 结构完整、每片至少 124 帧、`failed = 0`。
+同时发现旧 writer 没有强制
 将语义天空位置的 depth 置 0；旧 audit 用整片 depth 有效率间接推断天空，因此也会误报没有天空、
 但 depth 100% 有效的画面。
 
@@ -306,8 +318,18 @@ make proxy-duv-repair-sky CLIPS_DIR="$CLIPS_DIR" AUDIT_WORKERS=32
 make proxy-duv-audit CLIPS_DIR="$CLIPS_DIR" AUDIT_WORKERS=32
 ```
 
-第二次 audit 确认没有“semantic sky pixels carry valid depth”后，才生成 `_fastvideo/` split 并编码。
-没有 semantic sky 的 clip 仍可能产生 `no sky` 提示；该提示本身不是 depth 损坏。
+修复后的第二次 audit 已通过：
+
+```text
+segments       9985
+audited        9985
+failed            0
+median_spread  2.227
+warnings           0
+notices          463
+```
+
+`463` 条 notice 都是不阻塞的 `no sky` 提示；没有 semantic sky 的 clip 本身不是 depth 损坏。
 
 ---
 
@@ -349,9 +371,11 @@ make proxy-duv-manifest CLIPS_DIR="$CLIPS_DIR"
 
 下面从原始 manifest：
 
-1. 丢掉没有 prompt 的行；
-2. 按 episode 留出 24 个验证 episode；
-3. 写入数据根目录 `_fastvideo/`。
+1. 只保留通过 DUV audit 的行；
+2. 丢掉 caption `missing / failed / warned`；
+3. 丢掉 `score < 0.90`；
+4. 按 episode 留出 24 个验证 episode；
+5. 写入数据根目录 `_fastvideo/`。
 
 ```bash
 export CLIPS_DIR=/data/binghe/datasets/ABot-sub-2000-clips-moge3
@@ -359,36 +383,65 @@ export CLIPS_DIR=/data/binghe/datasets/ABot-sub-2000-clips-moge3
 python - <<'PY'
 import json
 import os
+from collections import Counter
 from pathlib import Path
 
+from clip_prompts.contract import Caption
+
 root = Path(os.environ["CLIPS_DIR"])
-rows = [
+source = [
     json.loads(line)
     for line in (root / "encode_manifest.jsonl").read_text().splitlines()
     if line.strip()
 ]
 
-with_prompt = [
-    row for row in rows
-    if isinstance(row.get("prompt"), str) and row["prompt"].strip()
-]
-dropped = len(rows) - len(with_prompt)
-if not with_prompt:
-    raise SystemExit("no manifest row has a prompt; finish captions-export before splitting")
+audit = json.loads((root / "proxy_duv_audit.json").read_text())
+captions = json.loads((root / "captions_audit.json").read_text())
+assert audit["failed"] == 0
+assert not audit["warnings"]
+
+good_duv = {row["seg"] for row in audit["segment_stats"]}
+text_rejected = set(captions["missing"]) | set(captions["failed"]) | set(captions["warned"])
+eligible = []
+rejected = Counter()
+
+for row in source:
+    name = row["name"]
+    if name not in good_duv:
+        rejected["duv"] += 1
+        continue
+    if name in text_rejected:
+        rejected["text_missing_failed_or_warned"] += 1
+        continue
+    if not isinstance(row.get("prompt"), str) or not row["prompt"].strip():
+        rejected["no_manifest_prompt"] += 1
+        continue
+    if "proxy_duv" not in row or "proxy_duv_video" in row:
+        rejected["wrong_proxy_type"] += 1
+        continue
+    try:
+        caption = Caption.read(root / name / "annotations" / "prompt.json")
+        score = caption.provenance.get("score")
+    except Exception:
+        rejected["unreadable_caption"] += 1
+        continue
+    if not isinstance(score, (int, float)) or score < 0.90:
+        rejected["score_below_0.90"] += 1
+        continue
+    eligible.append(row)
 
 def episode(row):
-    # clip_000414_2 -> 000414
-    return str(row["name"]).split("_")[-2]
+    return str(row["name"]).rsplit("_", 1)[0]
 
-episodes = sorted({episode(row) for row in with_prompt})
+episodes = sorted({episode(row) for row in eligible})
 val_count = min(24, len(episodes))
 val_episodes = {
     episodes[int(index * len(episodes) / val_count)]
     for index in range(val_count)
 }
 
-train = [row for row in with_prompt if episode(row) not in val_episodes]
-val = [row for row in with_prompt if episode(row) in val_episodes]
+train = [row for row in eligible if episode(row) not in val_episodes]
+val = [row for row in eligible if episode(row) in val_episodes]
 
 out = root / "_fastvideo"
 out.mkdir(exist_ok=True)
@@ -401,13 +454,19 @@ for name, split in (("train.jsonl", train), ("val.jsonl", val)):
 assert {episode(row) for row in train}.isdisjoint(
     {episode(row) for row in val}
 )
-print({
-    "source": len(rows),
-    "without_prompt_dropped": dropped,
+summary = {
+    "source": len(source),
+    "eligible": len(eligible),
     "train": len(train),
     "val": len(val),
     "val_episodes": len(val_episodes),
-})
+    "score_threshold": 0.90,
+    "rejected": dict(rejected),
+}
+(out / "split_summary.json").write_text(
+    json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
+)
+print(json.dumps(summary, ensure_ascii=False, indent=2))
 PY
 ```
 
@@ -417,7 +476,8 @@ PY
 ABot-sub-2000-clips-moge3/
 └── _fastvideo/
     ├── train.jsonl
-    └── val.jsonl
+    ├── val.jsonl
+    └── split_summary.json
 ```
 
 训练前检查：
@@ -449,13 +509,14 @@ FastVideo 不在训练时现场跑 VAE 或 Qwen3-VL。先把每片编码成一�
 export CLIPS_DIR=/data/binghe/datasets/ABot-sub-2000-clips-moge3
 export CACHE_DIR=/data/binghe/h3_proxy/cache/abot_moge3_sam2_w0_qwen2
 export MODEL_PATH=/data/models/MiniMax-H3
+export LOG_DIR="${CACHE_DIR}_logs"
 
 cd /workspace/FastVideo
 
 python scripts/h3_proxy/prepare_models/verify_h3_snapshot.py \
   --path "$MODEL_PATH" --profile ref2va
 
-NUM_SHARDS=8 STAGGER_SEC=45 \
+NUM_SHARDS=8 STAGGER_SEC=45 LOG_DIR="$LOG_DIR" \
 scripts/h3_proxy/prepare_data/encode_proxy_shards.sh \
   --manifest "$CLIPS_DIR/_fastvideo/train.jsonl" \
   --root "$CLIPS_DIR" \
@@ -470,6 +531,42 @@ scripts/h3_proxy/prepare_data/encode_proxy_shards.sh \
   --qwen-video-fps 2 \
   --cwm-system w0
 ```
+
+双节点各 8 张 H200 时，两边必须看到同一个 manifest、`CACHE_DIR` 和 `LOG_DIR`。两边运行同一条命令，
+只改 `NODE_RANK`；节点 0 取全局 shard `0..7`，节点 1 取 `8..15`：
+
+```bash
+# 两个节点都设置；节点 0 填 0，节点 1 填 1
+export NODE_COUNT=2
+export NODE_RANK=0
+
+# 每节点 8 个 encoder 进程。限制每进程 CPU 线程，避免 8×224 线程过度订阅。
+export OMP_NUM_THREADS=12
+export MKL_NUM_THREADS=12
+export OPENBLAS_NUM_THREADS=12
+export NUMEXPR_NUM_THREADS=12
+export TOKENIZERS_PARALLELISM=false
+
+NUM_SHARDS=8 NODE_COUNT="$NODE_COUNT" NODE_RANK="$NODE_RANK" \
+STAGGER_SEC=60 LOG_DIR="$LOG_DIR" \
+scripts/h3_proxy/prepare_data/encode_proxy_shards.sh \
+  --manifest "$CLIPS_DIR/_fastvideo/train.jsonl" \
+  --root "$CLIPS_DIR" \
+  --output "$CACHE_DIR" \
+  --model-path "$MODEL_PATH" \
+  --num-frames 124 \
+  --height 768 \
+  --width 1344 \
+  --proxy-height 192 \
+  --proxy-width 336 \
+  --anchor-short-edge 2048 \
+  --qwen-video-fps 2 \
+  --cwm-system w0
+```
+
+建议先启动节点 0，约 30 秒后再启动节点 1，避免两节点同时从存储加载 16 份约 64 GB 的
+Qwen3-VL。不要在两边都使用 `NODE_RANK=0`，否则会重复处理 shard `0..7`。多节点下某个节点先结束时
+cache 尚未达到 8238 是正常的；等两边都结束后统一运行 `describe_cache.py`。
 
 这里的 `--qwen-video-fps 2` 只控制 Qwen3-VL 观看 `<Video 1>` 时的时间采样率。
 源视频、target VAE 和 proxy VAE 仍使用完整的 124 帧（24 fps），不会降采样为 2 fps。
@@ -491,7 +588,7 @@ given latent frames        1
 `encode_proxy_shards.sh`：
 
 - 默认每张可见 GPU 一个进程
-- shard `i` 处理 manifest 的 `i::N`
+- shard `i` 处理 manifest 的 `i::N`；双节点的 `N=16`
 - 已存在的 `.pt` 自动跳过
 - 中断后重跑同一命令即可 resume
 - 日志默认写到 cache 同级 `encode_logs/`
