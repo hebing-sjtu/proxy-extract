@@ -381,6 +381,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="print every segment's statistics, not just the corpus summary",
     )
 
+    duv_repair_sky = sub.add_parser(
+        "proxy-duv-repair-sky",
+        help="set metric depth to zero wherever semantic_id is sky",
+    )
+    duv_repair_sky.add_argument("--root", type=Path, required=True)
+    duv_repair_sky.add_argument(
+        "--workers", type=int, default=1, metavar="N",
+        help="process segments in N worker processes (default: 1)",
+    )
+    duv_repair_sky.add_argument(
+        "--progress-every", type=int, default=10, metavar="N",
+        help="print progress and ETA every N segments; 0 disables it (default: %(default)s)",
+    )
+    duv_repair_sky.add_argument(
+        "--apply", action="store_true",
+        help="rewrite inconsistent depth frames atomically; without this flag, report only",
+    )
+    duv_repair_sky.add_argument("--report", type=Path, help="also write the JSON here")
+
     validate = sub.add_parser("validate", help="re-read a condition_root and check it")
     validate.add_argument("--condition-root", type=Path, required=True)
     validate.add_argument("--expect-frames", type=int)
@@ -978,10 +997,60 @@ def _run_proxy_duv_audit(args: argparse.Namespace) -> int:
 
     for line in summary["warnings"]:
         print(f"warning: {line}", file=sys.stderr)
+    for line in summary["notices"]:
+        print(f"notice: {line}", file=sys.stderr)
     # Non-zero on a warning as well as a failure. Every warning this raises
     # describes a delivery that passes the consumer's own assertions and still
     # cannot train, so letting it exit 0 would put it past a CI gate.
     return 1 if summary["failed"] or summary["warnings"] else 0
+
+
+def _run_proxy_duv_repair_sky(args: argparse.Namespace) -> int:
+    from . import proxy_duv
+
+    if args.workers < 1:
+        raise SystemExit(f"--workers must be at least 1, got {args.workers}")
+    started = time.monotonic()
+
+    def report_progress(done: int, total: int, segment: str) -> None:
+        every = args.progress_every
+        if every <= 0 or total < every:
+            return
+        if done == 0:
+            mode = "repairing" if args.apply else "checking"
+            print(
+                f"sky depth: {mode} 0/{total} segments with {args.workers} worker(s)",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+        if done % every != 0 and done != total:
+            return
+        elapsed = time.monotonic() - started
+        rate = done / max(elapsed, 1e-9)
+        eta = (total - done) / max(rate, 1e-9)
+        print(
+            f"sky depth: {done}/{total} segments ({done / total:.1%}), "
+            f"{rate * 60:.1f} segments/min, elapsed {elapsed / 60:.1f}m, "
+            f"eta {eta / 60:.1f}m; last {segment}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    summary = proxy_duv.repair_sky_root(
+        args.root,
+        workers=args.workers,
+        apply=args.apply,
+        progress=report_progress,
+    )
+    detail = summary.pop("segment_stats")
+    print(json.dumps(summary, indent=2))
+    if args.report:
+        args.report.write_text(json.dumps({**summary, "segment_stats": detail}, indent=2))
+        print(f"report written to {args.report}")
+    if summary["failed"]:
+        return 1
+    return 0 if args.apply or summary["affected_segments"] == 0 else 1
 
 
 def _run_validate(args: argparse.Namespace) -> int:
@@ -1033,6 +1102,7 @@ def main(argv: list[str] | None = None) -> int:
         "clips-audit": _run_clips_audit,
         "proxy-duv-manifest": _run_proxy_duv_manifest,
         "proxy-duv-audit": _run_proxy_duv_audit,
+        "proxy-duv-repair-sky": _run_proxy_duv_repair_sky,
         "validate": _run_validate,
         "preview": _run_preview,
         "scenes-preview": _run_scenes_preview,

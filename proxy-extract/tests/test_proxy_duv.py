@@ -99,6 +99,23 @@ def test_the_depth_is_little_endian_float32_metres(tmp_path):
     assert np.all(np.isfinite(depth)) and np.all(depth >= 0)
 
 
+def test_the_writer_forces_semantic_sky_depth_to_zero(tmp_path):
+    labels = np.full((H, W), ROAD_PAVED, dtype=np.uint8)
+    labels[:20] = SKY
+    proxy_duv.write_frame(
+        tmp_path / "seg_000000",
+        0,
+        np.full((H, W), 40.0, dtype=np.float32),
+        labels,
+        taxonomy="cwm12",
+    )
+
+    depth, semantic = contract.read_frame(tmp_path / "seg_000000" / proxy_duv.DUV_DIRNAME, 0)
+
+    assert np.all(depth[semantic == SKY] == 0.0)
+    assert np.all(depth[semantic != SKY] == 40.0)
+
+
 # ----------------------------------------------------- the silent failure mode
 
 
@@ -154,6 +171,8 @@ def test_the_audit_reports_the_numbers_section_eight_asks_for(tmp_path):
     # 20 of 192 rows are sky, so a bit under 90% of pixels carry depth.
     assert 0.85 < stats.valid_fraction < 0.92
     assert stats.above_far_fraction == 0.0
+    assert 0.09 < stats.sky_fraction < 0.12
+    assert stats.sky_depth_valid_fraction == 0.0
     assert SKY in stats.classes_present
 
 
@@ -240,26 +259,67 @@ def test_the_audit_reports_progress_without_changing_its_result(tmp_path):
 
 
 def test_a_sky_written_as_a_surface_is_caught(tmp_path):
-    """Valid everywhere means the sky became a ceiling at a finite depth.
-
-    The spec is explicit about the asymmetry: a false far surface is ignored
-    downstream, a false near one occludes the whole frame. So 100% valid is a
-    finding, not a clean bill of health.
-    """
+    """The audit checks semantic-sky pixels, not the whole-frame valid ratio."""
     seg = tmp_path / "seg_000000"
+    labels = np.full((H, W), ROAD_PAVED, dtype=np.uint8)
+    labels[:20] = SKY
     for ordinal in range(FRAMES):
-        proxy_duv.write_frame(
-            seg,
+        # Bypass proxy_duv.write_frame: the delivery writer now repairs this
+        # inconsistency, while the audit must still catch old data.
+        contract.write_frame(
+            proxy_duv.duv_dir_for(seg),
             ordinal,
             np.full((H, W), 40.0, dtype=np.float32),
-            np.full((H, W), ROAD_PAVED, dtype=np.uint8),
-            taxonomy="cwm12",
+            labels,
         )
     (seg / proxy_duv.TARGET_NAME).write_bytes(b"x")
 
     summary = proxy_duv.audit_root(tmp_path, frames=FRAMES)
 
-    assert any("sky was written as a surface" in line for line in summary["warnings"])
+    assert any("semantic sky pixels" in line for line in summary["warnings"])
+
+
+def test_a_fully_valid_frame_without_semantic_sky_is_not_called_a_sky_surface(tmp_path):
+    seg = tmp_path / "seg_000000"
+    for ordinal in range(FRAMES):
+        contract.write_frame(
+            proxy_duv.duv_dir_for(seg),
+            ordinal,
+            np.full((H, W), 40.0, dtype=np.float32),
+            np.full((H, W), ROAD_PAVED, dtype=np.uint8),
+        )
+    (seg / proxy_duv.TARGET_NAME).write_bytes(b"x")
+    _write_segment(tmp_path, "seg_000001")
+
+    summary = proxy_duv.audit_root(tmp_path, frames=FRAMES)
+
+    assert not any("carry valid depth" in line for line in summary["warnings"])
+    assert any("no `sky` pixels" in line for line in summary["notices"])
+
+
+def test_sky_repair_changes_only_semantic_sky_depth(tmp_path):
+    seg = tmp_path / "seg_000000"
+    labels = np.full((H, W), ROAD_PAVED, dtype=np.uint8)
+    labels[:20] = SKY
+    for ordinal in range(FRAMES):
+        contract.write_frame(
+            proxy_duv.duv_dir_for(seg),
+            ordinal,
+            np.full((H, W), 40.0, dtype=np.float32),
+            labels,
+        )
+
+    dry_run = proxy_duv.repair_sky_root(tmp_path)
+    assert dry_run["affected_segments"] == 1
+    assert dry_run["changed_frames"] == FRAMES
+
+    applied = proxy_duv.repair_sky_root(tmp_path, apply=True)
+    assert applied["changed_pixels"] == FRAMES * 20 * W
+
+    depth, semantic = contract.read_frame(proxy_duv.duv_dir_for(seg), 0)
+    assert np.all(depth[semantic == SKY] == 0.0)
+    assert np.all(depth[semantic != SKY] == 40.0)
+    assert proxy_duv.repair_sky_root(tmp_path)["affected_segments"] == 0
 
 
 def test_a_broken_segment_does_not_stop_the_audit(tmp_path):
@@ -508,6 +568,26 @@ def test_the_audit_command_passes_a_consistent_corpus(tmp_path, capsys):
     assert json.loads(captured.out)["audited"] == 3
 
 
+def test_a_no_sky_notice_does_not_fail_the_audit_command(tmp_path, capsys):
+    seg = tmp_path / "seg_000000"
+    for ordinal in range(FRAMES):
+        contract.write_frame(
+            proxy_duv.duv_dir_for(seg),
+            ordinal,
+            np.full((H, W), 12.0, dtype=np.float32),
+            np.full((H, W), ROAD_PAVED, dtype=np.uint8),
+        )
+    (seg / proxy_duv.TARGET_NAME).write_bytes(b"x")
+    _write_segment(tmp_path, "seg_000001", metres=12.0)
+
+    code = cli.main(["proxy-duv-audit", "--root", str(tmp_path), "--frames", "8"])
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "notice: seg_000000: no `sky` pixels" in captured.err
+    assert json.loads(captured.out)["warnings"] == []
+
+
 def test_the_audit_report_keeps_the_per_segment_detail(tmp_path):
     """The summary drops it to stay readable, and the file must not.
 
@@ -534,6 +614,29 @@ def test_the_audit_report_keeps_the_per_segment_detail(tmp_path):
         "seg_000000",
         "seg_000001",
     }
+
+
+def test_the_sky_repair_command_requires_apply_before_mutating(tmp_path, capsys):
+    seg = tmp_path / "seg_000000"
+    labels = np.full((H, W), ROAD_PAVED, dtype=np.uint8)
+    labels[:20] = SKY
+    contract.write_frame(
+        proxy_duv.duv_dir_for(seg),
+        0,
+        np.full((H, W), 40.0, dtype=np.float32),
+        labels,
+    )
+
+    dry_code = cli.main(["proxy-duv-repair-sky", "--root", str(tmp_path)])
+    dry_summary = json.loads(capsys.readouterr().out)
+    assert dry_code == 1
+    assert dry_summary["affected_segments"] == 1
+
+    apply_code = cli.main(["proxy-duv-repair-sky", "--root", str(tmp_path), "--apply"])
+    apply_summary = json.loads(capsys.readouterr().out)
+    assert apply_code == 0
+    assert apply_summary["changed_pixels"] == 20 * W
+    assert proxy_duv.repair_sky_root(tmp_path)["affected_segments"] == 0
 
 
 def test_the_new_backends_are_offered_by_the_command_line():

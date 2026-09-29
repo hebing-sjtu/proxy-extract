@@ -181,6 +181,22 @@ def frame_paths(root: Path, ordinal: int) -> tuple[Path, Path]:
     return root / f"{ordinal:06d}.depth.f32", root / f"{ordinal:06d}.semantic_id.png"
 
 
+def rewrite_depth_frame(root: Path, ordinal: int, depth_metres: np.ndarray) -> None:
+    """Atomically replace one already-sized metric depth frame."""
+    depth = np.asarray(depth_metres, dtype=np.float32)
+    expected = (CONDITION_HEIGHT, CONDITION_WIDTH)
+    if depth.shape != expected:
+        raise ValueError(f"depth for ordinal {ordinal} has shape {depth.shape}, expected {expected}")
+    if not bool(np.all(np.isfinite(depth))):
+        raise ValueError(f"depth for ordinal {ordinal} contains non-finite values")
+    if bool(np.any(depth < 0.0)):
+        raise ValueError(f"depth for ordinal {ordinal} contains negative values")
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    depth_path, _ = frame_paths(root, ordinal)
+    _atomic_write(depth_path, np.ascontiguousarray(depth, dtype="<f4").tobytes(order="C"))
+
+
 def write_frame(root: Path, ordinal: int, depth_metres: np.ndarray, semantic_ids: np.ndarray) -> None:
     """Write one ordinal's depth + semantic pair, resampling if needed."""
     from PIL import Image
@@ -195,9 +211,9 @@ def write_frame(root: Path, ordinal: int, depth_metres: np.ndarray, semantic_ids
     if int(semantic.max(initial=0)) >= NUM_SEMANTIC_CLASSES:
         raise ValueError(f"semantic ids for ordinal {ordinal} exceed {NUM_SEMANTIC_CLASSES - 1}")
 
-    depth_path, semantic_path = frame_paths(root, ordinal)
-    _atomic_write(depth_path, np.ascontiguousarray(depth, dtype="<f4").tobytes(order="C"))
+    rewrite_depth_frame(root, ordinal, depth)
 
+    _, semantic_path = frame_paths(root, ordinal)
     tmp = semantic_path.with_suffix(".png.tmp")
     Image.fromarray(semantic.astype(np.uint8), mode="L").save(tmp, format="PNG", optimize=True)
     os.replace(tmp, semantic_path)

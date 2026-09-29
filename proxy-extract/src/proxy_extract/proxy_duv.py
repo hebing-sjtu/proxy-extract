@@ -62,7 +62,7 @@ from pathlib import Path
 import numpy as np
 
 from . import contract
-from .taxonomy import CLASS_NAMES, NUM_CLASSES, to_cwm12
+from .taxonomy import CLASS_NAMES, NUM_CLASSES, SKY, to_cwm12
 
 SEG_PREFIX = "seg_"
 DUV_DIRNAME = "duv"
@@ -207,9 +207,13 @@ def write_frame(
     semantic = seg_dir.parent / SEMANTIC_NAME
     if ordinal == 0 and not semantic.is_file():
         write_semantic_json(seg_dir.parent)
-    contract.write_frame(
-        duv, ordinal, depth_metres, project_labels(labels, taxonomy)
-    )
+    ids = contract.downsample_semantic(project_labels(labels, taxonomy))
+    depth = contract.downsample_depth(np.asarray(depth_metres, dtype=np.float32))
+    sky = ids == SKY
+    if bool(np.any(sky)):
+        depth = depth.copy()
+        depth[sky] = 0.0
+    contract.write_frame(duv, ordinal, depth, ids)
 
 
 def project_labels(labels: np.ndarray, taxonomy: str) -> np.ndarray:
@@ -244,6 +248,8 @@ class SegStats:
     percentiles: dict[str, float]
     below_near_fraction: float
     above_far_fraction: float
+    sky_fraction: float
+    sky_depth_valid_fraction: float
     classes_present: list[int]
 
     def as_dict(self) -> dict:
@@ -256,9 +262,141 @@ class SegStats:
             "metres_p99": self.percentiles["p99"],
             "below_near_fraction": self.below_near_fraction,
             "above_far_fraction": self.above_far_fraction,
+            "sky_fraction": self.sky_fraction,
+            "sky_depth_valid_fraction": self.sky_depth_valid_fraction,
             "classes_present": self.classes_present,
             "class_names_present": [CLASS_NAMES[cls] for cls in self.classes_present],
         }
+
+
+@dataclass(frozen=True)
+class SkyRepairStats:
+    """Sky-depth inconsistencies found or repaired in one segment."""
+
+    seg: str
+    frames: int
+    changed_frames: int
+    changed_pixels: int
+    sky_pixels: int
+
+    def as_dict(self) -> dict:
+        return {
+            "seg": self.seg,
+            "frames": self.frames,
+            "changed_frames": self.changed_frames,
+            "changed_pixels": self.changed_pixels,
+            "sky_pixels": self.sky_pixels,
+        }
+
+
+def repair_sky_seg(seg_dir: Path, *, apply: bool = False) -> SkyRepairStats:
+    """Find semantic-sky pixels with depth and optionally rewrite them to zero."""
+    seg_dir = Path(seg_dir)
+    duv = duv_dir_for(seg_dir)
+    changed_frames = 0
+    changed_pixels = 0
+    sky_pixels = 0
+
+    def inspect_frame(ordinal: int, depth: np.ndarray, semantic: np.ndarray) -> None:
+        nonlocal changed_frames, changed_pixels, sky_pixels
+        sky = semantic == SKY
+        sky_pixels += int(sky.sum())
+        inconsistent = sky & (depth > contract.DEPTH_VALID_EPSILON_METRES)
+        count = int(inconsistent.sum())
+        if not count:
+            return
+        changed_frames += 1
+        changed_pixels += count
+        if apply:
+            repaired = depth.copy()
+            repaired[sky] = 0.0
+            contract.rewrite_depth_frame(duv, ordinal, repaired)
+
+    structural = contract.validate_condition_root(duv, frame_observer=inspect_frame)
+    return SkyRepairStats(
+        seg=seg_dir.name,
+        frames=int(structural["frames"]),
+        changed_frames=changed_frames,
+        changed_pixels=changed_pixels,
+        sky_pixels=sky_pixels,
+    )
+
+
+def repair_sky_root(
+    root: Path,
+    *,
+    workers: int = 1,
+    apply: bool = False,
+    progress: Callable[[int, int, str], None] | None = None,
+) -> dict:
+    """Find or repair sky depth over every segment under ``root``."""
+    root = Path(root)
+    segs = segment_dirs(root)
+    if not segs:
+        raise ProxyDuvError(f"no segment holds a {DUV_DIRNAME}/ directory under {root}")
+    if workers < 1:
+        raise ValueError(f"workers must be at least 1, got {workers}")
+
+    stats: list[SkyRepairStats] = []
+    failures: list[dict] = []
+    if progress is not None:
+        progress(0, len(segs), "")
+
+    def record(seg: Path, result: SkyRepairStats | BaseException) -> None:
+        if isinstance(result, BaseException):
+            if not isinstance(result, (ValueError, OSError)):
+                raise result
+            failures.append({"seg": seg.name, "error": f"{type(result).__name__}: {result}"})
+        else:
+            stats.append(result)
+
+    if workers == 1:
+        for index, seg in enumerate(segs, start=1):
+            try:
+                result: SkyRepairStats | BaseException = repair_sky_seg(seg, apply=apply)
+            except (ValueError, OSError) as error:
+                result = error
+            record(seg, result)
+            if progress is not None:
+                progress(index, len(segs), seg.name)
+    else:
+        executor = ProcessPoolExecutor(max_workers=min(workers, len(segs)))
+        futures = {}
+        try:
+            futures = {executor.submit(repair_sky_seg, seg, apply=apply): seg for seg in segs}
+            for index, future in enumerate(as_completed(futures), start=1):
+                seg = futures[future]
+                try:
+                    result = future.result()
+                except (ValueError, OSError) as error:
+                    result = error
+                record(seg, result)
+                if progress is not None:
+                    progress(index, len(segs), seg.name)
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown()
+
+    stats.sort(key=lambda item: item.seg)
+    failures.sort(key=lambda item: item["seg"])
+    affected = [item for item in stats if item.changed_pixels]
+    return {
+        "root": str(root),
+        "mode": "apply" if apply else "dry-run",
+        "segments": len(segs),
+        "audited": len(stats),
+        "failed": len(failures),
+        "affected_segments": len(affected),
+        "changed_frames": sum(item.changed_frames for item in affected),
+        "changed_pixels": sum(item.changed_pixels for item in affected),
+        "sky_pixels": sum(item.sky_pixels for item in stats),
+        "failures": failures[:20],
+        "segment_stats": [item.as_dict() for item in affected],
+    }
 
 
 def audit_seg(seg_dir: Path, *, frames: int = SPEC_FRAMES) -> SegStats:
@@ -279,6 +417,8 @@ def audit_seg(seg_dir: Path, *, frames: int = SPEC_FRAMES) -> SegStats:
     pixels = 0
     below = 0
     above = 0
+    sky_total = 0
+    sky_depth_valid = 0
     # Depth is sampled rather than pooled whole: a segment is 124 frames of
     # 64,512 pixels, and holding all 8 million to take three percentiles costs
     # 32 MB per segment for an answer a fixed stride gives to the same two
@@ -286,8 +426,8 @@ def audit_seg(seg_dir: Path, *, frames: int = SPEC_FRAMES) -> SegStats:
     # still contributes - a per-frame sample would miss a single bad frame.
     sampled: list[np.ndarray] = []
 
-    def collect_statistics(_ordinal: int, depth: np.ndarray, _semantic: np.ndarray) -> None:
-        nonlocal valid_total, pixels, below, above
+    def collect_statistics(_ordinal: int, depth: np.ndarray, semantic: np.ndarray) -> None:
+        nonlocal valid_total, pixels, below, above, sky_total, sky_depth_valid
         flat = depth.ravel()
         valid = flat > contract.DEPTH_VALID_EPSILON_METRES
         pixels += flat.size
@@ -296,6 +436,9 @@ def audit_seg(seg_dir: Path, *, frames: int = SPEC_FRAMES) -> SegStats:
         below += int((metres < contract.DEPTH_NEAR_METRES).sum())
         above += int((metres > contract.DEPTH_FAR_METRES).sum())
         sampled.append(metres[::_PERCENTILE_STRIDE])
+        sky = semantic == SKY
+        sky_total += int(sky.sum())
+        sky_depth_valid += int((sky & (depth > contract.DEPTH_VALID_EPSILON_METRES)).sum())
 
     # Not `expected_frames=frames`: the spec asks for *at least* 124, and a
     # longer segment is fine as long as the ordinals are contiguous from zero.
@@ -328,6 +471,8 @@ def audit_seg(seg_dir: Path, *, frames: int = SPEC_FRAMES) -> SegStats:
         percentiles=percentiles,
         below_near_fraction=round(below / max(valid_total, 1), 6),
         above_far_fraction=round(above / max(valid_total, 1), 6),
+        sky_fraction=round(sky_total / max(pixels, 1), 6),
+        sky_depth_valid_fraction=round(sky_depth_valid / max(sky_total, 1), 6),
         classes_present=structural["semantic_classes_present"],
     )
 
@@ -349,7 +494,7 @@ def audit_root(
     makes and still cannot train:
 
       per-segment depth normalisation   medians spread over orders of magnitude
-      sky written as a surface          valid_fraction at or near 1.0
+      sky written as a surface          valid depth on semantic sky pixels
       depth never written               valid_fraction at or near 0.0
       the wrong class table             a class the corpus should have, absent
     """
@@ -413,6 +558,7 @@ def audit_root(
     failures.sort(key=lambda item: item["seg"])
 
     warnings: list[str] = []
+    notices: list[str] = []
     medians = sorted(item.percentiles["p50"] for item in stats if item.percentiles["p50"] > 0)
     spread = None
     if len(medians) >= 2:
@@ -428,13 +574,13 @@ def audit_root(
             )
 
     for item in stats:
-        if item.valid_fraction >= 0.999:
+        if item.sky_depth_valid_fraction > 0:
             warnings.append(
-                f"{item.seg}: {item.valid_fraction:.1%} of pixels are valid, so the "
-                "sky was written as a surface rather than as 0. A false far surface is "
-                "ignored downstream but a ceiling at a finite depth is not."
+                f"{item.seg}: {item.sky_depth_valid_fraction:.2%} of semantic sky pixels "
+                "carry valid depth instead of 0. A false far surface is ignored downstream "
+                "but a ceiling at a finite depth is not."
             )
-        elif item.valid_fraction <= 0.01:
+        if item.valid_fraction <= 0.01:
             warnings.append(
                 f"{item.seg}: only {item.valid_fraction:.2%} of pixels carry depth; "
                 "the stack is effectively empty"
@@ -449,7 +595,7 @@ def audit_root(
         # other segment has it usually means that segment's labels came from a
         # different table.
         if 1 in union and 1 not in item.classes_present:
-            warnings.append(f"{item.seg}: no `sky` pixels, unlike the rest of the corpus")
+            notices.append(f"{item.seg}: no `sky` pixels, unlike the rest of the corpus")
 
     return {
         "root": str(root),
@@ -467,6 +613,7 @@ def audit_root(
         "classes_present": sorted(union),
         "class_names_present": [CLASS_NAMES[cls] for cls in sorted(union)],
         "warnings": warnings,
+        "notices": notices,
         "segment_stats": [item.as_dict() for item in stats],
     }
 

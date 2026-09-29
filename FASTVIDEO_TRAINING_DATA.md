@@ -293,9 +293,21 @@ python scripts/write_semantic_uv.py "$CLIPS_DIR" --check
 `proxy_duv_audit.json` 的价值不只是结构检查。逐片归一化的深度可以让每一帧都合法，只有跨片比较
 深度中位数才能发现整批标度不可比较。
 
-当前文本门禁已经完成；最终并行 DUV audit 的结果尚未记录到本文。在
-`proxy_duv_audit.json` 确认 `failed = 0` 且 fatal warning 为空之前，这批数据仍属于“编码前待验收”，
-不能仅凭 `9985` 个目录就视为全部可训练。
+当前首次并行 audit 已确认 `9985/9985` 个 segment 结构完整、每片至少 124 帧、`failed = 0`，
+深度 median p10/p90 为 `5.4762/12.2773 m`，spread 为 `2.242×`。同时发现旧 writer 没有强制
+将语义天空位置的 depth 置 0；旧 audit 用整片 depth 有效率间接推断天空，因此也会误报没有天空、
+但 depth 100% 有效的画面。
+
+修复工具现在直接读取 `semantic_id == sky` 的像素，只原子重写对应 depth 为 0，非天空深度和
+semantic PNG 不变。操作可中断并重跑：
+
+```bash
+make proxy-duv-repair-sky CLIPS_DIR="$CLIPS_DIR" AUDIT_WORKERS=32
+make proxy-duv-audit CLIPS_DIR="$CLIPS_DIR" AUDIT_WORKERS=32
+```
+
+第二次 audit 确认没有“semantic sky pixels carry valid depth”后，才生成 `_fastvideo/` split 并编码。
+没有 semantic sky 的 clip 仍可能产生 `no sky` 提示；该提示本身不是 depth 损坏。
 
 ---
 

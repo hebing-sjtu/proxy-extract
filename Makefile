@@ -62,7 +62,7 @@ NODE_RANK  ?= 0
 # land on `/proxy_duv_audit.json`, at the root of the filesystem.
 need = $(if $(strip $($(1))),,$(error $(1) is empty. Pass $(1)=/path/to/dir, or leave it unset for $(if $(2),$(2),the default)))
 
-.PHONY: help venv venv-core venv-test venv-fetch doctor scenes scenes-audit preview clips clip-episodes clips-audit proxy-duv-manifest proxy-duv-audit
+.PHONY: help venv venv-core venv-test venv-fetch doctor scenes scenes-audit preview clips clip-episodes clips-audit proxy-duv-manifest proxy-duv-audit proxy-duv-repair-sky
 
 help:
 	@echo "VENV     = $(VENV)"
@@ -90,6 +90,7 @@ help:
 	@echo "  make clip-episodes DEPTH=moge3 REFINER=sam2 PROXY_DUV=1"
 	@echo "  make proxy-duv-manifest   写 encode_manifest.jsonl"
 	@echo "  make proxy-duv-audit AUDIT_WORKERS=32   并行跑跨段验收"
+	@echo "  make proxy-duv-repair-sky AUDIT_WORKERS=32   把语义天空处的 depth 原子改为 0"
 	@echo "  双节点：两边都加 NODE_COUNT=2，一边 NODE_RANK=0 一边 NODE_RANK=1"
 	@echo
 	@echo "路径用 DATA_DIR= 和 OUT_DIR= 覆盖，worker 数用 WORKERS_PER_GPU=。"
@@ -146,6 +147,11 @@ proxy-duv-audit:
 	$(call need,CLIPS_DIR)
 	$(VPY) -m proxy_extract proxy-duv-audit --root $(CLIPS_DIR) \
 	  --report $(CLIPS_DIR)/proxy_duv_audit.json --workers $(AUDIT_WORKERS)
+
+proxy-duv-repair-sky:
+	$(call need,CLIPS_DIR)
+	$(VPY) -m proxy_extract proxy-duv-repair-sky --root $(CLIPS_DIR) \
+	  --report $(CLIPS_DIR)/proxy_duv_sky_repair.json --workers $(AUDIT_WORKERS) --apply
 
 clips-audit:
 	$(call need,CLIPS_DIR)

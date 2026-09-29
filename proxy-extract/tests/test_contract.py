@@ -102,6 +102,20 @@ class TestFrameIO:
         assert np.allclose(got_depth, depth)
         assert np.array_equal(got_labels, labels)
 
+    def test_depth_only_rewrite_keeps_the_semantic_file(self, tmp_path, rng):
+        contract.write_frame(tmp_path, 3, _depth_field(rng), _labels(rng))
+        _, semantic_path = contract.frame_paths(tmp_path, 3)
+        semantic_payload = semantic_path.read_bytes()
+
+        replacement = np.full(
+            (contract.CONDITION_HEIGHT, contract.CONDITION_WIDTH), 7.0, dtype=np.float32
+        )
+        contract.rewrite_depth_frame(tmp_path, 3, replacement)
+
+        got_depth, _ = contract.read_frame(tmp_path, 3)
+        assert np.array_equal(got_depth, replacement)
+        assert semantic_path.read_bytes() == semantic_payload
+
     def test_out_of_range_class_is_rejected_at_write_time(self, tmp_path, rng):
         labels = _labels(rng)
         labels[0, 0] = 12
