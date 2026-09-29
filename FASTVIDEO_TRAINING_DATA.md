@@ -230,6 +230,22 @@ manifest 行的 prompt 字段
 
 `score` 会记录，但当前没有按 score 自动设淘汰阈值。
 
+本轮在新 MoGe3 + SAM2 DUV 上重新验证并导出后的实测结果：
+
+```text
+clips       9985
+captioned   9721
+missing      264
+failed        61
+warned       893
+exported    9660
+mean_score  0.944
+```
+
+因此原始 `encode_manifest.jsonl` 有 `9985` 行，其中 `325 = 264 + 61` 行没有可训练的
+`prompt`；文本门禁后最多有 `9660` 个候选 clip。`warned` 仍保留。最终训练数量还要扣除
+episode 级 validation holdout；同时必须先完成 DUV audit，不能在这一步写死。
+
 检查命令：
 
 ```bash
@@ -258,9 +274,12 @@ manifest 必须过滤 prompt，而不是直接假设根目录的 manifest 已经
 
 ```bash
 make clips-audit CLIPS_DIR="$CLIPS_DIR"
-make proxy-duv-audit CLIPS_DIR="$CLIPS_DIR"
+make proxy-duv-audit CLIPS_DIR="$CLIPS_DIR" AUDIT_WORKERS=32
 python scripts/write_semantic_uv.py "$CLIPS_DIR" --check
 ```
+
+`proxy-duv-audit` 的验证与统计共用一次帧读取，并按 clip 多进程并行。224 核节点先用
+`AUDIT_WORKERS=32`；该任务受 `/data` 小文件吞吐限制，不应直接开到 224。
 
 接受条件：
 
@@ -273,6 +292,10 @@ python scripts/write_semantic_uv.py "$CLIPS_DIR" --check
 
 `proxy_duv_audit.json` 的价值不只是结构检查。逐片归一化的深度可以让每一帧都合法，只有跨片比较
 深度中位数才能发现整批标度不可比较。
+
+当前文本门禁已经完成；最终并行 DUV audit 的结果尚未记录到本文。在
+`proxy_duv_audit.json` 确认 `failed = 0` 且 fatal warning 为空之前，这批数据仍属于“编码前待验收”，
+不能仅凭 `9985` 个目录就视为全部可训练。
 
 ---
 
@@ -412,7 +435,7 @@ FastVideo 不在训练时现场跑 VAE 或 Qwen3-VL。先把每片编码成一�
 
 ```bash
 export CLIPS_DIR=/data/binghe/datasets/ABot-sub-2000-clips-moge3
-export CACHE_DIR=/data/binghe/h3_proxy/cache/abot_moge3_sam2_w0
+export CACHE_DIR=/data/binghe/h3_proxy/cache/abot_moge3_sam2_w0_qwen2
 export MODEL_PATH=/data/models/MiniMax-H3
 
 cd /workspace/FastVideo
@@ -439,6 +462,20 @@ scripts/h3_proxy/prepare_data/encode_proxy_shards.sh \
 这里的 `--qwen-video-fps 2` 只控制 Qwen3-VL 观看 `<Video 1>` 时的时间采样率。
 源视频、target VAE 和 proxy VAE 仍使用完整的 124 帧（24 fps），不会降采样为 2 fps。
 
+这批 cache 的固定时间合同是：
+
+```text
+源 target/proxy 时间线     24 fps，124 帧，约 5.17 秒
+target/proxy VAE 输入      全部 124 帧
+Qwen <Video 1> 采样率      2 fps
+info.qwen_video_fps        2.0
+CWM system role            w0
+given latent frames        1
+```
+
+目录名显式带 `_qwen2`，避免现有 24-FPS Qwen cache 被 resume 逻辑跳过后混入。普通编码遇到
+已存在的 `.pt` 会跳过，所以不要把 2-FPS 命令指向一个曾用 24 FPS 编码过的目录。
+
 `encode_proxy_shards.sh`：
 
 - 默认每张可见 GPU 一个进程
@@ -452,7 +489,7 @@ scripts/h3_proxy/prepare_data/encode_proxy_shards.sh \
 ```text
 /data/binghe/h3_proxy/
 ├── cache/
-│   ├── abot_moge3_sam2_w0/
+│   ├── abot_moge3_sam2_w0_qwen2/
 │   │   ├── clip_000000_0.pt
 │   │   ├── clip_000000_1.pt
 │   │   └── ...
@@ -514,7 +551,7 @@ python scripts/h3_proxy/describe_cache.py \
 ```yaml
 training:
   data:
-    data_path: /data/binghe/h3_proxy/cache/abot_moge3_sam2_w0
+    data_path: /data/binghe/h3_proxy/cache/abot_moge3_sam2_w0_qwen2
     preprocessed_data_type: t2va
     num_frames: 124
     num_latent_t: 37
@@ -587,7 +624,7 @@ DUV 的真实验证效果。
 
 ```bash
 export CLIPS_DIR=/data/binghe/datasets/ABot-sub-2000-clips-moge3
-export CACHE_DIR=/data/binghe/h3_proxy/cache/abot_moge3_sam2_w0
+export CACHE_DIR=/data/binghe/h3_proxy/cache/abot_moge3_sam2_w0_qwen2
 
 cd /workspace/fastvideo_datapipe
 
@@ -596,7 +633,7 @@ python -m clip_prompts captions-audit \
   --report "$CLIPS_DIR/captions_audit.json"
 
 make clips-audit CLIPS_DIR="$CLIPS_DIR"
-make proxy-duv-audit CLIPS_DIR="$CLIPS_DIR"
+make proxy-duv-audit CLIPS_DIR="$CLIPS_DIR" AUDIT_WORKERS=32
 python scripts/write_semantic_uv.py "$CLIPS_DIR" --check
 
 cd /workspace/FastVideo
