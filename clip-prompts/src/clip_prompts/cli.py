@@ -11,6 +11,9 @@ different training window, a look at what it did - do not require it.
     captions-export     project captions onto CWM user sentences, write prompt.txt
     captions-audit      count what is captioned, what failed, and what disagreed
     captions-show       print one caption's compiled text
+    quality-judge       VLM review of depth and semantics, write annotations/quality.json
+    quality-audit       count accepted, rejected and unjudged clips; list them for the split
+    workbench           browse the judged corpus and override verdicts in a browser
 """
 
 from __future__ import annotations
@@ -134,6 +137,38 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also print what the control video means, resolved from its card",
     )
+
+    from . import quality
+
+    judge = sub.add_parser("quality-judge", help="VLM review of depth and semantics")
+    judge.add_argument("--clips", type=Path, required=True, help="a clips root, or one clip dir")
+    judge.add_argument("--limit", type=int, help="only the first N clips, in name order")
+    judge.add_argument("--workers", type=int, default=16)
+    judge.add_argument("--model", default=observe.DEFAULT_MODEL)
+    judge.add_argument("--backend", default=observe.DEFAULT_BACKEND)
+    judge.add_argument("--env-dir", type=Path, help="extra directory to read .env files from")
+    judge.add_argument("--env-file", type=Path, help="one more .env file, e.g. a secrets mount")
+    judge.add_argument("--sample-fps", type=float, default=quality.DEFAULT_SAMPLE_FPS)
+    judge.add_argument("--min-score", type=int, default=quality.Thresholds.min_score,
+                       help="reject when any of the four scores is below this")
+    judge.add_argument("--allow-major", action="store_true",
+                       help="do not reject on a major issue by itself")
+    judge.add_argument("--ignore-verdict", action="store_true",
+                       help="decide from scores and issues only, not the VLM's own verdict")
+    judge.add_argument("--redo", action="store_true", help="re-judge clips judged by this prompt")
+    judge.add_argument("--keep-going", action="store_true", help="one bad clip costs one clip")
+    judge.add_argument("--report", type=Path, help="also write the run summary here")
+
+    qaudit = sub.add_parser("quality-audit", help="count and list accepted and rejected clips")
+    qaudit.add_argument("--clips", type=Path, required=True)
+    qaudit.add_argument("--report", type=Path, help=f"default: <clips>/{quality.AUDIT_NAME}")
+    qaudit.add_argument("--list", choices=("accepted", "rejected", "unjudged", "overridden"))
+
+    bench = sub.add_parser("workbench", help="browse verdicts and override them in a browser")
+    bench.add_argument("--clips", type=Path, required=True)
+    bench.add_argument("--host", default="127.0.0.1")
+    bench.add_argument("--port", type=int, default=8765)
+    bench.add_argument("--rescan", type=float, default=120.0, help="seconds between scans")
 
     return parser
 
@@ -499,9 +534,102 @@ def _run_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_quality_judge(args: argparse.Namespace) -> int:
+    from . import quality
+    from .llm import load_dotenv
+
+    clips = layout.discover(args.clips, limit=args.limit)
+    if not clips:
+        _say(f"no finished clips under {args.clips}")
+        return 1
+    if args.env_file:
+        if not args.env_file.is_file():
+            _say(f"--env-file {args.env_file} does not exist")
+            return 2
+        load_dotenv(args.env_file)
+    client = observe.build_client(args.backend, env_dir=args.env_dir)
+    thresholds = quality.Thresholds(
+        min_score=args.min_score,
+        reject_major=not args.allow_major,
+        trust_verdict=not args.ignore_verdict,
+    )
+
+    def work(clip: layout.Clip) -> dict:
+        try:
+            row = quality.judge_clip(
+                clip,
+                client,
+                model=args.model,
+                backend=args.backend,
+                thresholds=thresholds,
+                sample_fps=args.sample_fps,
+                redo=args.redo,
+            )
+        except Exception as exc:
+            if not args.keep_going:
+                raise
+            row = {"clip": clip.name, "status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+            traceback.print_exc(file=sys.stderr)
+        if row["status"] != "reused":
+            _say(json.dumps(row, ensure_ascii=False))
+        return row
+
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        rows = list(pool.map(work, clips))
+
+    summary: dict = {"clips": len(rows)}
+    for row in rows:
+        summary[row["status"]] = summary.get(row["status"], 0) + 1
+        if row.get("verdict"):
+            summary[row["verdict"]] = summary.get(row["verdict"], 0) + 1
+    _say(json.dumps(summary, ensure_ascii=False, indent=2))
+    if args.report:
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        args.report.write_text(
+            json.dumps({"summary": summary, "clips": rows}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    return 0 if not summary.get("failed") else 1
+
+
+def _run_quality_audit(args: argparse.Namespace) -> int:
+    from . import quality
+
+    root = args.clips.expanduser().resolve()
+    result = quality.audit(quality.scan(root))
+    report = args.report or root / quality.AUDIT_NAME
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if args.list:
+        for name in result[args.list]:
+            _say(name)
+    else:
+        _say(json.dumps(result["summary"], ensure_ascii=False, indent=2))
+        _say(f"wrote {report}")
+    return 0
+
+
+def _run_workbench(args: argparse.Namespace) -> int:
+    from . import workbench
+
+    server = workbench.serve(args.clips, host=args.host, port=args.port, interval=args.rescan)
+    host, port = server.server_address[:2]
+    _say(f"workbench on http://{host}:{port}/ over {server.index.root}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     handlers = {
+        "quality-judge": _run_quality_judge,
+        "quality-audit": _run_quality_audit,
+        "workbench": _run_workbench,
         "captions": _run_captions,
         "captions-evidence": _run_evidence,
         "captions-recompile": _run_recompile,

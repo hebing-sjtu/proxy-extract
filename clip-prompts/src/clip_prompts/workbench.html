@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>Clip 质量工作台</title>
+<style>
+  :root { --bg:#111418; --panel:#1a1f26; --line:#2a313b; --text:#e3e7ec; --dim:#8b95a3;
+          --ok:#3fb86b; --bad:#e5534b; --warn:#d8a33a; --acc:#4c9aff; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:13px/1.45 -apple-system, "PingFang SC", "Segoe UI", sans-serif;
+         background:var(--bg); color:var(--text); height:100vh; display:flex; flex-direction:column; }
+  header { padding:10px 14px; border-bottom:1px solid var(--line); display:flex; gap:14px;
+           align-items:center; flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0 8px 0 0; }
+  .chip { padding:3px 10px; border-radius:12px; background:var(--panel); border:1px solid var(--line);
+          cursor:pointer; user-select:none; }
+  .chip.on { border-color:var(--acc); color:#fff; }
+  .chip b { margin-left:4px; }
+  .dim { color:var(--dim); }
+  main { flex:1; display:flex; min-height:0; }
+  #left { width:46%; min-width:420px; display:flex; flex-direction:column; border-right:1px solid var(--line); }
+  #controls { padding:8px 10px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;
+              border-bottom:1px solid var(--line); }
+  input, select, button { background:var(--panel); color:var(--text); border:1px solid var(--line);
+                          border-radius:4px; padding:4px 7px; font:inherit; }
+  button { cursor:pointer; } button:hover { border-color:var(--acc); }
+  #hist { display:flex; align-items:flex-end; gap:2px; height:46px; padding:6px 10px;
+          border-bottom:1px solid var(--line); }
+  #hist div { flex:1; display:flex; flex-direction:column-reverse; height:100%; cursor:pointer; }
+  #hist span { display:block; }
+  #tablewrap { flex:1; overflow:auto; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { padding:4px 6px; border-bottom:1px solid var(--line); text-align:left; white-space:nowrap; }
+  th { position:sticky; top:0; background:var(--panel); cursor:pointer; font-weight:600; z-index:1; }
+  tr.sel td { background:#22344d; }
+  tbody tr:hover td { background:#1e2630; cursor:pointer; }
+  .v-accept { color:var(--ok); } .v-reject { color:var(--bad); } .v-none { color:var(--dim); }
+  .num { text-align:right; font-variant-numeric:tabular-nums; }
+  #pager { padding:6px 10px; border-top:1px solid var(--line); display:flex; gap:8px; align-items:center; }
+  #right { flex:1; overflow:auto; padding:12px 16px; }
+  video { width:100%; background:#000; border:1px solid var(--line); }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:8px 0; }
+  .bar { height:10px; background:var(--line); border-radius:5px; width:160px; overflow:hidden; display:inline-block; vertical-align:middle; }
+  .bar i { display:block; height:100%; }
+  .grid2 { display:grid; grid-template-columns: 170px 1fr; gap:3px 12px; }
+  .issue { padding:5px 8px; border-left:3px solid var(--warn); background:var(--panel); margin:4px 0; cursor:pointer; }
+  .issue.major { border-color:var(--bad); }
+  .big { font-size:18px; font-weight:700; }
+  .legend { display:flex; flex-wrap:wrap; gap:4px 10px; font-size:12px; }
+  .legend i { display:inline-block; width:11px; height:11px; margin-right:4px; vertical-align:-1px; border-radius:2px; }
+  .turbo { height:10px; width:220px; display:inline-block; vertical-align:middle; border-radius:3px;
+           background:linear-gradient(90deg,#7a0403,#f05b12,#fbb938,#a4fc3c,#1ae4b6,#3e9bfe,#30123b); }
+  kbd { background:var(--panel); border:1px solid var(--line); border-radius:3px; padding:0 4px; font-size:11px; }
+  .btn-ok { border-color:var(--ok); } .btn-bad { border-color:var(--bad); }
+  h3 { margin:16px 0 6px; font-size:13px; color:var(--dim); text-transform:uppercase; letter-spacing:.05em; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Clip 质量工作台</h1>
+  <span id="chips"></span>
+  <span class="dim" id="meta"></span>
+  <button id="refresh">重新扫描</button>
+</header>
+<main>
+  <section id="left">
+    <div id="controls">
+      <input id="q" placeholder="搜索 clip / 原因" size="22">
+      <select id="track">
+        <option value="">所有问题</option>
+        <option value="depth">有 depth 问题</option>
+        <option value="semantic">有 semantic 问题</option>
+        <option value="major">有 major 问题</option>
+        <option value="disagree">人工与 VLM 不一致</option>
+      </select>
+      <label class="dim">score ≤ <input id="maxscore" type="number" min="0" max="1" step="0.05" style="width:64px"></label>
+      <span class="dim" id="count"></span>
+    </div>
+    <div id="hist" title="score 分布（绿=接收，红=拒绝），点击按区间筛选"></div>
+    <div id="tablewrap">
+      <table>
+        <thead><tr>
+          <th data-k="clip">clip</th>
+          <th data-k="final">最终</th>
+          <th data-k="score" class="num">score</th>
+          <th data-k="depth_temporal" class="num" title="depth 时序稳定">D-时序</th>
+          <th data-k="depth_accuracy" class="num" title="depth 正确性">D-正确</th>
+          <th data-k="semantic_temporal" class="num" title="semantic 时序稳定">S-时序</th>
+          <th data-k="semantic_accuracy" class="num" title="semantic 正确性">S-正确</th>
+          <th data-k="major" class="num">major</th>
+          <th data-k="depth_jitter" class="num" title="depth 二阶差分中位数（log 码）">jitter</th>
+          <th data-k="semantic_flicker" class="num" title="单帧闪烁像素比例">flicker</th>
+        </tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <div id="pager">
+      <button id="prev">上一页</button><span id="page" class="dim"></span><button id="next">下一页</button>
+      <span class="dim" style="margin-left:auto"><kbd>j</kbd>/<kbd>k</kbd> 切换 <kbd>a</kbd> 接收 <kbd>r</kbd> 拒绝 <kbd>c</kbd> 清除人工 <kbd>空格</kbd> 播放 <kbd>,</kbd>/<kbd>.</kbd> 逐帧</span>
+    </div>
+  </section>
+  <section id="right"><p class="dim">从左侧选择一个 clip。</p></section>
+</main>
+<script>
+const PAGE = 200, FPS = 24;
+const SCORE_KEYS = ["depth_temporal","depth_accuracy","semantic_temporal","semantic_accuracy"];
+const SCORE_NAMES = {depth_temporal:"Depth 时序稳定", depth_accuracy:"Depth 正确性",
+                     semantic_temporal:"Semantic 时序稳定", semantic_accuracy:"Semantic 正确性"};
+const CLASSES = [["void_unknown","#000000"],["sky","#6eb4f0"],["water","#1e5ac8"],["terrain","#966e46"],
+  ["road_paved","#808080"],["vegetation","#28a032"],["building_structure","#c85a3c"],["infrastructure","#e6c828"],
+  ["human","#ff28c8"],["animal","#ff8c00"],["vehicle","#00e6e6"],["prop","#aa5ae6"]];
+const state = { data:null, rows:[], filter:"all", sort:"score", dir:1, page:0, sel:null, range:null };
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const fmt = (v, d=3) => (v === null || v === undefined) ? "–" : (typeof v === "number" ? v.toFixed(d) : v);
+
+function value(row, k) {
+  if (SCORE_KEYS.includes(k)) return row.scores ? row.scores[k] : undefined;
+  if (k === "depth_jitter" || k === "semantic_flicker") return row.metrics ? row.metrics[k] : undefined;
+  return row[k];
+}
+function verdictCell(row) {
+  if (!row.complete) return '<span class="v-none">未完成</span>';
+  if (!row.final) return '<span class="v-none">待评</span>';
+  const human = row.override ? ' <span class="dim" title="人工">✎</span>' : "";
+  return `<span class="v-${row.final}">${row.final === "accept" ? "接收" : "拒绝"}</span>${human}`;
+}
+function matches(row) {
+  const f = state.filter;
+  if (f === "accept" && row.final !== "accept") return false;
+  if (f === "reject" && row.final !== "reject") return false;
+  if (f === "pending" && !(row.complete && !row.final)) return false;
+  if (f === "override" && !row.override) return false;
+  if (f === "incomplete" && row.complete) return false;
+  const t = $("track").value, reasons = (row.reasons || []).join(" ");
+  if (t === "depth" && !/depth/.test(reasons)) return false;
+  if (t === "semantic" && !/semantic/.test(reasons)) return false;
+  if (t === "major" && !row.major) return false;
+  if (t === "disagree" && !(row.override && row.decision && row.override.verdict !== row.decision)) return false;
+  const max = parseFloat($("maxscore").value);
+  if (!isNaN(max) && !(row.score <= max)) return false;
+  if (state.range && !(row.score >= state.range[0] && row.score < state.range[1])) return false;
+  const q = $("q").value.trim().toLowerCase();
+  if (q && !(row.clip.toLowerCase().includes(q) || reasons.toLowerCase().includes(q))) return false;
+  return true;
+}
+function apply() {
+  const all = state.data ? state.data.rows : [];
+  const k = state.sort, dir = state.dir;
+  state.rows = all.filter(matches).sort((a, b) => {
+    const x = value(a, k), y = value(b, k);
+    if (x === y) return a.clip < b.clip ? -1 : 1;
+    if (x === undefined || x === null) return 1;
+    if (y === undefined || y === null) return -1;
+    return (x < y ? -1 : 1) * dir;
+  });
+  state.page = Math.min(state.page, Math.max(0, Math.ceil(state.rows.length / PAGE) - 1));
+  renderTable(); renderHist(all);
+}
+function renderChips() {
+  const a = state.data.audit, incomplete = state.data.rows.length - a.complete;
+  const chips = [["all","全部",state.data.rows.length],["accept","接收",a.accepted],["reject","拒绝",a.rejected],
+                 ["pending","待评",a.unjudged],["override","人工",a.overridden],["incomplete","未完成",incomplete]];
+  $("chips").innerHTML = chips.map(([k, n, c]) =>
+    `<span class="chip ${state.filter === k ? "on" : ""}" data-f="${k}">${n}<b>${c}</b></span>`).join(" ");
+  const when = state.data.scanned ? new Date(state.data.scanned * 1000).toLocaleTimeString() : "扫描中…";
+  const rate = a.judged ? ` · 接收率 ${(100 * a.accepted / Math.max(1, a.accepted + a.rejected)).toFixed(1)}%` : "";
+  $("meta").textContent = `${state.data.root} · ${state.data.prompt} · 扫描于 ${when}${state.data.scanning ? "（扫描中）" : ""} · 平均 score ${fmt(a.mean_score)}${rate}`;
+}
+function renderHist(all) {
+  const bins = Array.from({length: 10}, () => ({accept: 0, reject: 0}));
+  all.forEach((r) => { if (typeof r.score === "number" && r.final) bins[Math.min(9, Math.floor(r.score * 10))][r.final]++; });
+  const peak = Math.max(1, ...bins.map((b) => b.accept + b.reject));
+  $("hist").innerHTML = bins.map((b, i) => {
+    const on = state.range && state.range[0] === i / 10 ? "outline:1px solid var(--acc);" : "";
+    return `<div data-b="${i}" style="${on}" title="${(i/10).toFixed(1)}–${((i+1)/10).toFixed(1)}: 接收 ${b.accept} / 拒绝 ${b.reject}">
+      <span style="height:${100*b.accept/peak}%;background:var(--ok)"></span>
+      <span style="height:${100*b.reject/peak}%;background:var(--bad)"></span></div>`;
+  }).join("");
+}
+function renderTable() {
+  const start = state.page * PAGE, rows = state.rows.slice(start, start + PAGE);
+  $("rows").innerHTML = rows.map((r) => {
+    const s = r.scores || {}, m = r.metrics || {};
+    return `<tr data-c="${esc(r.clip)}" class="${r.clip === state.sel ? "sel" : ""}">
+      <td>${esc(r.clip)}</td><td>${verdictCell(r)}</td><td class="num">${fmt(r.score, 2)}</td>
+      ${SCORE_KEYS.map((k) => `<td class="num">${s[k] ?? "–"}</td>`).join("")}
+      <td class="num">${r.major ?? "–"}</td><td class="num">${fmt(m.depth_jitter, 2)}</td>
+      <td class="num">${fmt(m.semantic_flicker, 4)}</td></tr>`;
+  }).join("");
+  const pages = Math.max(1, Math.ceil(state.rows.length / PAGE));
+  $("page").textContent = `${state.page + 1} / ${pages}`;
+  $("count").textContent = `${state.rows.length} 条`;
+}
+function bar(v) {
+  const pct = v ? (v / 5) * 100 : 0, colour = v >= 4 ? "var(--ok)" : v >= 3 ? "var(--warn)" : "var(--bad)";
+  return `<span class="bar"><i style="width:${pct}%;background:${colour}"></i></span> <b>${v ?? "–"}</b>/5`;
+}
+async function select(name) {
+  state.sel = name; renderTable();
+  const res = await fetch(`/api/clip/${encodeURIComponent(name)}`);
+  if (!res.ok) { $("right").innerHTML = `<p class="v-reject">${esc((await res.json()).error)}</p>`; return; }
+  const {row, quality, report} = await res.json();
+  replaceRow(row);
+  const q = quality || {}, vlm = q.vlm || {}, dec = q.decision || {}, m = q.metrics || {};
+  const media = q.panel ? "panel" : "rgb", src = `/media/${encodeURIComponent(name)}/${media}?t=${Date.now()}`;
+  const override = row.override;
+  $("right").innerHTML = `
+    <div class="row"><span class="big">${esc(name)}</span> ${verdictCell(row)}
+      <span class="dim">score</span> <b>${fmt(dec.score, 2)}</b>
+      ${override ? `<span class="dim">VLM 判定：<span class="v-${dec.verdict}">${dec.verdict ?? "–"}</span></span>` : ""}</div>
+    <video id="vid" src="${src}" controls loop muted autoplay playsinline></video>
+    <div class="row">
+      <span class="dim">速度</span>${[0.25, 0.5, 1].map((r) => `<button data-rate="${r}">${r}×</button>`).join("")}
+      <button data-step="-1">◀ 帧</button><button data-step="1">帧 ▶</button>
+      <span class="dim" id="tc"></span>
+      <span style="margin-left:auto"></span>
+      <a class="dim" href="/media/${encodeURIComponent(name)}/rgb" target="_blank">rgb.mp4</a>
+      <a class="dim" href="/media/${encodeURIComponent(name)}/duv" target="_blank">duv.mp4</a>
+    </div>
+    <div class="legend"><span><span class="turbo"></span> <span class="dim">近 ← depth → 远，黑=天空</span></span>
+      ${CLASSES.map(([n, c]) => `<span><i style="background:${c}"></i>${n}</span>`).join("")}</div>
+    <h3>人工复核</h3>
+    <div class="row">
+      <button class="btn-ok" data-ov="accept">接收 (a)</button>
+      <button class="btn-bad" data-ov="reject">拒绝 (r)</button>
+      <button data-ov="">清除人工 (c)</button>
+      <input id="note" placeholder="备注（可选）" size="34" value="${esc(override ? override.note : "")}">
+      ${override ? `<span class="dim">人工：<span class="v-${override.verdict}">${override.verdict}</span> @ ${esc(override.written)}</span>` : ""}
+    </div>
+    ${quality ? `
+    <h3>VLM 打分</h3>
+    <div class="grid2">${SCORE_KEYS.map((k) => `<span>${SCORE_NAMES[k]}</span><span>${bar((vlm.scores || {})[k])}</span>`).join("")}
+      <span>VLM verdict</span><span class="v-${vlm.verdict}">${esc(vlm.verdict)}</span>
+      <span>结论</span><span>${esc(vlm.summary)}</span>
+      <span>拒绝原因</span><span>${(dec.reasons || []).length ? dec.reasons.map(esc).join("；") : '<span class="dim">无</span>'}</span>
+    </div>
+    <h3>问题（点击跳转）</h3>
+    ${(vlm.issues || []).length ? vlm.issues.map((i) => `
+      <div class="issue ${i.severity}" data-t="${i.start ?? 0}">
+        <b>${esc(i.track)}</b> · ${esc(i.kind)} · <span class="${i.severity === "major" ? "v-reject" : ""}">${esc(i.severity)}</span>
+        <span class="dim">${fmt(i.start, 2)}s – ${fmt(i.end, 2)}s</span><br>${esc(i.note)}</div>`).join("") : '<p class="dim">VLM 未报告问题。</p>'}
+    <h3>本地时序指标</h3>
+    <div class="grid2">
+      <span>depth_jitter</span><span>${fmt(m.depth_jitter, 3)} <span class="dim">（max ${fmt(m.depth_jitter_max, 2)}，log 码；1 码≈4.4% 距离）</span></span>
+      <span>depth 中位数最大跳变</span><span>${fmt(m.depth_median_step_max, 2)} 码</span>
+      <span>semantic_flicker</span><span>${fmt(m.semantic_flicker, 5)} <span class="dim">（max ${fmt(m.semantic_flicker_max, 4)}，单帧闪烁像素比例）</span></span>
+      <span>帧数</span><span>${m.frames ?? "–"}</span>
+    </div>
+    <h3>来源</h3>
+    <div class="grid2">
+      <span>模型</span><span>${esc(q.model)} <span class="dim">(${esc(q.backend)}, ${q.sample_fps} fps 采样, ${q.attempts} 次)</span></span>
+      <span>prompt</span><span>${esc(q.prompt)}</span><span>写入</span><span>${esc(q.written)}</span>
+      <span>阈值</span><span class="dim">${esc(JSON.stringify(dec.thresholds))}</span>
+      ${report ? `<span>clip_report</span><span class="dim">${esc(report.frames)} 帧 @ ${esc(report.fps)} fps · ${esc((report.episode || report.source || ""))}</span>` : ""}
+    </div>` : `<p class="dim">${row.complete ? "尚未经过 VLM 评审。" : "clip 尚未处理完成（缺 clip_report.json）。"}</p>`}`;
+  const vid = $("vid");
+  vid.addEventListener("timeupdate", () => { $("tc").textContent = `${vid.currentTime.toFixed(2)}s · 帧 ${Math.round(vid.currentTime * FPS)}`; });
+}
+function replaceRow(row) {
+  const rows = state.data.rows, i = rows.findIndex((r) => r.clip === row.clip);
+  if (i >= 0) rows[i] = row; else rows.push(row);
+}
+async function override(verdict) {
+  if (!state.sel) return;
+  const note = $("note") ? $("note").value : "";
+  const res = await fetch(`/api/override/${encodeURIComponent(state.sel)}`, {method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify({verdict, note})});
+  if (!res.ok) { alert((await res.json()).error); return; }
+  replaceRow((await res.json()).row);
+  await load(false); select(state.sel);
+}
+function move(delta) {
+  const i = state.rows.findIndex((r) => r.clip === state.sel), j = Math.max(0, Math.min(state.rows.length - 1, i + delta));
+  if (!state.rows[j]) return;
+  state.page = Math.floor(j / PAGE); select(state.rows[j].clip);
+  const tr = document.querySelector(`tr[data-c="${CSS.escape(state.rows[j].clip)}"]`); if (tr) tr.scrollIntoView({block: "nearest"});
+}
+async function load(refresh) {
+  state.data = await (await fetch(`/api/clips${refresh ? "?refresh=1" : ""}`)).json();
+  renderChips(); apply();
+}
+document.addEventListener("click", (e) => {
+  const t = e.target.closest("[data-f],[data-k],[data-b],tr[data-c],[data-rate],[data-step],[data-ov],.issue");
+  if (!t) return;
+  const vid = $("vid");
+  if (t.dataset.f) { state.filter = t.dataset.f; state.page = 0; renderChips(); apply(); }
+  else if (t.dataset.k) { state.dir = state.sort === t.dataset.k ? -state.dir : 1; state.sort = t.dataset.k; apply(); }
+  else if (t.dataset.b !== undefined) { const lo = +t.dataset.b / 10; state.range = state.range && state.range[0] === lo ? null : [lo, lo + 0.1 + (lo >= 0.9 ? 0.01 : 0)]; state.page = 0; apply(); }
+  else if (t.dataset.c) select(t.dataset.c);
+  else if (t.dataset.rate && vid) vid.playbackRate = +t.dataset.rate;
+  else if (t.dataset.step && vid) { vid.pause(); vid.currentTime = Math.max(0, vid.currentTime + (+t.dataset.step) / FPS); }
+  else if (t.dataset.ov !== undefined) override(t.dataset.ov || null);
+  else if (t.classList.contains("issue") && vid) { vid.currentTime = +t.dataset.t; vid.playbackRate = 0.5; vid.play(); }
+});
+["q", "maxscore", "track"].forEach((id) => $(id).addEventListener("input", () => { state.page = 0; apply(); }));
+$("refresh").onclick = () => load(true).then(() => setTimeout(() => load(false), 5000));
+$("prev").onclick = () => { state.page = Math.max(0, state.page - 1); renderTable(); };
+$("next").onclick = () => { state.page = Math.min(Math.ceil(state.rows.length / PAGE) - 1, state.page + 1); renderTable(); };
+document.addEventListener("keydown", (e) => {
+  if (["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement.tagName)) return;
+  const vid = $("vid");
+  if (e.key === "j") move(1); else if (e.key === "k") move(-1);
+  else if (e.key === "a") override("accept"); else if (e.key === "r") override("reject"); else if (e.key === "c") override(null);
+  else if (e.key === " " && vid) { e.preventDefault(); vid.paused ? vid.play() : vid.pause(); }
+  else if (e.key === "," && vid) { vid.pause(); vid.currentTime = Math.max(0, vid.currentTime - 1 / FPS); }
+  else if (e.key === "." && vid) { vid.pause(); vid.currentTime += 1 / FPS; }
+});
+load(false);
+setInterval(() => load(false), 60000);
+</script>
+</body>
+</html>
