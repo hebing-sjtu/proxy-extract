@@ -783,7 +783,8 @@ export HF_HOME=/data/binghe/cache/huggingface HF_HUB_OFFLINE=1   # 权重在这�
 
 make clip-episodes LIMIT=8 WORKERS_PER_GPU=2 DEPTH=moge3 REFINER=sam2 PROXY_DUV=1 \
   WORK_SIZE=1280x720 DUV_SIZE=native CLIPS_DIR="$CLIPS_DIR"                 # 先试
-NODE_COUNT=4 NODE_RANK=$R make clip-episodes DEPTH=moge3 REFINER=sam2 PROXY_DUV=1 \
+NODE_COUNT=4 NODE_RANK=$R WORK_ROOT=/workspace/clip-work make clip-episodes WORKERS_PER_GPU=10 \
+  DEPTH=moge3 REFINER=sam2 PROXY_DUV=1 \
   WORK_SIZE=1280x720 DUV_SIZE=native CLIPS_DIR="$CLIPS_DIR"                 # 全量，R=0..3
 ```
 
@@ -835,8 +836,29 @@ SH
 source /opt/fv-venv/env.sh     # clip-episodes、captions、encode 前都先 source 它
 ```
 
-四节点时 `NODE_COUNT=4`，各 pod `NODE_RANK=0..3`，`WORKERS_PER_GPU` 必须一致（默认 6，
-共 192 shard）。
+SAM 2 必须带编译好的 `sam2._C`，否则它只打一行 warning 就跳过 mask 补洞，产出和旧语料不一致；
+现在 refiner 和启动器 preflight 都会直接拒绝。git 装的 SAM 2 在没有匹配 nvcc 时会静默不编，
+所以用和 torch 同版本的 nvcc（torch 2.12 是 CUDA 13.0）重编，头文件用 venv 自带的：
+
+```bash
+apt-get install -y cuda-nvcc-13-0 cuda-cudart-dev-13-0
+source /opt/fv-venv/env.sh
+export CUDA_HOME=/usr/local/cuda-13.0 PATH=/usr/local/cuda-13.0/bin:$PATH \
+  CPATH=/opt/fv-venv/lib/python3.12/site-packages/nvidia/cu13/include \
+  TORCH_CUDA_ARCH_LIST=9.0 SAM2_BUILD_ALLOW_ERRORS=0
+/opt/venv/bin/python -m uv pip install --python /opt/fv-venv/bin/python setuptools wheel
+/opt/venv/bin/python -m uv pip install --python /opt/fv-venv/bin/python --no-build-isolation \
+  --no-deps --reinstall --no-cache git+https://github.com/facebookresearch/sam2.git@2b90b9f5ceec907a1c18123530e92e794ad901a4
+python -c "from sam2 import _C"
+```
+
+四节点时 `NODE_COUNT=4`，各 pod `NODE_RANK=0..3`，`WORKERS_PER_GPU` 必须一致。
+
+吞吐（4×8 H200 实测）：`.work` 默认放在 clip 目录里，也就是 GCS 挂载上；1280×720 时每片要把
+600 MB 以上的中间帧写一遍、读两遍，GPU 大半时间在等。`WORK_ROOT=/workspace/clip-work`
+把它放到 pod 本地盘，再把 `WORKERS_PER_GPU` 从 6 提到 10（每卡约 55–75 GB 显存，主机内存约
+470 GB/节点）：GPU 利用率从 12–82% 波动升到 75–100%，吞吐从约 26 片/分钟升到约 43 片/分钟。
+此时瓶颈是 GPU，CPU 仍有约 60% 空闲是正常的。
 
 ### 11.2 H3 omni cache（1280×704）
 
