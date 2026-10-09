@@ -52,6 +52,8 @@ PROXY_DUV ?= 0
 # The reusable 720p corpus is WORK_SIZE=1280x720 DUV_SIZE=native.
 WORK_SIZE ?= 1344x768
 DUV_SIZE  ?= condition
+# Local scratch for each clip's predicted frames; empty keeps it in the clip.
+WORK_ROOT ?=
 
 # Several nodes over one corpus. Every node needs the same NODE_COUNT and a
 # distinct NODE_RANK; the shard space is global, so the nodes never talk to
@@ -140,7 +142,7 @@ clip-episodes:
 	DATA_DIR=$(DATA_DIR) CLIPS_DIR=$(CLIPS_DIR) PER_SCENE=$(PER_SCENE) LIMIT=$(LIMIT) \
 	  WORKERS_PER_GPU=$(WORKERS_PER_GPU) \
 	  DEPTH=$(DEPTH) REFINER=$(REFINER) PROXY_DUV=$(PROXY_DUV) \
-	  WORK_SIZE=$(WORK_SIZE) DUV_SIZE=$(DUV_SIZE) \
+	  WORK_SIZE=$(WORK_SIZE) DUV_SIZE=$(DUV_SIZE) WORK_ROOT=$(WORK_ROOT) \
 	  NODE_COUNT=$(NODE_COUNT) NODE_RANK=$(NODE_RANK) scripts/run_clip_episodes.sh
 
 # The PROXY_DUV_SPEC.md deliverable's own two steps, after clip-episodes.

@@ -381,6 +381,18 @@ def test_labels_of_the_wrong_shape_are_refused(fake_sam2):
         refiner.refine(_frames(), _base(wrong))
 
 
+def test_cuda_refuses_a_build_without_the_hole_filling_extension(fake_sam2, monkeypatch):
+    """Without sam2._C the predictor skips hole filling and only warns."""
+    predictor = fake_sam2(object())
+    monkeypatch.setattr("proxy_extract.accel.pick_device", lambda _device: "cuda")
+
+    with pytest.raises(ImportError, match=r"sam2\._C"):
+        Sam2ConsistencyRefiner()._load()
+
+    monkeypatch.setitem(sys.modules, "sam2._C", types.ModuleType("sam2._C"))
+    assert Sam2ConsistencyRefiner()._load() is predictor
+
+
 def test_a_missing_package_says_how_to_get_it(monkeypatch):
     monkeypatch.delitem(sys.modules, "sam2", raising=False)
     monkeypatch.delitem(sys.modules, "sam2.sam2_video_predictor", raising=False)

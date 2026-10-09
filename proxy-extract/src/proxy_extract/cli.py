@@ -325,6 +325,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--keep-work", action="store_true",
         help="leave each clip's .work/ directory, which holds the predicted frames",
     )
+    episodes.add_argument(
+        "--work-root", type=Path, default=None, metavar="DIR",
+        help="keep .work/ under DIR/<clip>/ on a local disk instead of inside the clip",
+    )
     episodes.add_argument("--shard", metavar="INDEX/COUNT")
     episodes.add_argument("--resume", action="store_true")
     episodes.add_argument("--keep-going", action="store_true")
@@ -909,6 +913,7 @@ def _run_clip_episodes(args: argparse.Namespace) -> int:
                     duv_native=native,
                     resume=args.resume,
                     keep_work=args.keep_work,
+                    work_root=args.work_root,
                     progress=say,
                 )
             )

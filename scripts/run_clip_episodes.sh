@@ -165,6 +165,16 @@ for choice in (depth, refiner):
         module, how = needed[choice]
         if importlib.util.find_spec(module) is None:
             missing.append(f"  {choice} needs `{module}`, which is absent: {how}")
+if refiner == "sam2" and not missing:
+    import torch
+
+    if torch.cuda.is_available():
+        from proxy_extract.semantic.sam2 import require_sam2_extension
+
+        try:
+            require_sam2_extension()
+        except ImportError as error:
+            missing.append(f"  {error}")
 if missing:
     print("\n".join(missing), file=sys.stderr)
     raise SystemExit(1)
@@ -271,6 +281,13 @@ if [[ -n "${LIMIT:-}" ]]; then
 fi
 if [[ "$PROXY_DUV" == "1" ]]; then
   extra+=(--proxy-duv)
+fi
+# Each clip's predicted frames are written once and read back twice; on a
+# network mount such as /data that round trip, not the models, dominates a
+# clip. WORK_ROOT puts it on a local disk; only finished clips go to CLIPS_DIR.
+if [[ -n "${WORK_ROOT:-}" ]]; then
+  mkdir -p "$WORK_ROOT" || die "cannot create WORK_ROOT=$WORK_ROOT"
+  extra+=(--work-root "$WORK_ROOT")
 fi
 
 pids=()

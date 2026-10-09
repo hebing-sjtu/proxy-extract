@@ -526,6 +526,26 @@ def test_the_native_route_keeps_depth_and_semantics_on_the_targets_grid(delivere
     )
 
 
+def test_a_local_work_root_keeps_the_scratch_out_of_the_clip(delivered, tmp_path):
+    """Same clips, but the predicted frames never touch the output tree."""
+    source = delivered.parent / "video.mp4"
+    inside = _direct(source, tmp_path / "inside", proxy_duv_frames=True)
+
+    out, scratch = tmp_path / "outside", tmp_path / "scratch"
+    stale = out / inside[0]["clip"] / clips.WORK_DIRNAME
+    stale.mkdir(parents=True)  # left by a run killed with the default layout
+    outside = _direct(source, out, proxy_duv_frames=True, work_root=scratch)
+
+    assert [item["clip"] for item in outside] == [item["clip"] for item in inside]
+    assert not list(out.rglob(clips.WORK_DIRNAME)), "scratch was left in the output tree"
+    assert not list(scratch.iterdir()), "finished clips left their scratch behind"
+    for item in outside:
+        clip, twin = out / item["clip"], tmp_path / "inside" / item["clip"]
+        assert clips.already_cut(clip, 8, proxy_duv_frames=True)
+        for path in sorted(twin.joinpath("duv").iterdir()):
+            assert (clip / "duv" / path.name).read_bytes() == path.read_bytes()
+
+
 def test_a_clip_made_by_other_models_does_not_count_as_already_cut(delivered, tmp_path):
     """Otherwise a rerun with better models silently keeps the old corpus.
 

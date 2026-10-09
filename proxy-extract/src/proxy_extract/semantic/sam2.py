@@ -99,6 +99,25 @@ NO_OWNER = -1
 OWNER_DTYPE = np.int16
 
 
+def require_sam2_extension() -> None:
+    """Refuse to run SAM 2 on CUDA without its compiled `_C`.
+
+    Without it the video predictor prints one warning and skips filling small
+    holes in every mask, so the masks differ from a build that has it while
+    looking just as valid.
+    """
+    try:
+        from sam2 import _C  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "sam2 was installed without its CUDA extension (sam2._C), so SAM 2 would\n"
+            "silently skip hole filling. Rebuild it with an nvcc matching torch's CUDA:\n"
+            "  CUDA_HOME=/usr/local/cuda-<torch cuda> SAM2_BUILD_ALLOW_ERRORS=0 \\\n"
+            "  pip install --no-build-isolation --no-deps --force-reinstall \\\n"
+            "    git+https://github.com/facebookresearch/sam2.git"
+        ) from exc
+
+
 class Sam2ConsistencyRefiner:
     name = "sam2"
 
@@ -146,6 +165,8 @@ class Sam2ConsistencyRefiner:
                 ) from exc
 
             self.device = pick_device(self.device)
+            if str(self.device).startswith("cuda"):
+                require_sam2_extension()
             self._predictor = SAM2VideoPredictor.from_pretrained(
                 self.checkpoint, device=self.device
             )

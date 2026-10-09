@@ -720,6 +720,7 @@ def cut_episode(
     duv_native: bool = False,
     resume: bool = False,
     keep_work: bool = False,
+    work_root: Path | None = None,
     progress=None,
 ) -> list[dict]:
     """Cut one episode's clips without delivering the episode first.
@@ -744,6 +745,10 @@ def cut_episode(
     target's own grid - instead of reducing them onto 336x192. Every pixel of
     the target then has its own depth and class, which is what a consumer
     that crops rather than resamples needs.
+
+    `work_root` puts each clip's predicted frames on a local disk instead of
+    inside the clip. They are written once and read back twice, several hundred
+    MB a clip at 1280x720, which on a network mount is most of a clip's time.
     """
     from . import delivery
 
@@ -802,6 +807,10 @@ def cut_episode(
             f"({len(select)} predicted, {length} kept)"
         )
         work = clip_dir / WORK_DIRNAME
+        if work_root is not None:
+            # A killed run with the default layout leaves its scratch in the clip.
+            shutil.rmtree(work, ignore_errors=True)
+            work = Path(work_root) / clip_dir.name / WORK_DIRNAME
         # One window, one batch. The depth backends lock per `estimate()` call -
         # MoGe-3 solves the field of view and levels the metric scale over the
         # frames it is handed - so a window arriving in two batches comes back
@@ -845,6 +854,8 @@ def cut_episode(
         )
         if not keep_work:
             shutil.rmtree(work, ignore_errors=True)
+            if work_root is not None:
+                shutil.rmtree(work.parent, ignore_errors=True)
     return reports
 
 
