@@ -764,3 +764,70 @@ python scripts/h3_proxy/describe_cache.py \
 - 训练配置的 `data_path` 指向新 cache
 - 验证没有偷用旧 `proxy/duv.mp4`
 
+
+---
+
+## 11. 720p 原分辨率版本（omni：depth / semantic 分开作 reference）
+
+为数据复用，另切一份标准 720p 语料：源视频 1920×1080 一次缩到 **1280×720**（精确 2/3），
+RGB、逐帧 depth、逐帧 semantic、`proxy/duv.mp4` **全部 1280×720**，不再降到 336×192。
+Wan 等其它模型直接用 1280×720 不裁剪；H3 cache 编码时再中心裁剪到 1280×704。
+
+### 11.1 切片
+
+```bash
+cd /workspace/fastvideo_datapipe && git pull
+export DATA_DIR=/data/binghe/datasets/ABot-World-Explorer-subset2000/data
+export CLIPS_DIR=/data/binghe/datasets/ABot-sub-2000-clips-moge3-720p
+export HF_HUB_OFFLINE=1
+
+make clip-episodes LIMIT=8 WORKERS_PER_GPU=2 DEPTH=moge3 REFINER=sam2 PROXY_DUV=1 \
+  WORK_SIZE=1280x720 DUV_SIZE=native CLIPS_DIR="$CLIPS_DIR"                 # 先试
+NODE_COUNT=2 NODE_RANK=$R make clip-episodes DEPTH=moge3 REFINER=sam2 PROXY_DUV=1 \
+  WORK_SIZE=1280x720 DUV_SIZE=native CLIPS_DIR="$CLIPS_DIR"                 # 全量
+```
+
+- `CLIPS_DIR` 必须是新目录：一个根目录只能有一种 DUV 网格，`semantic.json` 会记录
+  `1280×720`，往里写 336×192 的帧会直接报错；`clip_report.json` 的 `duv_size` 也参与 resume
+  判断，旧网格的 clip 不会被当成已切好。
+- 体积：每帧 depth 3.69 MB，每片约 457 MB，一万片约 4.6 TB，必须放 `/data`。
+- 收货与第 3–6 节完全相同（`clips-audit`、`proxy-duv-manifest`、`proxy-duv-audit`、captions、
+  按 episode 切分），只是 `CLIPS_DIR` 换成新根目录。
+- 文本不必重跑 VLM：同名 clip 的 `clip_report.json` 里 `source_ordinals` 与 768p 版本一致时，
+  把旧根目录的 `annotations/prompt.json`、`prompt.txt` 复制过来即可；不一致的 clip 必须重新生成。
+
+### 11.2 H3 omni cache（1280×704）
+
+```bash
+cd /workspace/FastVideo && git pull
+export CACHE_DIR=/data/binghe/h3_proxy/cache/abot_720p_omni_704_qwen2
+
+NUM_SHARDS=8 NODE_COUNT=2 NODE_RANK=$R STAGGER_SEC=60 LOG_DIR="${CACHE_DIR}_logs" \
+scripts/h3_proxy/prepare_data/encode_proxy_shards.sh \
+  --manifest "$CLIPS_DIR/_fastvideo/train.jsonl" \
+  --root "$CLIPS_DIR" \
+  --output "$CACHE_DIR" \
+  --model-path /data/models/MiniMax-H3 \
+  --num-frames 124 \
+  --height 704 --width 1280 \
+  --proxy-height 704 --proxy-width 1280 \
+  --fit center-crop \
+  --proxy-references depth semantic \
+  --cwm-system w0_depth_semantic \
+  --anchor-short-edge 2048 \
+  --qwen-video-fps 2
+```
+
+- `--fit center-crop`：每路先等比缩放到恰好覆盖目标网格再居中裁剪；720→704 只裁上下各 8 行，
+  不缩放。depth / semantic 只裁不缩，必须已是 target 分辨率，否则报错。anchor 先裁到 1280:704
+  再缩放到短边 2048（3712×2048）。
+- `--proxy-references depth semantic`：同一份 `duv/` 拆成两路 video reference：
+  `<Video 1>` 灰度 depth（DUV 的 log-depth 通道复制三份），`<Video 2>` 纯色 semantic
+  （12 类放在 RGB 3×2×2 格点上）。cache 存 `proxy_latents` `[2,24,37,44,80]` 和
+  `info.proxy_references`，不再有 `proxy_latent`。
+- `--cwm-system w0_depth_semantic`：新的锁哈希 system prompt，按 `<Picture 1>` anchor、
+  `<Video 1>` depth、`<Video 2>` semantic 描述三路参考；w0/wn 只描述一路 proxy，和两路参考
+  组合会被拒绝。
+
+训练在 SolarWM：`configs/examples/minimax_h3/stage0p5-124f-ref2va-omni-704p-sp2.yaml`
+（SP2，2×8 卡全局 batch 8），见 SolarWM `docs/backends/minimax-h3.md`。

@@ -327,6 +327,11 @@ export HF_HUB_OFFLINE=1
 make clip-episodes LIMIT=8 WORKERS_PER_GPU=2 DEPTH=moge3 REFINER=sam2 PROXY_DUV=1   # 试
 NODE_COUNT=2 NODE_RANK=$R make clip-episodes DEPTH=moge3 REFINER=sam2 PROXY_DUV=1   # 全量
 
+# 720p 原分辨率（rgb/depth/semantic/duv 全 1280x720，新 CLIPS_DIR；每片约 457 MB）
+# 详见 FASTVIDEO_TRAINING_DATA.md 第 11 节
+NODE_COUNT=2 NODE_RANK=$R make clip-episodes DEPTH=moge3 REFINER=sam2 PROXY_DUV=1 \
+  WORK_SIZE=1280x720 DUV_SIZE=native CLIPS_DIR=/data/binghe/datasets/ABot-sub-2000-clips-moge3-720p
+
 # 收货
 make clips-audit && make proxy-duv-manifest && make proxy-duv-audit
 ```
