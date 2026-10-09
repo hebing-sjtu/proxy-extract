@@ -779,7 +779,7 @@ Wan 等其它模型直接用 1280×720 不裁剪；H3 cache 编码时再中心�
 cd /workspace/fastvideo_datapipe && git pull
 export DATA_DIR=/data/binghe/datasets/ABot-World-Explorer-subset2000/data
 export CLIPS_DIR=/data/binghe/datasets/ABot-sub-2000-clips-moge3-720p
-export HF_HUB_OFFLINE=1
+export HF_HOME=/data/binghe/cache/huggingface HF_HUB_OFFLINE=1   # 权重在这；pod 默认缓存是空的
 
 make clip-episodes LIMIT=8 WORKERS_PER_GPU=2 DEPTH=moge3 REFINER=sam2 PROXY_DUV=1 \
   WORK_SIZE=1280x720 DUV_SIZE=native CLIPS_DIR="$CLIPS_DIR"                 # 先试
