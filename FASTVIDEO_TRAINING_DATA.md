@@ -374,8 +374,9 @@ make proxy-duv-manifest CLIPS_DIR="$CLIPS_DIR"
 1. 只保留通过 DUV audit 的行；
 2. 丢掉 caption `missing / failed / warned`；
 3. 丢掉 `score < 0.90`；
-4. 按 episode 留出 24 个验证 episode；
-5. 写入数据根目录 `_fastvideo/`。
+4. 有 `quality_audit.json`（第 11.3 节 VLM 质量门禁）时，只保留其中 `accepted` 的 clip；
+5. 按 episode 留出 24 个验证 episode；
+6. 写入数据根目录 `_fastvideo/`。
 
 ```bash
 export CLIPS_DIR=/data/binghe/datasets/ABot-sub-2000-clips-moge3
@@ -402,6 +403,8 @@ assert not audit["warnings"]
 
 good_duv = {row["seg"] for row in audit["segment_stats"]}
 text_rejected = set(captions["missing"]) | set(captions["failed"]) | set(captions["warned"])
+quality_path = root / "quality_audit.json"
+quality_ok = set(json.loads(quality_path.read_text())["accepted"]) if quality_path.exists() else None
 eligible = []
 rejected = Counter()
 
@@ -409,6 +412,9 @@ for row in source:
     name = row["name"]
     if name not in good_duv:
         rejected["duv"] += 1
+        continue
+    if quality_ok is not None and name not in quality_ok:
+        rejected["vlm_quality"] += 1
         continue
     if name in text_rejected:
         rejected["text_missing_failed_or_warned"] += 1
@@ -461,6 +467,7 @@ summary = {
     "val": len(val),
     "val_episodes": len(val_episodes),
     "score_threshold": 0.90,
+    "quality_gate": quality_ok is not None,
     "rejected": dict(rejected),
 }
 (out / "split_summary.json").write_text(
@@ -793,7 +800,7 @@ NODE_COUNT=4 NODE_RANK=$R WORK_ROOT=/workspace/clip-work make clip-episodes WORK
   判断，旧网格的 clip 不会被当成已切好。
 - 体积：每帧 depth 3.69 MB，每片约 457 MB，一万片约 4.6 TB，必须放 `/data`。
 - 收货与第 3–6 节完全相同（`clips-audit`、`proxy-duv-manifest`、`proxy-duv-audit`、captions、
-  按 episode 切分），只是 `CLIPS_DIR` 换成新根目录。
+  按 episode 切分），只是 `CLIPS_DIR` 换成新根目录；切分前先过第 11.3 节的 VLM 质量门禁。
 - 文本不必重跑 VLM：窗口只取决于 episode 和 `--per-scene/--frames/--fps`，与分辨率无关
   （smoke 实测 `source_ordinals` 与 768p 版逐片相同）。`reuse_prompts.py` 只在两边
   `source_ordinals` 相同时复制 `annotations/prompt.json`，再用新 DUV 本地复核（不调 VLM）后导出：
@@ -857,7 +864,7 @@ python -c "from sam2 import _C"
 吞吐（4×8 H200 实测）：`.work` 默认放在 clip 目录里，也就是 GCS 挂载上；1280×720 时每片要把
 600 MB 以上的中间帧写一遍、读两遍，GPU 大半时间在等。`WORK_ROOT=/workspace/clip-work`
 把它放到 pod 本地盘，再把 `WORKERS_PER_GPU` 从 6 提到 10（每卡约 55–75 GB 显存，主机内存约
-470 GB/节点）：GPU 利用率从 12–82% 波动升到 75–100%，吞吐从约 26 片/分钟升到约 43 片/分钟。
+470 GB/节点）：GPU 利用率从 12–82% 波动升到 75–100%，吞吐从约 26 片/分钟升到约 38 片/分钟。
 此时瓶颈是 GPU，CPU 仍有约 60% 空闲是正常的。
 
 ### 11.2 H3 omni cache（1280×704）
@@ -896,3 +903,49 @@ scripts/h3_proxy/prepare_data/encode_proxy_shards.sh \
 
 训练在 SolarWM：`configs/examples/minimax_h3/stage0p5-124f-ref2va-omni-704p-sp2.yaml`
 （SP2，2×8 卡全局 batch 8），见 SolarWM `docs/backends/minimax-h3.md`。
+
+### 11.3 VLM 质量门禁与工作台
+
+结构性 audit 只保证每帧格式合法；闪烁、错标、漏检只能在时序上、或对照画面才看得出来。
+所以每片在切分前先由 VLM 看一遍：
+
+- `quality-judge` 为每片渲染一个 2×2 审片视频 `annotations/quality_panel.mp4`
+  （RGB｜depth turbo 色，近暖远蓝、天空黑｜semantic 12 类固定色｜semantic 半透明叠 RGB，
+  每格 640×360、24 fps），以 8 fps 发给 Gemini（默认 `gemini-3.8-flash`，Vertex）。
+- VLM 给四项 1–5 分：`depth_temporal`、`depth_accuracy`、`semantic_temporal`、
+  `semantic_accuracy`，外加带时间段的问题列表（`minor`/`major`）和自己的 verdict。
+- 判定：VLM 判 reject、任一分 < 3、或有任一 `major` 问题，就拒绝；score = 四项均值 / 5。
+  阈值写进每片的 `quality.json`（`--min-score`、`--allow-major`、`--ignore-verdict` 可调）。
+- 本地另算两项不经 VLM 的时序指标，用于排序和交叉核对：`depth_jitter`（log-depth 码的
+  三帧二阶差分中位数，1 码≈4.4% 距离；匀速运动相消，只剩抖动）和 `semantic_flicker`
+  （t 帧标签与 t±1 不同、而 t±1 彼此相同的像素比例，即单帧闪烁）。
+- 只评审已有 `clip_report.json` 的完整 clip；同一 prompt 版本评过的会复用，所以可以边切边评、
+  反复重跑。每片约 18 s，24 并发约 45 片/分钟，只用 CPU 和网络。
+
+```bash
+cd /workspace/fastvideo_datapipe && git pull --ff-only
+source /opt/fv-venv/env.sh
+clip-prompts quality-judge --clips "$CLIPS_DIR" --workers 24 --keep-going \
+  --env-file /data/binghe/secrets/vertex.env
+clip-prompts quality-audit --clips "$CLIPS_DIR"      # 写 $CLIPS_DIR/quality_audit.json，第 6 节切分读它
+```
+
+工作台（只监听 pod 的 127.0.0.1，经 `kubectl port-forward` 访问）：
+
+```bash
+# pod 上
+clip-prompts workbench --clips "$CLIPS_DIR" --port 8765
+# 本机
+kubectl -n ultron-ls-gcp-aw port-forward pod/$(bcs name 154751:0) 8765:8765
+open http://localhost:8765/
+```
+
+- 顶部计数（全部／接收／拒绝／待评／人工／未完成）可点击筛选；score 直方图按区间筛选；
+  表格可按任一分数或本地指标排序；`#clip_xxx` 直接定位某片。
+- 右侧播放审片视频（0.25×/0.5×、逐帧），列出四项分数、VLM 结论、拒绝原因、问题列表
+  （点击跳到对应时间并 0.5× 播放）、本地指标和来源。
+- 人工复核：`a` 接收、`r` 拒绝、`c` 清除，写 `annotations/quality_override.json`；
+  人工结论优先于 VLM，`quality-audit` 和切分都按最终结论。`j`/`k` 上下切换。
+
+720p 语料前 148 片实测：接收 72%。拒绝几乎都来自 semantic：道路／停车场被标成
+infrastructure、狗被标成 vehicle、主角没被分出来（`hero_split` 未 resolve）；depth 很少触发。

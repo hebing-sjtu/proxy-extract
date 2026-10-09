@@ -198,6 +198,7 @@ function bar(v) {
 }
 async function select(name) {
   state.sel = name; renderTable();
+  history.replaceState(null, "", `#${name}`);
   const res = await fetch(`/api/clip/${encodeURIComponent(name)}`);
   if (!res.ok) { $("right").innerHTML = `<p class="v-reject">${esc((await res.json()).error)}</p>`; return; }
   const {row, quality, report} = await res.json();
@@ -306,7 +307,7 @@ document.addEventListener("keydown", (e) => {
   else if (e.key === "," && vid) { vid.pause(); vid.currentTime = Math.max(0, vid.currentTime - 1 / FPS); }
   else if (e.key === "." && vid) { vid.pause(); vid.currentTime += 1 / FPS; }
 });
-load(false);
+load(false).then(() => { const name = decodeURIComponent(location.hash.slice(1)); if (name) select(name); });
 setInterval(() => load(false), 60000);
 </script>
 </body>

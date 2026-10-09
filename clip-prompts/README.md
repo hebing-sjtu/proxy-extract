@@ -340,7 +340,9 @@ src/clip_prompts/
     cwm_export.py 投影成 CWM 真正喂给 Qwen 的那一句（见 CWM_TEXT_EXPORT.md）
     llm/          VLM 传输层：Vertex / LiteLLM，全标准库
     layout.py     片目录解析，prompt.json 放哪
-    cli.py        七个子命令
+    quality.py    depth/semantic 的 VLM 质量门禁：审片视频、时序指标、打分、接收/拒绝
+    workbench.py  浏览器工作台（workbench.html），看结论、人工改判
+    cli.py        十个子命令
 CWM_TEXT_EXPORT.md   文本落地合同：时间戳、CRLF、w0/wn、prompt.txt 写哪
 example/prompt.json
 tests/
@@ -352,4 +354,6 @@ tests/
 python -m pytest clip-prompts/tests -q
 ```
 
-不需要 GPU、不需要网络、不需要语料——161 个用例全部在合成数据上跑。
+不需要 GPU、不需要网络、不需要语料——182 个用例全部在合成数据上跑。
+
+depth / semantic 的 VLM 质量门禁和工作台见上级目录 `FASTVIDEO_TRAINING_DATA.md` 第 11.3 节。
