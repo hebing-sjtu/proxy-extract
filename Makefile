@@ -48,6 +48,11 @@ DEPTH     ?= depth_anything_v3
 REFINER   ?= none
 PROXY_DUV ?= 0
 
+# What clip-episodes runs the models at, and whether duv/ keeps that grid.
+# The reusable 720p corpus is WORK_SIZE=1280x720 DUV_SIZE=native.
+WORK_SIZE ?= 1344x768
+DUV_SIZE  ?= condition
+
 # Several nodes over one corpus. Every node needs the same NODE_COUNT and a
 # distinct NODE_RANK; the shard space is global, so the nodes never talk to
 # each other. See RUNBOOK section 3.
@@ -88,6 +93,7 @@ help:
 	@echo
 	@echo "治闪烁 + PROXY_DUV 交付（RUNBOOK 第 5 节）"
 	@echo "  make clip-episodes DEPTH=moge3 REFINER=sam2 PROXY_DUV=1"
+	@echo "  720p 原分辨率：再加 WORK_SIZE=1280x720 DUV_SIZE=native"
 	@echo "  make proxy-duv-manifest   写 encode_manifest.jsonl"
 	@echo "  make proxy-duv-audit AUDIT_WORKERS=32   并行跑跨段验收"
 	@echo "  make proxy-duv-repair-sky AUDIT_WORKERS=32   把语义天空处的 depth 原子改为 0"
@@ -134,6 +140,7 @@ clip-episodes:
 	DATA_DIR=$(DATA_DIR) CLIPS_DIR=$(CLIPS_DIR) PER_SCENE=$(PER_SCENE) LIMIT=$(LIMIT) \
 	  WORKERS_PER_GPU=$(WORKERS_PER_GPU) \
 	  DEPTH=$(DEPTH) REFINER=$(REFINER) PROXY_DUV=$(PROXY_DUV) \
+	  WORK_SIZE=$(WORK_SIZE) DUV_SIZE=$(DUV_SIZE) \
 	  NODE_COUNT=$(NODE_COUNT) NODE_RANK=$(NODE_RANK) scripts/run_clip_episodes.sh
 
 # The PROXY_DUV_SPEC.md deliverable's own two steps, after clip-episodes.

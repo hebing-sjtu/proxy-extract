@@ -402,6 +402,7 @@ def clip_provenance(clip_dir: Path) -> dict | None:
         "depth": (report.get("depth") or {}).get("backend"),
         "refiner": (report.get("semantic") or {}).get("refiner"),
         "proxy_duv": bool(report.get("proxy_duv")),
+        "duv_size": list(report.get("duv_size") or (DUV_WIDTH, DUV_HEIGHT)),
     }
 
 
@@ -411,6 +412,7 @@ def already_cut(
     *,
     proxy_duv_frames: bool = False,
     expect: dict | None = None,
+    duv_size: tuple[int, int] | None = None,
 ) -> bool:
     """Whether a previous run left a complete clip here.
 
@@ -442,7 +444,7 @@ def already_cut(
         return False
     if not (clip_dir / TARGET_DIRNAME / ANCHOR_NAME).is_file():
         return False
-    if proxy_duv_frames and not _duv_frames_complete(clip_dir, length):
+    if proxy_duv_frames and not _duv_frames_complete(clip_dir, length, size=duv_size):
         return False
     try:
         return all(probe(path).frames == length for path in videos)
@@ -450,21 +452,26 @@ def already_cut(
         return False
 
 
-def _duv_frames_complete(clip_dir: Path, length: int) -> bool:
+def _duv_frames_complete(
+    clip_dir: Path, length: int, *, size: tuple[int, int] | None = None
+) -> bool:
     """Whether `duv/` holds a readable pair for every ordinal the clip claims.
 
     Byte counts, not a file listing: the consumer asserts on the size of every
     `.depth.f32` it opens, so a write cut short by a full disk has to fail here
-    rather than at the far end of a cache build.
+    rather than at the far end of a cache build. `size` is the `(width, height)`
+    the frames were written at, the condition grid unless the clip is native.
     """
     duv = proxy_duv.duv_dir_for(clip_dir)
     if not duv.is_dir():
         return False
+    width, height = size or (DUV_WIDTH, DUV_HEIGHT)
+    expected = contract.depth_bytes(height, width)
     for ordinal in range(length):
         depth, semantic = contract.frame_paths(duv, ordinal)
         if not semantic.is_file():
             return False
-        if not depth.is_file() or depth.stat().st_size != contract.DEPTH_BYTES:
+        if not depth.is_file() or depth.stat().st_size != expected:
             return False
     return True
 
@@ -710,6 +717,7 @@ def cut_episode(
     semantic_backend=None,
     refiner=None,
     proxy_duv_frames: bool = False,
+    duv_native: bool = False,
     resume: bool = False,
     keep_work: bool = False,
     progress=None,
@@ -731,6 +739,11 @@ def cut_episode(
 
     What comes out is byte-for-byte the same layout `cut_scene` produces, so
     nothing downstream can tell which route a clip took.
+
+    `duv_native` writes `duv/` and `proxy/duv.mp4` at the work size - the
+    target's own grid - instead of reducing them onto 336x192. Every pixel of
+    the target then has its own depth and class, which is what a consumer
+    that crops rather than resamples needs.
     """
     from . import delivery
 
@@ -738,6 +751,7 @@ def cut_episode(
     config = config or delivery.DeliveryConfig()
     halo = config.temporal_radius if halo is None else halo
     say = progress or (lambda _line: None)
+    duv_size = tuple(config.size) if duv_native else (DUV_WIDTH, DUV_HEIGHT)
 
     # What this call will produce, so `already_cut` can tell a clip it made
     # from one an earlier run with different models left behind. `none` becomes
@@ -746,6 +760,7 @@ def cut_episode(
         "depth": config.depth_backend,
         "refiner": None if config.semantic_refiner in {"none", ""} else config.semantic_refiner,
         "proxy_duv": bool(proxy_duv_frames),
+        "duv_size": list(duv_size),
     }
 
     info = probe(video)
@@ -764,7 +779,11 @@ def cut_episode(
     for window in windows:
         clip_dir = clips_root / clip_name(scene, window.index)
         if resume and already_cut(
-            clip_dir, length, proxy_duv_frames=proxy_duv_frames, expect=expect
+            clip_dir,
+            length,
+            proxy_duv_frames=proxy_duv_frames,
+            expect=expect,
+            duv_size=duv_size,
         ):
             existing = clip_dir / CLIP_REPORT_NAME
             reports.append(
@@ -821,6 +840,7 @@ def cut_episode(
                 annotations=annotations,
                 color_crf=config.color_crf,
                 proxy_duv_frames=proxy_duv_frames,
+                duv_native=duv_native,
             )
         )
         if not keep_work:
@@ -840,6 +860,7 @@ def _assemble_clip(
     annotations: Path | None,
     color_crf: int,
     proxy_duv_frames: bool = False,
+    duv_native: bool = False,
 ) -> dict:
     """Turn one window's predicted frames into the clip's three outputs.
 
@@ -855,12 +876,13 @@ def _assemble_clip(
     inverted = bool(scene_report.get("duv_depth_inverted", False))
     taxonomy = scene_report.get("semantic", {}).get("taxonomy", "standard11")
     width, height = scene_report["size"]
+    duv_width, duv_height = (width, height) if duv_native else (DUV_WIDTH, DUV_HEIGHT)
 
     rgb = proxy.open_encoder(
         clip_dir / TARGET_DIRNAME / TARGET_NAME, width, height, fps, kind="color", crf=color_crf
     )
     duv = proxy.open_encoder(
-        clip_dir / PROXY_DIRNAME / DUV_NAME, DUV_WIDTH, DUV_HEIGHT, fps, kind="proxy"
+        clip_dir / PROXY_DIRNAME / DUV_NAME, duv_width, duv_height, fps, kind="proxy"
     )
     anchor = None
     try:
@@ -869,15 +891,14 @@ def _assemble_clip(
             if anchor is None:
                 anchor = colour
             rgb.write(colour)
-            # This route's work size is already a whole multiple of the DUV
-            # grid - the CLI refuses a --work-size that is not - so these are
-            # exact block reductions rather than the nearest-neighbour fallback.
-            metres = contract.downsample_depth(
-                frames.read_array(work, "depth", index).astype(np.float32)
-            )
-            ids = contract.downsample_semantic(
-                frames.read_array(work, "semantic", index).astype(np.uint8)
-            )
+            metres = frames.read_array(work, "depth", index).astype(np.float32)
+            ids = frames.read_array(work, "semantic", index).astype(np.uint8)
+            if not duv_native:
+                # This route's work size is already a whole multiple of the DUV
+                # grid - the CLI refuses a --work-size that is not - so these are
+                # exact block reductions rather than the nearest-neighbour fallback.
+                metres = contract.downsample_depth(metres)
+                ids = contract.downsample_semantic(ids)
             duv.write(
                 proxy.compose_proxy_frame(
                     metres, ids, driving=driving, inverted_depth=inverted
@@ -885,7 +906,7 @@ def _assemble_clip(
             )
             if proxy_duv_frames:
                 proxy_duv.write_frame(
-                    clip_dir, index - offset, metres, ids, taxonomy=taxonomy
+                    clip_dir, index - offset, metres, ids, taxonomy=taxonomy, native=duv_native
                 )
     finally:
         rgb.close()
@@ -908,7 +929,7 @@ def _assemble_clip(
         "fps": fps,
         "target_size": [width, height],
         "target_from": "the source video, resampled once",
-        "duv_size": [DUV_WIDTH, DUV_HEIGHT],
+        "duv_size": [duv_width, duv_height],
         "duv_depth_inverted": inverted,
         "proxy_duv": (
             {

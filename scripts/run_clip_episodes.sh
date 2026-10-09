@@ -33,6 +33,13 @@ PER_SCENE="${PER_SCENE:-5}"
 FRAMES="${FRAMES:-124}"
 FPS="${FPS:-24}"
 WORK_SIZE="${WORK_SIZE:-1344x768}"
+# `native` keeps duv/ and proxy/duv.mp4 at WORK_SIZE instead of 336x192. The
+# reusable 720p corpus is WORK_SIZE=1280x720 DUV_SIZE=native: exactly 2/3 of
+# the 1920x1080 source, so nothing is squeezed, and every target pixel has its
+# own depth and class for consumers that crop rather than resample.
+DUV_SIZE="${DUV_SIZE:-condition}"
+[[ "$DUV_SIZE" == "condition" || "$DUV_SIZE" == "native" ]] \
+  || { echo "error: DUV_SIZE must be condition or native, got $DUV_SIZE" >&2; exit 1; }
 
 _repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # An activated environment wins over a repo-local .venv. That ordering matters
@@ -178,16 +185,24 @@ fi
 
 mkdir -p "$CLIPS_DIR/logs"
 mib_per_clip="$MIB_PER_CLIP"
+depth_frame_bytes=258048
+if [[ "$DUV_SIZE" == "native" ]]; then
+  work_w="${WORK_SIZE%x*}"
+  work_h="${WORK_SIZE#*x}"
+  depth_frame_bytes=$((work_w * work_h * 4))
+  # The lossless DUV video grows with the grid too, by roughly the same factor.
+  mib_per_clip=$((mib_per_clip + mib_per_clip * work_w * work_h / (336 * 192) / 4))
+fi
 if [[ "$PROXY_DUV" == "1" ]]; then
-  # 258048 bytes of depth plus a compressible 8-bit id plane, per frame.
-  mib_per_clip=$((mib_per_clip + FRAMES * 258048 / 1048576 + 1))
+  # float32 depth plus a compressible 8-bit id plane, per frame.
+  mib_per_clip=$((mib_per_clip + FRAMES * depth_frame_bytes / 1048576 + 1))
 fi
 need_mib=$((clips * mib_per_clip + n_workers * MIB_PER_WORKER_SCRATCH))
 avail_mib="$(df -Pm "$CLIPS_DIR" | awk 'NR==2 {print $4}')"
 if [[ "$avail_mib" -lt "$need_mib" ]]; then
   die "$CLIPS_DIR has $((avail_mib / 1024)) GiB free but $clips clips at ~$mib_per_clip MiB
        plus $n_workers working directories need about $((need_mib / 1024)) GiB.${PROXY_DUV:+
-       PROXY_DUV=1 is most of that: the per-frame form is ~$((FRAMES * 258048 / 1048576)) MiB a clip, uncompressed.}"
+       PROXY_DUV=1 is most of that: the per-frame form is ~$((FRAMES * depth_frame_bytes / 1048576)) MiB a clip, uncompressed.}"
 fi
 
 gib() { awk -v m="$1" 'BEGIN {printf "%.1f", m / 1024}'; }
@@ -231,7 +246,7 @@ fi
 cat <<EOF
 data       $DATA_DIR ($episodes episodes${LIMIT:+, limited})
 clips      $CLIPS_DIR ($clips clips at ~$mib_per_clip MiB, $(gib "$avail_mib") GiB free, need ~$(gib "$need_mib") GiB)
-shape      $PER_SCENE x $FRAMES frames at $FPS fps, models at $WORK_SIZE
+shape      $PER_SCENE x $FRAMES frames at $FPS fps, models at $WORK_SIZE, DUV $DUV_SIZE
 shards     $shard_base..$((shard_base + n_workers - 1)) of $n_shards ($N_GPUS GPU(s) x $WORKERS_PER_GPU worker(s), node $NODE_RANK of $NODE_COUNT)
 threads    $THREADS_PER_WORKER per worker, of $cores core(s)
 memory     ~$(gib "$ram_need_mib") GiB needed${ram_avail_mib:+, $(gib "$ram_avail_mib") GiB available}
@@ -271,6 +286,7 @@ for ((i = 0; i < n_workers; i++)); do
     --frames "$FRAMES" \
     --fps "$FPS" \
     --work-size "$WORK_SIZE" \
+    --duv-size "$DUV_SIZE" \
     --semantic-backend "$SEMANTIC" \
     --depth-backend "$DEPTH" \
     --refiner "$REFINER" \
@@ -304,7 +320,7 @@ done_at_start="$(find "$CLIPS_DIR" -maxdepth 2 -name clip_report.json 2>/dev/nul
 if ((done_at_start > 0)); then
   echo "note: $CLIPS_DIR already holds $done_at_start of $clips clips."
   echo "      Those were cut by an earlier run. This one reuses only the ones made"
-  echo "      with DEPTH=$DEPTH, REFINER=$REFINER and PROXY_DUV=$PROXY_DUV; the rest"
+  echo "      with DEPTH=$DEPTH, REFINER=$REFINER, PROXY_DUV=$PROXY_DUV and this DUV grid; the rest"
   echo "      are cut again. For a clean corpus in its own directory instead:"
   echo "        CLIPS_DIR=/data/binghe/datasets/<new-name> $0"
   echo

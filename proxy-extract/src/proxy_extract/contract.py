@@ -9,6 +9,11 @@ Layout, one pair per source-frame ordinal, flat:
 
     000000.depth.f32      headerless C-order little-endian float32, 192x336, metres
     000000.semantic_id.png  8-bit grayscale PNG, 336x192, values in [0, 11]
+
+`write_frame(..., native=True)` keeps the caller's grid instead, for consumers
+that want depth and labels at the target's own resolution. The semantic PNG's
+size is then the grid of record: readers take the shape from its header and
+hold the depth file to that many float32s, so one root cannot mix grids.
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ WINDOW_FRAMES = 124
 STRIDE_FRAMES = 90
 
 DEPTH_BYTES = CONDITION_WIDTH * CONDITION_HEIGHT * 4
+CONDITION_PIXELS = CONDITION_WIDTH * CONDITION_HEIGHT
 _LOG_FAR = math.log(DEPTH_FAR_METRES)
 _LOG_SPAN = _LOG_FAR - math.log(DEPTH_NEAR_METRES)
 
@@ -181,12 +187,22 @@ def frame_paths(root: Path, ordinal: int) -> tuple[Path, Path]:
     return root / f"{ordinal:06d}.depth.f32", root / f"{ordinal:06d}.semantic_id.png"
 
 
-def rewrite_depth_frame(root: Path, ordinal: int, depth_metres: np.ndarray) -> None:
-    """Atomically replace one already-sized metric depth frame."""
-    depth = np.asarray(depth_metres, dtype=np.float32)
-    expected = (CONDITION_HEIGHT, CONDITION_WIDTH)
-    if depth.shape != expected:
-        raise ValueError(f"depth for ordinal {ordinal} has shape {depth.shape}, expected {expected}")
+def depth_bytes(height: int, width: int) -> int:
+    return int(height) * int(width) * 4
+
+
+def frame_shape(root: Path, ordinal: int) -> tuple[int, int]:
+    """`(height, width)` of one ordinal, from its semantic PNG's header."""
+    from PIL import Image
+
+    _, semantic_path = frame_paths(Path(root), ordinal)
+    with Image.open(semantic_path) as image:
+        return int(image.size[1]), int(image.size[0])
+
+
+def _write_depth(root: Path, ordinal: int, depth: np.ndarray) -> None:
+    if depth.ndim != 2:
+        raise ValueError(f"depth for ordinal {ordinal} must be 2-D, got shape {depth.shape}")
     if not bool(np.all(np.isfinite(depth))):
         raise ValueError(f"depth for ordinal {ordinal} contains non-finite values")
     if bool(np.any(depth < 0.0)):
@@ -197,13 +213,51 @@ def rewrite_depth_frame(root: Path, ordinal: int, depth_metres: np.ndarray) -> N
     _atomic_write(depth_path, np.ascontiguousarray(depth, dtype="<f4").tobytes(order="C"))
 
 
-def write_frame(root: Path, ordinal: int, depth_metres: np.ndarray, semantic_ids: np.ndarray) -> None:
-    """Write one ordinal's depth + semantic pair, resampling if needed."""
+def rewrite_depth_frame(root: Path, ordinal: int, depth_metres: np.ndarray) -> None:
+    """Atomically replace one already-sized metric depth frame.
+
+    The size is the one the ordinal's semantic PNG already has, so a rewrite
+    can never leave a pair that disagrees about its grid.
+    """
+    depth = np.asarray(depth_metres, dtype=np.float32)
+    _, semantic_path = frame_paths(Path(root), ordinal)
+    expected = (
+        frame_shape(root, ordinal) if semantic_path.is_file() else (CONDITION_HEIGHT, CONDITION_WIDTH)
+    )
+    if depth.shape != expected:
+        raise ValueError(f"depth for ordinal {ordinal} has shape {depth.shape}, expected {expected}")
+    _write_depth(root, ordinal, depth)
+
+
+def write_frame(
+    root: Path,
+    ordinal: int,
+    depth_metres: np.ndarray,
+    semantic_ids: np.ndarray,
+    *,
+    native: bool = False,
+) -> None:
+    """Write one ordinal's depth + semantic pair.
+
+    By default both are reduced onto the 192x336 condition grid. `native`
+    writes them at the grid they arrive on, which then has to be the same for
+    both: there is no resampling left to reconcile them.
+    """
     from PIL import Image
 
+    root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
-    depth = downsample_depth(depth_metres)
-    semantic = downsample_semantic(semantic_ids)
+    if native:
+        depth = np.asarray(depth_metres, dtype=np.float32)
+        semantic = np.asarray(semantic_ids)
+        if depth.ndim != 2 or depth.shape != semantic.shape:
+            raise ValueError(
+                f"native depth {depth.shape} and semantic ids {semantic.shape} must be the "
+                f"same 2-D grid for ordinal {ordinal}"
+            )
+    else:
+        depth = downsample_depth(depth_metres)
+        semantic = downsample_semantic(semantic_ids)
 
     if not np.all(np.isfinite(depth)):
         raise ValueError(f"depth for ordinal {ordinal} contains non-finite values")
@@ -211,7 +265,7 @@ def write_frame(root: Path, ordinal: int, depth_metres: np.ndarray, semantic_ids
     if int(semantic.max(initial=0)) >= NUM_SEMANTIC_CLASSES:
         raise ValueError(f"semantic ids for ordinal {ordinal} exceed {NUM_SEMANTIC_CLASSES - 1}")
 
-    rewrite_depth_frame(root, ordinal, depth)
+    _write_depth(root, ordinal, depth)
 
     _, semantic_path = frame_paths(root, ordinal)
     tmp = semantic_path.with_suffix(".png.tmp")
@@ -220,19 +274,23 @@ def write_frame(root: Path, ordinal: int, depth_metres: np.ndarray, semantic_ids
 
 
 def read_frame(root: Path, ordinal: int) -> tuple[np.ndarray, np.ndarray]:
-    """Read back one ordinal as (metric depth, semantic ids)."""
+    """Read back one ordinal as (metric depth, semantic ids), at its own grid."""
     from PIL import Image
 
     depth_path, semantic_path = frame_paths(root, ordinal)
-    payload = depth_path.read_bytes()
-    if len(payload) != DEPTH_BYTES:
-        raise ValueError(f"raw depth byte count must be {DEPTH_BYTES}, got {len(payload)}: {depth_path}")
-    depth = np.frombuffer(payload, dtype="<f4").reshape(CONDITION_HEIGHT, CONDITION_WIDTH)
-
     with Image.open(semantic_path) as image:
-        if image.mode != "L" or image.size != (CONDITION_WIDTH, CONDITION_HEIGHT):
-            raise ValueError(f"semantic ID must be L/{CONDITION_WIDTH}x{CONDITION_HEIGHT}: {semantic_path}")
+        if image.mode != "L":
+            raise ValueError(f"semantic ID must be an L-mode PNG, got {image.mode}: {semantic_path}")
         semantic = np.asarray(image, dtype=np.uint8).copy()
+    height, width = semantic.shape
+    expected = depth_bytes(height, width)
+    payload = depth_path.read_bytes()
+    if len(payload) != expected:
+        raise ValueError(
+            f"raw depth byte count must be {expected} for {width}x{height}, "
+            f"got {len(payload)}: {depth_path}"
+        )
+    depth = np.frombuffer(payload, dtype="<f4").reshape(height, width)
     return depth, semantic
 
 
@@ -243,11 +301,15 @@ class ContractError(ValueError):
     """A condition_root does not satisfy what code-world-model will accept."""
 
 
+CONDITION_SHAPE = (CONDITION_HEIGHT, CONDITION_WIDTH)
+
+
 def validate_condition_root(
     root: Path,
     *,
     expected_frames: int | None = None,
     frame_observer: Callable[[int, np.ndarray, np.ndarray], None] | None = None,
+    shape: tuple[int, int] | None = CONDITION_SHAPE,
 ) -> dict:
     """Re-read a written condition_root and apply every check the loader applies.
 
@@ -255,6 +317,10 @@ def validate_condition_root(
     malformed frame when `prepare` throws 124 frames into a window. When an
     observer is supplied, it sees each frame after validation so callers can
     collect additional statistics without reading the files a second time.
+
+    `shape` is the `(height, width)` every frame must have. The default is
+    code-world-model's grid; `None` accepts any grid as long as every frame in
+    the root shares the first frame's.
     """
     root = Path(root)
     if not root.is_dir():
@@ -270,8 +336,16 @@ def validate_condition_root(
 
     classes_seen: set[int] = set()
     depth_min, depth_max, invalid_total = math.inf, 0.0, 0
+    grid = shape
     for ordinal in ordinals:
         depth, semantic = read_frame(root, ordinal)
+        if grid is None:
+            grid = tuple(depth.shape)
+        if tuple(depth.shape) != tuple(grid):
+            raise ContractError(
+                f"ordinal {ordinal} is {depth.shape[1]}x{depth.shape[0]}, "
+                f"expected {grid[1]}x{grid[0]} in {root}"
+            )
         if not bool(np.all(np.isfinite(depth))):
             raise ContractError(f"non-finite depth at ordinal {ordinal}")
         if bool(np.any(depth < 0.0)):
@@ -289,9 +363,10 @@ def validate_condition_root(
         if frame_observer is not None:
             frame_observer(ordinal, depth, semantic)
 
-    pixels = len(ordinals) * CONDITION_HEIGHT * CONDITION_WIDTH
+    pixels = len(ordinals) * int(grid[0]) * int(grid[1])
     return {
         "frames": len(ordinals),
+        "size": [int(grid[1]), int(grid[0])],
         "windows": window_count_for(len(ordinals)),
         "depth_min_metres": None if depth_min is math.inf else round(depth_min, 4),
         "depth_max_metres": round(depth_max, 4),

@@ -116,6 +116,69 @@ def test_the_writer_forces_semantic_sky_depth_to_zero(tmp_path):
     assert np.all(depth[semantic != SKY] == 40.0)
 
 
+# ------------------------------------------------------- the native grid
+
+NATIVE_H, NATIVE_W = 720, 1280
+
+
+def _write_native_segment(root, name, *, metres=12.0, frames=2):
+    seg = root / name
+    ids = np.full((NATIVE_H, NATIVE_W), ROAD_PAVED, dtype=np.uint8)
+    ids[:40] = SKY
+    for ordinal in range(frames):
+        depth = np.full((NATIVE_H, NATIVE_W), metres, dtype=np.float32)
+        proxy_duv.write_frame(seg, ordinal, depth, ids, taxonomy="cwm12", native=True)
+    (seg / proxy_duv.TARGET_NAME).write_bytes(b"not really an mp4, but a file")
+    return seg
+
+
+def test_a_native_frame_keeps_the_targets_own_grid(tmp_path):
+    seg = _write_native_segment(tmp_path, "seg_000000", frames=1)
+
+    depth, ids = contract.read_frame(seg / proxy_duv.DUV_DIRNAME, 0)
+
+    assert depth.shape == ids.shape == (NATIVE_H, NATIVE_W)
+    assert (seg / proxy_duv.DUV_DIRNAME / "000000.depth.f32").stat().st_size == (
+        NATIVE_H * NATIVE_W * 4
+    )
+    assert np.all(depth[ids == SKY] == 0.0), "sky is still the zero sentinel"
+    assert np.all(depth[ids != SKY] == 12.0), "a native frame is never block-reduced"
+    metadata = json.loads((tmp_path / proxy_duv.SEMANTIC_NAME).read_text())
+    assert metadata["resolution"] == {"width": NATIVE_W, "height": NATIVE_H}
+
+
+def test_one_root_refuses_a_second_grid(tmp_path):
+    _write_native_segment(tmp_path, "seg_000000", frames=1)
+
+    with pytest.raises(proxy_duv.ProxyDuvError, match="mix"):
+        _write_segment(tmp_path, "seg_000001", frames=1)
+
+
+def test_the_audit_accepts_a_native_corpus_and_reports_its_grid(tmp_path):
+    for index in range(3):
+        _write_native_segment(tmp_path, f"seg_{index:06d}", frames=2)
+
+    report = proxy_duv.audit_root(tmp_path, frames=2)
+
+    assert report["failed"] == 0
+    assert report["resolutions"] == [f"{NATIVE_W}x{NATIVE_H}"]
+    assert report["warnings"] == []
+    assert report["segment_stats"][0]["size"] == [NATIVE_W, NATIVE_H]
+    assert report["segment_stats"][0]["metres_p50"] == pytest.approx(12.0)
+
+
+def test_the_audit_warns_when_segments_disagree_about_the_grid(tmp_path):
+    _write_native_segment(tmp_path, "seg_000000", frames=FRAMES)
+    other = tmp_path / "other"
+    _write_segment(other, "seg_000001")
+    (other / "seg_000001").rename(tmp_path / "seg_000001")
+
+    report = proxy_duv.audit_root(tmp_path, frames=FRAMES)
+
+    assert report["resolutions"] == ["336x192", f"{NATIVE_W}x{NATIVE_H}"]
+    assert any("disagree about the DUV grid" in warning for warning in report["warnings"])
+
+
 # ----------------------------------------------------- the silent failure mode
 
 

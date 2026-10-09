@@ -132,6 +132,33 @@ class TestFrameIO:
         contract.write_frame(tmp_path, 0, _depth_field(rng), _labels(rng))
         assert not list(tmp_path.glob("*.tmp"))
 
+    def test_a_native_write_keeps_its_grid_and_reads_back_exactly(self, tmp_path, rng):
+        depth = rng.uniform(0.5, 80.0, size=(72, 128)).astype(np.float32)
+        labels = rng.integers(0, contract.NUM_SEMANTIC_CLASSES, size=(72, 128)).astype(np.uint8)
+
+        contract.write_frame(tmp_path, 0, depth, labels, native=True)
+
+        got_depth, got_labels = contract.read_frame(tmp_path, 0)
+        assert np.array_equal(got_depth, depth)
+        assert np.array_equal(got_labels, labels)
+        assert contract.frame_paths(tmp_path, 0)[0].stat().st_size == contract.depth_bytes(72, 128)
+
+    def test_a_native_write_refuses_depth_and_labels_on_different_grids(self, tmp_path):
+        with pytest.raises(ValueError, match="same 2-D grid"):
+            contract.write_frame(
+                tmp_path, 0, np.ones((72, 128), np.float32), np.zeros((64, 128), np.uint8), native=True
+            )
+
+    def test_a_depth_rewrite_follows_the_pairs_own_grid(self, tmp_path):
+        contract.write_frame(
+            tmp_path, 0, np.ones((72, 128), np.float32), np.zeros((72, 128), np.uint8), native=True
+        )
+        contract.rewrite_depth_frame(tmp_path, 0, np.full((72, 128), 3.0, np.float32))
+        with pytest.raises(ValueError, match="expected"):
+            contract.rewrite_depth_frame(
+                tmp_path, 0, np.ones((contract.CONDITION_HEIGHT, contract.CONDITION_WIDTH), np.float32)
+            )
+
 
 class TestValidation:
     def _write_run(self, root, rng, frames):
@@ -160,6 +187,25 @@ class TestValidation:
         self._write_run(tmp_path, rng, 3)
         with pytest.raises(contract.ContractError, match="expected 124"):
             contract.validate_condition_root(tmp_path, expected_frames=124)
+
+    def test_code_world_models_grid_is_still_the_default_requirement(self, tmp_path):
+        for ordinal in range(2):
+            contract.write_frame(
+                tmp_path, ordinal, np.ones((72, 128), np.float32), np.zeros((72, 128), np.uint8),
+                native=True,
+            )
+        with pytest.raises(contract.ContractError, match="expected 336x192"):
+            contract.validate_condition_root(tmp_path)
+        summary = contract.validate_condition_root(tmp_path, shape=None)
+        assert summary["size"] == [128, 72]
+
+    def test_a_root_mixing_grids_is_caught_even_without_a_required_shape(self, tmp_path, rng):
+        contract.write_frame(
+            tmp_path, 0, np.ones((72, 128), np.float32), np.zeros((72, 128), np.uint8), native=True
+        )
+        contract.write_frame(tmp_path, 1, _depth_field(rng), _labels(rng))
+        with pytest.raises(contract.ContractError, match="ordinal 1"):
+            contract.validate_condition_root(tmp_path, shape=None)
 
     def test_validation_can_observe_each_already_validated_frame(self, tmp_path, rng):
         self._write_run(tmp_path, rng, 3)

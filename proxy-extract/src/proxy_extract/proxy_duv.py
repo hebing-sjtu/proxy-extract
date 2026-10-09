@@ -117,20 +117,23 @@ def duv_dir_for(seg_dir: Path) -> Path:
     return Path(seg_dir) / DUV_DIRNAME
 
 
-def semantic_uv_metadata() -> dict:
+def semantic_uv_metadata(size: tuple[int, int] | None = None) -> dict:
     """The CWM class-id to packed-DUV `(U, V)` mapping.
 
     Byte values are what an RGB DUV frame carries in G and B. FastVideo divides
     them by 255 before feeding the VAE; recording bytes rather than rounded
     floats keeps the mapping bit-exact and lets any consumer choose its own
     numeric representation.
+
+    `size` is the corpus's `(width, height)`; the condition grid by default.
     """
     width = len(SEMANTIC_U)
+    grid_width, grid_height = size or (contract.CONDITION_WIDTH, contract.CONDITION_HEIGHT)
     return {
         "semantic": "clip_*/duv/%06d.semantic_id.png",
         "resolution": {
-            "width": contract.CONDITION_WIDTH,
-            "height": contract.CONDITION_HEIGHT,
+            "width": int(grid_width),
+            "height": int(grid_height),
         },
         "encoding": {
             "semantic_pixel": "class_id",
@@ -164,12 +167,12 @@ def semantic_uv_metadata() -> dict:
     }
 
 
-def write_semantic_json(root: Path) -> Path:
+def write_semantic_json(root: Path, size: tuple[int, int] | None = None) -> Path:
     """Atomically write the corpus-wide semantic/UV contract once."""
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     path = root / SEMANTIC_NAME
-    payload = json.dumps(semantic_uv_metadata(), indent=2, ensure_ascii=False) + "\n"
+    payload = json.dumps(semantic_uv_metadata(size), indent=2, ensure_ascii=False) + "\n"
     handle, scratch = tempfile.mkstemp(dir=root, prefix=f"{SEMANTIC_NAME}.", suffix=".tmp")
     tmp = Path(scratch)
     try:
@@ -188,6 +191,7 @@ def write_frame(
     labels: np.ndarray,
     *,
     taxonomy: str = "cwm12",
+    native: bool = False,
 ) -> None:
     """Write one ordinal's pair into a segment's `duv/`.
 
@@ -197,23 +201,47 @@ def write_frame(
     different classes, which is precisely the failure the spec opens by warning
     about. There is no value of the data that distinguishes them, so the
     caller has to.
+
+    `native` keeps the arrays at the grid they arrive on - the clip's own
+    resolution - instead of reducing them onto the 192x336 condition grid.
     """
     seg_dir = Path(seg_dir)
     duv = duv_dir_for(seg_dir)
+    ids = project_labels(labels, taxonomy)
+    depth = np.asarray(depth_metres, dtype=np.float32)
+    if not native:
+        ids = contract.downsample_semantic(ids)
+        depth = contract.downsample_depth(depth)
+    size = (int(ids.shape[1]), int(ids.shape[0]))
     # The class table is corpus-wide: every clip uses the same ids and UV
     # bytes. Keep one copy at the root rather than ten thousand copies beside
     # identical frames. Concurrent shards may both observe it missing, but the
     # atomic writer is safe and their payloads are byte-identical.
-    semantic = seg_dir.parent / SEMANTIC_NAME
-    if ordinal == 0 and not semantic.is_file():
-        write_semantic_json(seg_dir.parent)
-    ids = contract.downsample_semantic(project_labels(labels, taxonomy))
-    depth = contract.downsample_depth(np.asarray(depth_metres, dtype=np.float32))
+    if ordinal == 0:
+        _ensure_semantic_json(seg_dir.parent, size)
     sky = ids == SKY
     if bool(np.any(sky)):
         depth = depth.copy()
         depth[sky] = 0.0
-    contract.write_frame(duv, ordinal, depth, ids)
+    contract.write_frame(duv, ordinal, depth, ids, native=native)
+
+
+def _ensure_semantic_json(root: Path, size: tuple[int, int]) -> None:
+    """Write the root's class table once, and refuse a second grid in one root."""
+    path = Path(root) / SEMANTIC_NAME
+    if not path.is_file():
+        write_semantic_json(root, size)
+        return
+    try:
+        recorded = json.loads(path.read_text(encoding="utf-8")).get("resolution") or {}
+    except (OSError, ValueError):
+        return
+    if (recorded.get("width"), recorded.get("height")) != size:
+        raise ProxyDuvError(
+            f"{root} already holds {recorded.get('width')}x{recorded.get('height')} DUV frames "
+            f"(see {SEMANTIC_NAME}); writing {size[0]}x{size[1]} into the same root would mix "
+            "grids that no consumer can read together. Use a separate clips root."
+        )
 
 
 def project_labels(labels: np.ndarray, taxonomy: str) -> np.ndarray:
@@ -251,11 +279,13 @@ class SegStats:
     sky_fraction: float
     sky_depth_valid_fraction: float
     classes_present: list[int]
+    size: tuple[int, int] = (contract.CONDITION_WIDTH, contract.CONDITION_HEIGHT)
 
     def as_dict(self) -> dict:
         return {
             "seg": self.seg,
             "frames": self.frames,
+            "size": list(self.size),
             "valid_fraction": self.valid_fraction,
             "metres_p1": self.percentiles["p1"],
             "metres_p50": self.percentiles["p50"],
@@ -312,7 +342,7 @@ def repair_sky_seg(seg_dir: Path, *, apply: bool = False) -> SkyRepairStats:
             repaired[sky] = 0.0
             contract.rewrite_depth_frame(duv, ordinal, repaired)
 
-    structural = contract.validate_condition_root(duv, frame_observer=inspect_frame)
+    structural = contract.validate_condition_root(duv, frame_observer=inspect_frame, shape=None)
     return SkyRepairStats(
         seg=seg_dir.name,
         frames=int(structural["frames"]),
@@ -435,7 +465,10 @@ def audit_seg(seg_dir: Path, *, frames: int = SPEC_FRAMES) -> SegStats:
         metres = flat[valid]
         below += int((metres < contract.DEPTH_NEAR_METRES).sum())
         above += int((metres > contract.DEPTH_FAR_METRES).sum())
-        sampled.append(metres[::_PERCENTILE_STRIDE])
+        # The same sample count per frame at any grid, so a native-resolution
+        # corpus costs no more memory to audit than a condition-grid one.
+        stride = max(_PERCENTILE_STRIDE, _PERCENTILE_STRIDE * flat.size // contract.CONDITION_PIXELS)
+        sampled.append(metres[::stride])
         sky = semantic == SKY
         sky_total += int(sky.sum())
         sky_depth_valid += int((sky & (depth > contract.DEPTH_VALID_EPSILON_METRES)).sum())
@@ -444,7 +477,9 @@ def audit_seg(seg_dir: Path, *, frames: int = SPEC_FRAMES) -> SegStats:
     # longer segment is fine as long as the ordinals are contiguous from zero.
     # The observer gathers acceptance statistics during the contract's
     # authoritative validation pass, avoiding a second read of every frame.
-    structural = contract.validate_condition_root(duv, frame_observer=collect_statistics)
+    structural = contract.validate_condition_root(
+        duv, frame_observer=collect_statistics, shape=None
+    )
     if structural["frames"] < frames:
         raise ProxyDuvError(
             f"{seg_dir.name} is short of the window: {structural['frames']} frames "
@@ -474,6 +509,7 @@ def audit_seg(seg_dir: Path, *, frames: int = SPEC_FRAMES) -> SegStats:
         sky_fraction=round(sky_total / max(pixels, 1), 6),
         sky_depth_valid_fraction=round(sky_depth_valid / max(sky_total, 1), 6),
         classes_present=structural["semantic_classes_present"],
+        size=tuple(structural["size"]),
     )
 
 
@@ -559,6 +595,15 @@ def audit_root(
 
     warnings: list[str] = []
     notices: list[str] = []
+    sizes: dict[tuple[int, int], int] = {}
+    for item in stats:
+        sizes[item.size] = sizes.get(item.size, 0) + 1
+    if len(sizes) > 1:
+        breakdown = ", ".join(f"{w}x{h}: {n}" for (w, h), n in sorted(sizes.items()))
+        warnings.append(
+            f"segments disagree about the DUV grid ({breakdown}). One encode reads one "
+            "grid, so the minority segments fail partway through building the cache."
+        )
     medians = sorted(item.percentiles["p50"] for item in stats if item.percentiles["p50"] > 0)
     spread = None
     if len(medians) >= 2:
@@ -604,6 +649,7 @@ def audit_root(
         "failed": len(failures),
         "failures": failures[:20],
         "frames_each_at_least": frames,
+        "resolutions": [f"{w}x{h}" for w, h in sorted(sizes)],
         "median_spread": spread,
         "median_metres_p10_p90": (
             [round(float(v), 4) for v in np.percentile(medians, [10.0, 90.0])]

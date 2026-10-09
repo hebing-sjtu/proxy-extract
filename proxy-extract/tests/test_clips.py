@@ -503,6 +503,29 @@ def test_the_source_route_writes_the_same_shape_as_the_delivered_one(delivered, 
         assert (clip / clips.TARGET_DIRNAME / clips.ANCHOR_NAME).is_file()
 
 
+def test_the_native_route_keeps_depth_and_semantics_on_the_targets_grid(delivered, tmp_path):
+    """`duv_native` is what a cropping consumer needs: one DUV pixel per target pixel."""
+    from proxy_extract import contract, proxy_duv
+    from proxy_extract.video import probe
+
+    source = delivered.parent / "video.mp4"
+    out = tmp_path / "native"
+    reports = _direct(source, out, proxy_duv_frames=True, duv_native=True)
+    clip = out / reports[0]["clip"]
+    size = (clips.TARGET_WIDTH, clips.TARGET_HEIGHT)
+
+    duv_video = probe(clip / clips.PROXY_DIRNAME / clips.DUV_NAME)
+    assert (duv_video.width, duv_video.height) == size
+    metres, ids = contract.read_frame(proxy_duv.duv_dir_for(clip), 0)
+    assert metres.shape == ids.shape == (size[1], size[0])
+    assert reports[0]["duv_size"] == list(size)
+
+    assert clips.already_cut(clip, 8, proxy_duv_frames=True, duv_size=size)
+    assert not clips.already_cut(clip, 8, proxy_duv_frames=True), (
+        "a condition-grid run must not take a native clip as its own"
+    )
+
+
 def test_a_clip_made_by_other_models_does_not_count_as_already_cut(delivered, tmp_path):
     """Otherwise a rerun with better models silently keeps the old corpus.
 
@@ -520,11 +543,18 @@ def test_a_clip_made_by_other_models_does_not_count_as_already_cut(delivered, tm
     assert clips.already_cut(clip_dir, 8), "the clip it just made is not complete"
 
     made_with = clips.clip_provenance(clip_dir)
-    assert made_with == {"depth": "synthetic", "refiner": None, "proxy_duv": False}
+    assert made_with == {
+        "depth": "synthetic",
+        "refiner": None,
+        "proxy_duv": False,
+        "duv_size": [clips.DUV_WIDTH, clips.DUV_HEIGHT],
+    }
 
     # Same clip, same frames, asked for by a run configured differently.
     assert not clips.already_cut(clip_dir, 8, expect={**made_with, "depth": "moge3"})
     assert not clips.already_cut(clip_dir, 8, expect={**made_with, "refiner": "sam2"})
+    native = [clips.TARGET_WIDTH, clips.TARGET_HEIGHT]
+    assert not clips.already_cut(clip_dir, 8, expect={**made_with, "duv_size": native})
     # And unchanged configuration still resumes, or no restart would ever skip.
     assert clips.already_cut(clip_dir, 8, expect=made_with)
 
@@ -600,7 +630,12 @@ def test_a_rerun_with_a_different_backend_actually_redoes_the_clips(
 
     assert rerun("none") == 0, "an unchanged rerun re-did work it had already done"
     assert asked == [
-        {"depth": "synthetic", "refiner": None, "proxy_duv": False}
+        {
+            "depth": "synthetic",
+            "refiner": None,
+            "proxy_duv": False,
+            "duv_size": [clips.DUV_WIDTH, clips.DUV_HEIGHT],
+        }
     ] * 2, "the configuration was not passed to the resume check"
 
     # Nothing on disk changed, but these clips were not made with a refiner, so

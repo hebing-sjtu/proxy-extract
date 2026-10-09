@@ -282,7 +282,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--work-size", default=f"{clip_defaults.TARGET_WIDTH}x{clip_defaults.TARGET_HEIGHT}",
         metavar="WxH",
         help="what the models see and the target is written at; must be 4x the DUV "
-        "(default: %(default)s)",
+        "unless --duv-size native (default: %(default)s)",
+    )
+    episodes.add_argument(
+        "--duv-size", choices=("condition", "native"), default="condition",
+        help="'condition' reduces depth and semantics onto the 336x192 DUV grid; "
+        "'native' writes duv/ and proxy/duv.mp4 at --work-size, pixel-aligned with "
+        "the target (default: %(default)s)",
     )
     episodes.add_argument(
         "--halo", type=int, default=None, metavar="N",
@@ -807,7 +813,18 @@ def _run_clip_episodes(args: argparse.Namespace) -> int:
 
     width, _, height = args.work_size.partition("x")
     size = (int(width), int(height))
-    if size[0] % clip_defaults.DUV_WIDTH or size[1] % clip_defaults.DUV_HEIGHT:
+    native = args.duv_size == "native"
+    if native and (size[0] % 16 or size[1] % 16):
+        # Every consumer's VAE compresses space by 8 or 16, and a native DUV is
+        # cropped rather than resampled, so a grid off that lattice cannot be
+        # brought onto it without inventing depth or class values.
+        print(
+            f"error: --work-size {args.work_size} must be a multiple of 16 in both "
+            "dimensions for --duv-size native",
+            file=sys.stderr,
+        )
+        return 2
+    if not native and (size[0] % clip_defaults.DUV_WIDTH or size[1] % clip_defaults.DUV_HEIGHT):
         # Not a preference. The DUV is a block reduction of this grid, and a
         # non-integer factor sends it down the nearest-neighbour path, which
         # samples one pixel per block and calls it a median.
@@ -853,9 +870,12 @@ def _run_clip_episodes(args: argparse.Namespace) -> int:
         **({"color_crf": args.color_crf} if args.color_crf is not None else {}),
     )
 
+    duv_label = f"{size[0]}x{size[1]}" if native else (
+        f"{clip_defaults.DUV_WIDTH}x{clip_defaults.DUV_HEIGHT}"
+    )
     say(
         f"{len(assignments)} episodes -> {args.per_scene} x {args.frames} frames at "
-        f"{args.fps:g} fps, models at {size[0]}x{size[1]} [{label}]"
+        f"{args.fps:g} fps, models at {size[0]}x{size[1]}, DUV at {duv_label} [{label}]"
     )
 
     # Loaded once for the whole shard rather than once per episode: at five
@@ -886,6 +906,7 @@ def _run_clip_episodes(args: argparse.Namespace) -> int:
                     semantic_backend=semantic,
                     refiner=refiner,
                     proxy_duv_frames=args.proxy_duv,
+                    duv_native=native,
                     resume=args.resume,
                     keep_work=args.keep_work,
                     progress=say,
