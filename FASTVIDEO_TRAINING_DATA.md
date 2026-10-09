@@ -918,7 +918,9 @@ scripts/h3_proxy/prepare_data/encode_proxy_shards.sh \
   阈值写进每片的 `quality.json`（`--min-score`、`--allow-major`、`--ignore-verdict` 可调）。
 - 本地另算两项不经 VLM 的时序指标，用于排序和交叉核对：`depth_jitter`（log-depth 码的
   三帧二阶差分中位数，1 码≈4.4% 距离；匀速运动相消，只剩抖动）和 `semantic_flicker`
-  （t 帧标签与 t±1 不同、而 t±1 彼此相同的像素比例，即单帧闪烁）。
+  （t 帧标签与 t±3 不同、而 t±3 彼此相同的像素比例，即持续 ≤5 帧的闪烁；单调运动的边缘
+  不计入）。窗口取 ±3 而不是 ±1：SAM 2 传播已经消掉单帧闪烁，±1 在实测 292 片上几乎全为 0，
+  VLM 报的闪烁都持续数帧。指标改版只重算指标（`remeasured`），不重新调用 VLM。
 - 只评审已有 `clip_report.json` 的完整 clip；同一 prompt 版本评过的会复用，所以可以边切边评、
   反复重跑。每片约 18 s，24 并发约 45 片/分钟，只用 CPU 和网络。
 

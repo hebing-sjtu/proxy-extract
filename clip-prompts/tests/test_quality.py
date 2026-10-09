@@ -125,23 +125,29 @@ def _measure(codes, ids):
 
 
 def test_steady_motion_is_not_flicker():
-    codes = [np.full((8, 8), 50 + 3 * t, np.uint8) for t in range(6)]
-    ids = [np.full((8, 8), 4, np.uint8)] * 6
-    result = _measure(codes, ids)
+    codes = [np.full((8, 8), 50 + 3 * t, np.uint8) for t in range(10)]
+    ids = []
+    for t in range(10):
+        frame = np.full((8, 16), 4, np.uint8)
+        frame[:, : t + 2] = 10
+        ids.append(frame)
+    result = _measure(codes, [i[:, :8] for i in ids])
     assert result["depth_jitter"] == 0
-    assert result["semantic_flicker"] == 0
     assert result["depth_median_step_max"] == 3
+    assert _measure(codes, ids)["semantic_flicker_max"] == 0
 
 
-def test_a_one_frame_flash_is_measured_in_both_tracks():
-    codes = [np.full((8, 8), 50, np.uint8) for _ in range(5)]
-    codes[2] = np.full((8, 8), 70, np.uint8)
-    ids = [np.full((8, 8), 4, np.uint8) for _ in range(5)]
-    ids[2] = ids[2].copy()
-    ids[2][:4] = 5
+def test_a_flash_of_a_few_frames_is_measured_in_both_tracks():
+    codes = [np.full((8, 8), 50, np.uint8) for _ in range(10)]
+    codes[4] = np.full((8, 8), 70, np.uint8)
+    ids = [np.full((8, 8), 4, np.uint8) for _ in range(10)]
+    for t in (3, 4, 5):
+        ids[t] = ids[t].copy()
+        ids[t][:4] = 5
     result = _measure(codes, ids)
     assert result["depth_jitter_max"] == 40
     assert result["semantic_flicker_max"] == pytest.approx(0.5)
+    assert result["semantic_flicker"] > 0
 
 
 def test_sky_is_left_out_of_depth_jitter():
@@ -183,6 +189,20 @@ def test_judging_a_clip_writes_panel_and_verdict_and_then_reuses_it(tmp_path):
 
     again = quality.judge_clip(clip, FakeClient(), model="m", backend="fake")
     assert again["status"] == "reused"
+
+
+def test_stale_measures_are_redone_without_asking_the_vlm_again(tmp_path):
+    clip = make_clip(tmp_path)
+    quality.judge_clip(clip, FakeClient(json.dumps(GOOD)), model="m", backend="fake")
+    saved = json.loads(quality.quality_path(clip).read_text())
+    saved["metrics"] = {"frames": 12}
+    quality.quality_path(clip).write_text(json.dumps(saved))
+
+    row = quality.judge_clip(clip, FakeClient(), model="m", backend="fake")
+    assert row["status"] == "remeasured"
+    redone = json.loads(quality.quality_path(clip).read_text())
+    assert redone["metrics"]["version"] == quality.METRICS_VERSION
+    assert redone["vlm"] == saved["vlm"]
 
 
 def test_a_clip_without_semantic_ids_fails_loudly_and_leaves_nothing(tmp_path):

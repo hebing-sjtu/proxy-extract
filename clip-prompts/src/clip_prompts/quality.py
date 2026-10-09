@@ -8,13 +8,16 @@ RGB, depth, semantics and the semantics over the RGB, side by side - and a VLM
 watches it and scores the two tracks for stability and for correctness.
 
 Two numbers per clip are also measured here, for sorting and for checking the
-VLM against something it cannot talk its way around. Both use three-frame
-windows so that smooth camera motion cancels and only flicker remains:
+VLM against something it cannot talk its way around. Both are built so that
+smooth motion cancels and only flicker remains:
 
 - `depth_jitter`: the median over pixels of |c[t+1] - 2 c[t] + c[t-1]| in log-depth
   codes (one code is 4.4% of a distance), averaged over frames.
 - `semantic_flicker`: the share of pixels whose label at t differs from the label
-  at t-1 and t+1 while those two agree - a one-frame flash.
+  at t-3 and t+3 while those two agree - a flash of up to five frames. Under
+  monotonic motion a pixel an object covers at t-3 and t+3 it also covers at t,
+  so moving edges do not count. One-frame windows are not enough: SAM 2
+  propagation removes one-frame flashes, and what is left lasts several frames.
 
 What is written, per clip:
 
@@ -25,6 +28,7 @@ What is written, per clip:
 
 from __future__ import annotations
 
+import itertools
 import json
 import re
 import shutil
@@ -52,6 +56,8 @@ PANEL_FPS = 24.0
 # defect lasting a few frames almost always.
 DEFAULT_SAMPLE_FPS = 8.0
 DEFAULT_MAX_FRAMES = 48
+FLASH_SPAN = 3
+METRICS_VERSION = 2
 
 SKY_CODE = 255
 SCORE_KEYS = ("depth_temporal", "depth_accuracy", "semantic_temporal", "semantic_accuracy")
@@ -176,8 +182,9 @@ def _fit(array: np.ndarray, *, nearest: bool) -> np.ndarray:
 
 @dataclass
 class _Temporal:
-    """Three-frame flicker measures, streamed so a clip costs three frames of memory."""
+    """Flicker measures, streamed so a clip costs a few frames of memory."""
 
+    span: int = FLASH_SPAN
     codes: list = field(default_factory=list)
     ids: list = field(default_factory=list)
     jitter: list = field(default_factory=list)
@@ -188,20 +195,22 @@ class _Temporal:
         valid = codes < SKY_CODE
         self.medians.append(float(np.median(codes[valid])) if valid.any() else float("nan"))
         self.codes = [*self.codes[-2:], codes.astype(np.int16)]
-        self.ids = [*self.ids[-2:], ids]
-        if len(self.codes) < 3:
-            return
-        before, now, after = self.codes
-        both = (before < SKY_CODE) & (now < SKY_CODE) & (after < SKY_CODE)
-        if both.any():
-            self.jitter.append(float(np.median(np.abs(after - 2 * now + before)[both])))
-        a, b, c = self.ids
-        self.flashes.append(float(((a == c) & (b != a)).mean()))
+        self.ids = [*self.ids[-2 * self.span :], ids]
+        if len(self.codes) == 3:
+            before, now, after = self.codes
+            both = (before < SKY_CODE) & (now < SKY_CODE) & (after < SKY_CODE)
+            if both.any():
+                self.jitter.append(float(np.median(np.abs(after - 2 * now + before)[both])))
+        if len(self.ids) == 2 * self.span + 1:
+            first, middle, last = self.ids[0], self.ids[self.span], self.ids[-1]
+            self.flashes.append(float(((first == last) & (middle != first)).mean()))
 
     def result(self) -> dict:
         medians = np.asarray(self.medians, dtype=np.float64)
         steps = np.abs(np.diff(medians[~np.isnan(medians)]))
         return {
+            "version": METRICS_VERSION,
+            "flash_span": self.span,
             "frames": len(self.medians),
             "depth_jitter": round(float(np.mean(self.jitter)), 4) if self.jitter else None,
             "depth_jitter_max": round(float(np.max(self.jitter)), 4) if self.jitter else None,
@@ -223,6 +232,25 @@ def ffmpeg_binary() -> str:
         return found
 
 
+def _tiles(clip: Clip, *, with_rgb: bool = True):
+    """(rgb, depth codes, class ids) per frame at tile size; rgb is None without with_rgb."""
+    duv = _semantic_frames(clip, _video_frames(clip.duv))
+    rgb = _video_frames(clip.rgb) if with_rgb else itertools.repeat(None)
+    for picture, (frame, ids) in zip(rgb, duv):
+        codes = _fit(np.ascontiguousarray(frame[:, :, 0]), nearest=True)
+        if picture is not None:
+            picture = _fit(np.ascontiguousarray(picture), nearest=False)
+        yield picture, codes, _fit(ids, nearest=True)
+
+
+def measure(clip: Clip) -> dict:
+    """The flicker measures alone: no panel, no model call."""
+    temporal = _Temporal()
+    for _, codes, ids in _tiles(clip, with_rgb=False):
+        temporal.add(codes, ids)
+    return temporal.result()
+
+
 def render_panel(clip: Clip, out: Path | None = None) -> tuple[Path, dict]:
     """Write the review panel and return it with the clip's flicker measures."""
     out = Path(out) if out else panel_path(clip)
@@ -238,13 +266,9 @@ def render_panel(clip: Clip, out: Path | None = None) -> tuple[Path, dict]:
     temporal = _Temporal()
     encoder = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
-        pairs = zip(_video_frames(clip.rgb), _semantic_frames(clip, _video_frames(clip.duv)))
-        for rgb, (duv, ids) in pairs:
-            rgb_t = _fit(np.ascontiguousarray(rgb), nearest=False)
-            codes_t = _fit(np.ascontiguousarray(duv[:, :, 0]), nearest=True)
-            ids_t = _fit(ids, nearest=True)
-            temporal.add(codes_t, ids_t)
-            encoder.stdin.write(compose(rgb_t, codes_t, ids_t).tobytes())
+        for rgb, codes, ids in _tiles(clip):
+            temporal.add(codes, ids)
+            encoder.stdin.write(compose(rgb, codes, ids).tobytes())
         encoder.stdin.close()
         if encoder.wait() != 0:
             raise RuntimeError(f"ffmpeg failed: {encoder.stderr.read().decode(errors='replace')[-400:]}")
@@ -450,7 +474,12 @@ def judge_clip(
     """Panel, measures, VLM, decision; written to annotations/quality.json."""
     existing = read_json(quality_path(clip))
     if existing and existing.get("prompt") == PROMPT_VERSION and not redo:
-        return {"clip": clip.name, "status": "reused", "verdict": existing["decision"]["verdict"]}
+        verdict = existing["decision"]["verdict"]
+        if (existing.get("metrics") or {}).get("version") == METRICS_VERSION:
+            return {"clip": clip.name, "status": "reused", "verdict": verdict}
+        existing["metrics"] = measure(clip)
+        write_json(quality_path(clip), existing)
+        return {"clip": clip.name, "status": "remeasured", "verdict": verdict}
     clip.check()
     report = clip.report()
     duration = float(report.get("frames", 0)) / float(report.get("fps") or PANEL_FPS)

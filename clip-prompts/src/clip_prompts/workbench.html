@@ -89,7 +89,7 @@
           <th data-k="semantic_accuracy" class="num" title="semantic 正确性">S-正确</th>
           <th data-k="major" class="num">major</th>
           <th data-k="depth_jitter" class="num" title="depth 二阶差分中位数（log 码）">jitter</th>
-          <th data-k="semantic_flicker" class="num" title="单帧闪烁像素比例">flicker</th>
+          <th data-k="semantic_flicker" class="num" title="持续 ≤5 帧的标签闪烁像素比例">flicker</th>
         </tr></thead>
         <tbody id="rows"></tbody>
       </table>
@@ -112,6 +112,7 @@ const CLASSES = [["void_unknown","#000000"],["sky","#6eb4f0"],["water","#1e5ac8"
 const state = { data:null, rows:[], filter:"all", sort:"score", dir:1, page:0, sel:null, range:null };
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const pct = (v) => (typeof v === "number") ? (100 * v).toFixed(3) + "%" : "–";
 const fmt = (v, d=3) => (v === null || v === undefined) ? "–" : (typeof v === "number" ? v.toFixed(d) : v);
 
 function value(row, k) {
@@ -186,7 +187,7 @@ function renderTable() {
       <td>${esc(r.clip)}</td><td>${verdictCell(r)}</td><td class="num">${fmt(r.score, 2)}</td>
       ${SCORE_KEYS.map((k) => `<td class="num">${s[k] ?? "–"}</td>`).join("")}
       <td class="num">${r.major ?? "–"}</td><td class="num">${fmt(m.depth_jitter, 2)}</td>
-      <td class="num">${fmt(m.semantic_flicker, 4)}</td></tr>`;
+      <td class="num">${pct(m.semantic_flicker)}</td></tr>`;
   }).join("");
   const pages = Math.max(1, Math.ceil(state.rows.length / PAGE));
   $("page").textContent = `${state.page + 1} / ${pages}`;
@@ -245,7 +246,7 @@ async function select(name) {
     <div class="grid2">
       <span>depth_jitter</span><span>${fmt(m.depth_jitter, 3)} <span class="dim">（max ${fmt(m.depth_jitter_max, 2)}，log 码；1 码≈4.4% 距离）</span></span>
       <span>depth 中位数最大跳变</span><span>${fmt(m.depth_median_step_max, 2)} 码</span>
-      <span>semantic_flicker</span><span>${fmt(m.semantic_flicker, 5)} <span class="dim">（max ${fmt(m.semantic_flicker_max, 4)}，单帧闪烁像素比例）</span></span>
+      <span>semantic_flicker</span><span>${pct(m.semantic_flicker)} <span class="dim">（max ${pct(m.semantic_flicker_max)}；t 帧标签与 t±${m.flash_span ?? 1} 不同、而 t±${m.flash_span ?? 1} 彼此一致的像素比例，即持续 ≤${2 * (m.flash_span ?? 1) - 1} 帧的闪烁）</span></span>
       <span>帧数</span><span>${m.frames ?? "–"}</span>
     </div>
     <h3>来源</h3>
