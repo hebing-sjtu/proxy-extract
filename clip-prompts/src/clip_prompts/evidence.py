@@ -65,8 +65,14 @@ GROUP_NAMES = {
 }
 
 # A 336x192 frame is 64,512 pixels. Eight is about a person at 60 m; below it
-# the blob is as likely to be a mislabelled railing as a bystander.
+# the blob is as likely to be a mislabelled railing as a bystander. The floor is
+# a share of the frame, so a native 1280x720 DUV counts the same people.
 PED_MIN_PIXELS = 8
+PED_MIN_AREA = PED_MIN_PIXELS / (336 * 192)
+
+
+def ped_min_pixels(frame_pixels: int) -> int:
+    return max(1, round(PED_MIN_AREA * frame_pixels))
 
 # Mean absolute change in the log-depth code between neighbouring frames, over
 # pixels with valid depth. One code is 4.4% of a distance, so this is "the
@@ -210,6 +216,7 @@ def measure_frames(frames, grid: Grid, *, hero_resolved: bool = True, source: st
     accumulators = [_Accumulator() for _ in grid.bins]
     previous: np.ndarray | None = None
     seen = 0
+    min_pixels = PED_MIN_PIXELS
 
     for index, frame in enumerate(frames):
         if index >= grid.frames:
@@ -224,7 +231,8 @@ def measure_frames(frames, grid: Grid, *, hero_resolved: bool = True, source: st
         acc.fractions += counts[: len(GROUP_NAMES)] / group.size
         acc.histogram += np.bincount(red.ravel(), minlength=256)
 
-        acc.ped_counts.append(_blobs(group == GROUP_PED, min_pixels=PED_MIN_PIXELS))
+        min_pixels = ped_min_pixels(group.size)
+        acc.ped_counts.append(_blobs(group == GROUP_PED, min_pixels=min_pixels))
         box = _bbox(group == GROUP_PLAYER)
         if box is not None:
             acc.player_boxes.append(box)
@@ -273,7 +281,7 @@ def measure_frames(frames, grid: Grid, *, hero_resolved: bool = True, source: st
         "source": "duv",
         "from": source,
         "hero_resolved": bool(hero_resolved),
-        "ped_min_pixels": PED_MIN_PIXELS,
+        "ped_min_pixels": min_pixels,
         "static_code_delta": STATIC_CODE_DELTA,
         "per_bin": rows,
     }

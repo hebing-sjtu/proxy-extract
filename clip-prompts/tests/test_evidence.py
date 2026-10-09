@@ -66,6 +66,25 @@ def test_measure_reports_one_row_per_bin():
     assert all(not row["vehicle"] for row in facts["per_bin"])
 
 
+def test_the_bystander_floor_is_a_share_of_the_frame():
+    """A native 1280x720 DUV must count the bystanders a 336x192 one does."""
+    assert evidence.ped_min_pixels(336 * 192) == evidence.PED_MIN_PIXELS
+    assert evidence.ped_min_pixels(1280 * 720) == 114
+
+    small = _duv_frame(peds=2)
+    small[60:62, 300:303, 1] = 0
+    small[60:62, 300:303, 2] = 128  # a 2x3 speck, below the floor
+    rows = (np.arange(720) * 192) // 720
+    cols = (np.arange(1280) * 336) // 1280
+    large = small[rows][:, cols]
+
+    grid = timeline.plan(24, 24.0)
+    for frame, floor in ((small, 8), (large, 114)):
+        facts = evidence.measure_frames((frame for _ in range(24)), grid)
+        assert facts["ped_min_pixels"] == floor
+        assert facts["per_bin"][0]["peds"] == 2
+
+
 def test_measure_sees_a_vehicle_in_the_second_it_appears():
     grid = timeline.plan(48, 24.0)
     frames = (_duv_frame(vehicle=index >= 24) for index in range(48))

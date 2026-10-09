@@ -783,8 +783,8 @@ export HF_HOME=/data/binghe/cache/huggingface HF_HUB_OFFLINE=1   # 权重在这�
 
 make clip-episodes LIMIT=8 WORKERS_PER_GPU=2 DEPTH=moge3 REFINER=sam2 PROXY_DUV=1 \
   WORK_SIZE=1280x720 DUV_SIZE=native CLIPS_DIR="$CLIPS_DIR"                 # 先试
-NODE_COUNT=2 NODE_RANK=$R make clip-episodes DEPTH=moge3 REFINER=sam2 PROXY_DUV=1 \
-  WORK_SIZE=1280x720 DUV_SIZE=native CLIPS_DIR="$CLIPS_DIR"                 # 全量
+NODE_COUNT=4 NODE_RANK=$R make clip-episodes DEPTH=moge3 REFINER=sam2 PROXY_DUV=1 \
+  WORK_SIZE=1280x720 DUV_SIZE=native CLIPS_DIR="$CLIPS_DIR"                 # 全量，R=0..3
 ```
 
 - `CLIPS_DIR` 必须是新目录：一个根目录只能有一种 DUV 网格，`semantic.json` 会记录
@@ -793,16 +793,59 @@ NODE_COUNT=2 NODE_RANK=$R make clip-episodes DEPTH=moge3 REFINER=sam2 PROXY_DUV=
 - 体积：每帧 depth 3.69 MB，每片约 457 MB，一万片约 4.6 TB，必须放 `/data`。
 - 收货与第 3–6 节完全相同（`clips-audit`、`proxy-duv-manifest`、`proxy-duv-audit`、captions、
   按 episode 切分），只是 `CLIPS_DIR` 换成新根目录。
-- 文本不必重跑 VLM：同名 clip 的 `clip_report.json` 里 `source_ordinals` 与 768p 版本一致时，
-  把旧根目录的 `annotations/prompt.json`、`prompt.txt` 复制过来即可；不一致的 clip 必须重新生成。
+- 文本不必重跑 VLM：窗口只取决于 episode 和 `--per-scene/--frames/--fps`，与分辨率无关
+  （smoke 实测 `source_ordinals` 与 768p 版逐片相同）。`reuse_prompts.py` 只在两边
+  `source_ordinals` 相同时复制 `annotations/prompt.json`，再用新 DUV 本地复核（不调 VLM）后导出：
+
+  ```bash
+  python scripts/reuse_prompts.py /data/binghe/datasets/ABot-sub-2000-clips-moge3 "$CLIPS_DIR"
+  python -m clip_prompts captions-recompile --clips "$CLIPS_DIR" --reverify
+  python -m clip_prompts captions-export --clips "$CLIPS_DIR" --write-txt
+  python -m clip_prompts captions-audit --clips "$CLIPS_DIR" --report "$CLIPS_DIR/captions_audit.json"
+  ```
+
+  复核里行人的最小连通块按画面面积缩放（336×192 时 8 像素，1280×720 时 114 像素），
+  所以原分辨率 DUV 和旧网格数出的人数一致。
+
+### 11.1.1 SolarWM 镜像（torch 2.6）上的环境
+
+SolarWM 训练镜像是 Python 3.10 + torch 2.6/triton 3.2。MoGe-3 的 FlexGEMM 需要更新的 triton
+（报 `'dtype' object has no attribute 'itemsize'`），FastVideo 又钉 torch 2.12，所以两者都装进
+独立的 `/opt/fv-venv`（Python 3.12 + torch 2.12），镜像自带的 `/opt/venv` 不动：
+
+```bash
+cd /workspace/FastVideo && git pull
+python -m pip install uv
+python -m uv venv --python 3.12 --seed /opt/fv-venv
+python -m uv pip install --python /opt/fv-venv/bin/python -e .
+cd /workspace/fastvideo_datapipe && git pull
+source /opt/fv-venv/bin/activate && VENV=/opt/fv-venv scripts/setup_docker_env.sh --with-flicker
+```
+
+镜像的 `LD_LIBRARY_PATH` 以 `/lib/x86_64-linux-gnu`（系统 cuDNN 9.1）开头，会盖住 torch 2.12
+自带的 cuDNN 9.20，卷积直接报 `cuDNN version incompatibility`。所以每次都用一个把 venv 自带
+NVIDIA 库排在前面的入口，而不是裸 `activate`：
+
+```bash
+cat > /opt/fv-venv/env.sh <<'SH'
+source /opt/fv-venv/bin/activate
+_nv=/opt/fv-venv/lib/python3.12/site-packages/nvidia
+export LD_LIBRARY_PATH="$_nv/cudnn/lib:$_nv/cu13/lib:$_nv/cusparselt/lib:$_nv/nccl/lib:$_nv/nvshmem/lib:$LD_LIBRARY_PATH"
+SH
+source /opt/fv-venv/env.sh     # clip-episodes、captions、encode 前都先 source 它
+```
+
+四节点时 `NODE_COUNT=4`，各 pod `NODE_RANK=0..3`，`WORKERS_PER_GPU` 必须一致（默认 6，
+共 192 shard）。
 
 ### 11.2 H3 omni cache（1280×704）
 
 ```bash
 cd /workspace/FastVideo && git pull
+source /opt/fv-venv/env.sh            # SolarWM 镜像上；FastVideo 镜像里直接用自带 venv
 export CACHE_DIR=/data/binghe/h3_proxy/cache/abot_720p_omni_704_qwen2
 
-NUM_SHARDS=8 NODE_COUNT=2 NODE_RANK=$R STAGGER_SEC=60 LOG_DIR="${CACHE_DIR}_logs" \
+NUM_SHARDS=8 NODE_COUNT=4 NODE_RANK=$R STAGGER_SEC=60 LOG_DIR="${CACHE_DIR}_logs" \
 scripts/h3_proxy/prepare_data/encode_proxy_shards.sh \
   --manifest "$CLIPS_DIR/_fastvideo/train.jsonl" \
   --root "$CLIPS_DIR" \
