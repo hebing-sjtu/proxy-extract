@@ -61,6 +61,7 @@
   <span id="chips"></span>
   <span class="dim" id="meta"></span>
   <button id="refresh">重新扫描</button>
+  <span id="auth" style="margin-left:auto"></span>
 </header>
 <main>
   <section id="left">
@@ -109,7 +110,33 @@ const SCORE_NAMES = {depth_temporal:"Depth 时序稳定", depth_accuracy:"Depth 
 const CLASSES = [["void_unknown","#000000"],["sky","#6eb4f0"],["water","#1e5ac8"],["terrain","#966e46"],
   ["road_paved","#808080"],["vegetation","#28a032"],["building_structure","#c85a3c"],["infrastructure","#e6c828"],
   ["human","#ff28c8"],["animal","#ff8c00"],["vehicle","#00e6e6"],["prop","#aa5ae6"]];
-const state = { data:null, rows:[], filter:"all", sort:"score", dir:1, page:0, sel:null, range:null };
+const state = { data:null, rows:[], filter:"all", sort:"score", dir:1, page:0, sel:null, range:null,
+                auth:{mode:"readonly", reviewer:null} };
+const TOKEN_KEY = "clip-workbench-token";
+const authHeaders = () => { const t = localStorage.getItem(TOKEN_KEY); return t ? {Authorization: `Bearer ${t}`} : {}; };
+const canWrite = () => !!state.auth.reviewer;
+async function whoami() {
+  state.auth = await (await fetch("/api/whoami", {headers: authHeaders()})).json();
+  if (state.auth.mode === "reviewers" && !state.auth.reviewer) localStorage.removeItem(TOKEN_KEY);
+  const a = state.auth;
+  $("auth").innerHTML = a.mode === "open" ? '<span class="dim">本机模式：可改判</span>'
+    : a.mode === "readonly" ? '<span class="dim">只读</span>'
+    : a.reviewer ? `<span>审核人 <b>${esc(a.reviewer)}</b></span> <button id="logout">退出</button>`
+    : '<span class="dim">只读</span> <button id="login">审核人登录</button>';
+}
+async function login() {
+  const token = prompt("输入审核口令（向工作台管理员索取）");
+  if (!token) return;
+  localStorage.setItem(TOKEN_KEY, token.trim());
+  await whoami();
+  if (!state.auth.reviewer) alert("口令无效");
+  if (state.sel) select(state.sel);
+}
+function reviewLine(o) {
+  const who = o.reviewer ? ` · ${esc(o.reviewer)}` : "";
+  const what = o.verdict ? `<span class="v-${o.verdict}">${o.verdict === "accept" ? "接收" : "拒绝"}</span>` : '<span class="dim">清除</span>';
+  return `${what}${who} · ${esc(o.written)}${o.note ? ` · ${esc(o.note)}` : ""}`;
+}
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const pct = (v) => (typeof v === "number") ? (100 * v).toFixed(3) + "%" : "–";
@@ -123,7 +150,7 @@ function value(row, k) {
 function verdictCell(row) {
   if (!row.complete) return '<span class="v-none">未完成</span>';
   if (!row.final) return '<span class="v-none">待评</span>';
-  const human = row.override ? ' <span class="dim" title="人工">✎</span>' : "";
+  const human = row.override ? ` <span class="dim" title="人工${row.override.reviewer ? "：" + esc(row.override.reviewer) : ""}">✎</span>` : "";
   return `<span class="v-${row.final}">${row.final === "accept" ? "接收" : "拒绝"}</span>${human}`;
 }
 function matches(row) {
@@ -202,7 +229,7 @@ async function select(name) {
   history.replaceState(null, "", `#${name}`);
   const res = await fetch(`/api/clip/${encodeURIComponent(name)}`);
   if (!res.ok) { $("right").innerHTML = `<p class="v-reject">${esc((await res.json()).error)}</p>`; return; }
-  const {row, quality, report} = await res.json();
+  const {row, quality, report, override: overrideFile} = await res.json();
   replaceRow(row);
   const q = quality || {}, vlm = q.vlm || {}, dec = q.decision || {}, m = q.metrics || {};
   const media = q.panel ? "panel" : "rgb", src = `/media/${encodeURIComponent(name)}/${media}?t=${Date.now()}`;
@@ -223,13 +250,15 @@ async function select(name) {
     <div class="legend"><span><span class="turbo"></span> <span class="dim">近 ← depth → 远，黑=天空</span></span>
       ${CLASSES.map(([n, c]) => `<span><i style="background:${c}"></i>${n}</span>`).join("")}</div>
     <h3>人工复核</h3>
-    <div class="row">
+    ${canWrite() ? `<div class="row">
       <button class="btn-ok" data-ov="accept">接收 (a)</button>
       <button class="btn-bad" data-ov="reject">拒绝 (r)</button>
       <button data-ov="">清除人工 (c)</button>
       <input id="note" placeholder="备注（可选）" size="34" value="${esc(override ? override.note : "")}">
-      ${override ? `<span class="dim">人工：<span class="v-${override.verdict}">${override.verdict}</span> @ ${esc(override.written)}</span>` : ""}
-    </div>
+    </div>` : `<p class="dim">${state.auth.mode === "reviewers" ? "只读。审核人登录后可以改判。" : "只读。"}</p>`}
+    ${override ? `<div class="row">当前人工结论：${reviewLine(override)}</div>` : ""}
+    ${overrideFile && (overrideFile.history || []).length ? `<details><summary class="dim">改判历史（${overrideFile.history.length} 条）</summary>
+      ${overrideFile.history.slice().reverse().map((h) => `<div class="dim">${reviewLine(h)}</div>`).join("")}</details>` : ""}
     ${quality ? `
     <h3>VLM 打分</h3>
     <div class="grid2">${SCORE_KEYS.map((k) => `<span>${SCORE_NAMES[k]}</span><span>${bar((vlm.scores || {})[k])}</span>`).join("")}
@@ -264,11 +293,11 @@ function replaceRow(row) {
   if (i >= 0) rows[i] = row; else rows.push(row);
 }
 async function override(verdict) {
-  if (!state.sel) return;
+  if (!state.sel || !canWrite()) return;
   const note = $("note") ? $("note").value : "";
   const res = await fetch(`/api/override/${encodeURIComponent(state.sel)}`, {method: "POST",
-    headers: {"Content-Type": "application/json"}, body: JSON.stringify({verdict, note})});
-  if (!res.ok) { alert((await res.json()).error); return; }
+    headers: {"Content-Type": "application/json", ...authHeaders()}, body: JSON.stringify({verdict, note})});
+  if (!res.ok) { alert((await res.json()).error); await whoami(); return; }
   replaceRow((await res.json()).row);
   await load(false); select(state.sel);
 }
@@ -308,7 +337,11 @@ document.addEventListener("keydown", (e) => {
   else if (e.key === "," && vid) { vid.pause(); vid.currentTime = Math.max(0, vid.currentTime - 1 / FPS); }
   else if (e.key === "." && vid) { vid.pause(); vid.currentTime += 1 / FPS; }
 });
-load(false).then(() => { const name = decodeURIComponent(location.hash.slice(1)); if (name) select(name); });
+$("auth").addEventListener("click", (e) => {
+  if (e.target.id === "login") login();
+  else if (e.target.id === "logout") { localStorage.removeItem(TOKEN_KEY); whoami().then(() => state.sel && select(state.sel)); }
+});
+whoami().then(() => load(false)).then(() => { const name = decodeURIComponent(location.hash.slice(1)); if (name) select(name); });
 setInterval(() => load(false), 60000);
 </script>
 </body>

@@ -230,25 +230,41 @@ def test_a_human_override_wins_in_the_audit(tmp_path):
     assert result["overridden"] == [overruled.name]
     assert result["summary"]["clips"] == 4 and result["summary"]["complete"] == 3
 
-    quality.set_override(overruled, None)
+    quality.set_override(overruled, None, reviewer="ann")
     assert quality.summarize(overruled.root)["final"] == "accept"
+    assert quality.audit(quality.scan(tmp_path))["overridden"] == []
+    kept = json.loads(quality.override_path(overruled).read_text())
+    assert kept["verdict"] is None and kept["reviewer"] == "ann"
+    assert kept["history"][0]["verdict"] == "reject"
+    assert kept["history"][0]["note"] == "road flickers at 3s"
 
 
 # ---------------------------------------------------------------- workbench
+
+
+def _start(root, **access):
+    index = workbench.Index(root)
+    index.refresh()
+    server = workbench.ThreadingHTTPServer(("127.0.0.1", 0), workbench.make_handler(index, **access))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}"
 
 
 @pytest.fixture
 def bench(tmp_path):
     clip = make_clip(tmp_path)
     quality.judge_clip(clip, FakeClient(json.dumps(GOOD)), model="m", backend="fake")
-    index = workbench.Index(tmp_path)
-    index.refresh()
-    server = workbench.ThreadingHTTPServer(("127.0.0.1", 0), workbench.make_handler(index))
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    yield f"http://127.0.0.1:{server.server_address[1]}", clip
+    server, base = _start(tmp_path)
+    yield base, clip
     server.shutdown()
     server.server_close()
+
+
+def _post(url, payload, token=None):
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    request = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST",
+                                     headers=headers)
+    return urllib.request.urlopen(request, timeout=5)
 
 
 def _get(url, **headers):
@@ -295,3 +311,57 @@ def test_an_override_posted_from_the_workbench_lands_on_disk(bench):
     with pytest.raises(urllib.error.HTTPError) as error:
         urllib.request.urlopen(bad, timeout=5)
     assert error.value.code == 400
+
+
+def test_a_read_only_workbench_refuses_every_change(tmp_path):
+    clip = make_clip(tmp_path)
+    server, base = _start(tmp_path, mode="readonly")
+    try:
+        assert json.loads(_get(base + "/api/whoami").read()) == {"mode": "readonly", "reviewer": None}
+        with pytest.raises(urllib.error.HTTPError) as error:
+            _post(f"{base}/api/override/{clip.name}", {"verdict": "reject"})
+        assert error.value.code == 403
+        assert not quality.override_path(clip).exists()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_only_reviewers_with_a_token_change_verdicts_and_they_are_named(tmp_path):
+    clips = tmp_path / "clips"
+    clip = make_clip(clips)
+    roster = tmp_path / "reviewers.txt"
+    ann = workbench.add_reviewer(roster, "ann")
+    workbench.add_reviewer(roster, "bob")
+    server, base = _start(clips, mode="reviewers", reviewers=workbench.Reviewers(roster))
+    try:
+        for token in (None, "wrong"):
+            with pytest.raises(urllib.error.HTTPError) as error:
+                _post(f"{base}/api/override/{clip.name}", {"verdict": "reject"}, token)
+            assert error.value.code == 401
+        request = urllib.request.Request(base + "/api/whoami", headers={"Authorization": f"Bearer {ann}"})
+        assert json.loads(urllib.request.urlopen(request, timeout=5).read())["reviewer"] == "ann"
+
+        row = json.loads(_post(f"{base}/api/override/{clip.name}", {"verdict": "reject"}, ann).read())["row"]
+        assert row["final"] == "reject" and row["override"]["reviewer"] == "ann"
+
+        carl = workbench.add_reviewer(roster, "carl")
+        _post(f"{base}/api/override/{clip.name}", {"verdict": "accept"}, carl)
+        saved = json.loads(quality.override_path(clip).read_text())
+        assert saved["reviewer"] == "carl" and saved["history"][0]["reviewer"] == "ann"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_reviewer_keeps_their_token_unless_it_is_rotated(tmp_path):
+    roster = tmp_path / "reviewers.txt"
+    first = workbench.add_reviewer(roster, "ann")
+    with pytest.raises(ValueError):
+        workbench.add_reviewer(roster, "ann")
+    second = workbench.add_reviewer(roster, "ann", rotate=True)
+    reviewers = workbench.Reviewers(roster)
+    assert second != first
+    assert reviewers.who(second) == "ann" and reviewers.who(first) is None
+    with pytest.raises(ValueError):
+        workbench.add_reviewer(roster, "no spaces")

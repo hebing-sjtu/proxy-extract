@@ -14,6 +14,7 @@ different training window, a look at what it did - do not require it.
     quality-judge       VLM review of depth and semantics, write annotations/quality.json
     quality-audit       count accepted, rejected and unjudged clips; list them for the split
     workbench           browse the judged corpus and override verdicts in a browser
+    workbench-token     give a reviewer a token for a shared workbench
 """
 
 from __future__ import annotations
@@ -169,6 +170,15 @@ def build_parser() -> argparse.ArgumentParser:
     bench.add_argument("--host", default="127.0.0.1")
     bench.add_argument("--port", type=int, default=8765)
     bench.add_argument("--rescan", type=float, default=120.0, help="seconds between scans")
+    access = bench.add_mutually_exclusive_group()
+    access.add_argument("--reviewers", type=Path,
+                        help="`name token` lines; only these may change verdicts, by name")
+    access.add_argument("--read-only", action="store_true", help="nobody may change verdicts")
+
+    token = sub.add_parser("workbench-token", help="give a reviewer a workbench token")
+    token.add_argument("--reviewers", type=Path, required=True)
+    token.add_argument("--name", required=True)
+    token.add_argument("--rotate", action="store_true", help="replace an existing token")
 
     return parser
 
@@ -612,9 +622,13 @@ def _run_quality_audit(args: argparse.Namespace) -> int:
 def _run_workbench(args: argparse.Namespace) -> int:
     from . import workbench
 
-    server = workbench.serve(args.clips, host=args.host, port=args.port, interval=args.rescan)
+    mode = "reviewers" if args.reviewers else "readonly" if args.read_only else "open"
+    server = workbench.serve(args.clips, host=args.host, port=args.port, interval=args.rescan,
+                             mode=mode, reviewers=args.reviewers)
     host, port = server.server_address[:2]
-    _say(f"workbench on http://{host}:{port}/ over {server.index.root}")
+    _say(f"workbench on http://{host}:{port}/ over {server.index.root} ({mode})")
+    if mode == "open":
+        _say("anyone who reaches this page can change verdicts; share it with --reviewers or --read-only")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -624,9 +638,18 @@ def _run_workbench(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_workbench_token(args: argparse.Namespace) -> int:
+    from . import workbench
+
+    token = workbench.add_reviewer(args.reviewers, args.name, rotate=args.rotate)
+    _say(f"{args.name} {token}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     handlers = {
+        "workbench-token": _run_workbench_token,
         "quality-judge": _run_quality_judge,
         "quality-audit": _run_quality_audit,
         "workbench": _run_workbench,

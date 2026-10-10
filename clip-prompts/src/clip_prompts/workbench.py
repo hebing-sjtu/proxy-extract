@@ -7,13 +7,22 @@ the pod network.
 
 The corpus is re-scanned in the background, so a judge running alongside shows
 up as it goes; the page asks for the current rows, never for a fresh scan.
+
+Who may change a verdict is one of three modes. `open` lets anyone who reaches
+the page override, which is right only while that is you over your own
+port-forward. `readonly` lets nobody. `reviewers` lets the holders of a token in
+a reviewers file, one `name token` per line, and records the name with the
+verdict. The server cannot tell a port-forward from a local browser - both
+arrive from 127.0.0.1 - so sharing the page means choosing a mode, not a host.
 """
 
 from __future__ import annotations
 
+import hmac
 import json
 import mimetypes
 import re
+import secrets
 import threading
 import time
 from http import HTTPStatus
@@ -32,6 +41,62 @@ MEDIA = {
     "anchor": lambda clip: clip.anchor,
 }
 CHUNK = 1 << 20
+MODES = ("open", "readonly", "reviewers")
+REVIEWER_NAME = re.compile(r"^[A-Za-z0-9_.@-]{1,64}$")
+
+
+class Reviewers:
+    """`name token` lines, re-read when the file changes so adding someone needs no restart."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self._stamp: float | None = None
+        self._tokens: dict[str, str] = {}
+        self._lock = threading.Lock()
+
+    def _load(self) -> dict[str, str]:
+        stamp = self.path.stat().st_mtime
+        with self._lock:
+            if stamp != self._stamp:
+                tokens = {}
+                for line in self.path.read_text(encoding="utf-8").splitlines():
+                    fields = line.split()
+                    if len(fields) == 2 and not fields[0].startswith("#"):
+                        tokens[fields[0]] = fields[1]
+                self._tokens, self._stamp = tokens, stamp
+            return self._tokens
+
+    def who(self, token: str | None) -> str | None:
+        if not token:
+            return None
+        try:
+            roster = self._load()
+        except OSError:
+            return None
+        found = None
+        for name, expected in roster.items():
+            if hmac.compare_digest(token.encode(), expected.encode()):
+                found = name
+        return found
+
+
+def add_reviewer(path: Path, name: str, *, rotate: bool = False) -> str:
+    """Append a reviewer with a fresh token and return the token."""
+    if not REVIEWER_NAME.match(name):
+        raise ValueError(f"reviewer names are letters, digits and _.@- ; got {name!r}")
+    path = Path(path)
+    lines = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
+    kept = [line for line in lines if line.split()[:1] != [name]]
+    if len(kept) != len(lines) and not rotate:
+        raise ValueError(f"{name} already has a token; pass --rotate to replace it")
+    token = secrets.token_urlsafe(18)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join([*kept, f"{name} {token}"]) + "\n", encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return token
 
 
 class Index:
@@ -97,7 +162,11 @@ def page() -> bytes:
     return resources.files(__package__).joinpath("workbench.html").read_bytes()
 
 
-def make_handler(index: Index):
+def make_handler(index: Index, *, mode: str = "open", reviewers: Reviewers | None = None):
+    if mode not in MODES:
+        raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
+    if (mode == "reviewers") != (reviewers is not None):
+        raise ValueError("the reviewers mode needs a reviewers file, and only it does")
     root = index.root
 
     class Handler(BaseHTTPRequestHandler):
@@ -126,12 +195,24 @@ def make_handler(index: Index):
         def _error(self, status: int, message: str) -> None:
             self._json({"error": message}, status)
 
+        def _reviewer(self) -> str | None:
+            """Who is asking: a name, "local" in open mode, or None if they may not write."""
+            if mode == "open":
+                return "local"
+            if mode == "readonly":
+                return None
+            header = self.headers.get("Authorization") or ""
+            token = header[7:].strip() if header.lower().startswith("bearer ") else None
+            return reviewers.who(token)
+
         def do_GET(self):
             url = urlparse(self.path)
             parts = [p for p in url.path.split("/") if p]
             try:
                 if not parts:
                     return self._send(HTTPStatus.OK, page(), "text/html; charset=utf-8")
+                if parts == ["api", "whoami"]:
+                    return self._json({"mode": mode, "reviewer": self._reviewer()})
                 if parts == ["api", "clips"]:
                     if "refresh" in parse_qs(url.query):
                         index.poke()
@@ -144,6 +225,7 @@ def make_handler(index: Index):
                         {
                             "row": index.update(clip.name),
                             "quality": quality.read_json(quality.quality_path(clip)),
+                            "override": quality.read_json(quality.override_path(clip)),
                             "report": quality.read_json(clip.report_path),
                         }
                     )
@@ -160,6 +242,11 @@ def make_handler(index: Index):
             parts = [p for p in urlparse(self.path).path.split("/") if p]
             if len(parts) != 3 or parts[:2] != ["api", "override"]:
                 return self._error(HTTPStatus.NOT_FOUND, "not found")
+            reviewer = self._reviewer()
+            if reviewer is None:
+                status = HTTPStatus.FORBIDDEN if mode == "readonly" else HTTPStatus.UNAUTHORIZED
+                return self._error(status, "this workbench is read-only" if mode == "readonly"
+                                   else "log in with a reviewer token to change verdicts")
             clip = self._clip(parts[2])
             if clip is None:
                 return self._error(HTTPStatus.NOT_FOUND, "no such clip")
@@ -167,7 +254,9 @@ def make_handler(index: Index):
                 length = int(self.headers.get("Content-Length") or 0)
                 body = json.loads(self.rfile.read(length) or b"{}")
                 verdict = body.get("verdict")
-                quality.set_override(clip, verdict if verdict else None, str(body.get("note") or ""))
+                quality.set_override(
+                    clip, verdict if verdict else None, str(body.get("note") or ""), reviewer
+                )
             except (ValueError, AttributeError) as exc:
                 return self._error(HTTPStatus.BAD_REQUEST, str(exc))
             return self._json({"row": index.update(clip.name)})
@@ -213,11 +302,16 @@ def make_handler(index: Index):
 
 
 def serve(root: Path, *, host: str = "127.0.0.1", port: int = 8765, interval: float = 120.0,
-          workers: int = 32) -> ThreadingHTTPServer:
+          workers: int = 32, mode: str = "open",
+          reviewers: Path | None = None) -> ThreadingHTTPServer:
     """Start the scanner and return a bound server; the caller runs `serve_forever`."""
+    roster = Reviewers(reviewers) if reviewers else None
+    if roster:
+        roster._load()  # a missing or unreadable file fails here, not on the first save
     index = Index(Path(root).expanduser().resolve(), interval=interval, workers=workers)
     threading.Thread(target=index.run_forever, name="workbench-scan", daemon=True).start()
-    server = ThreadingHTTPServer((host, port), make_handler(index))
+    server = ThreadingHTTPServer((host, port), make_handler(index, mode=mode, reviewers=roster))
     server.daemon_threads = True
     server.index = index  # type: ignore[attr-defined]
+    server.mode = mode  # type: ignore[attr-defined]
     return server

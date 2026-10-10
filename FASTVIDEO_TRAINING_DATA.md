@@ -946,8 +946,32 @@ open http://localhost:8765/
   表格可按任一分数或本地指标排序；`#clip_xxx` 直接定位某片。
 - 右侧播放审片视频（0.25×/0.5×、逐帧），列出四项分数、VLM 结论、拒绝原因、问题列表
   （点击跳到对应时间并 0.5× 播放）、本地指标和来源。
-- 人工复核：`a` 接收、`r` 拒绝、`c` 清除，写 `annotations/quality_override.json`；
+- 人工复核：`a` 接收、`r` 拒绝、`c` 清除，写 `annotations/quality_override.json`
+  （当前结论、审核人、时间、备注和此前的改判历史；清除也记一条，不删文件）。
   人工结论优先于 VLM，`quality-audit` 和切分都按最终结论。`j`/`k` 上下切换。
+
+改判权限有三种模式：不加参数是 `open`，任何能打开页面的人都能改判，只适合自己经本机
+port-forward 使用；`--read-only` 谁都不能改；`--reviewers FILE` 只有名单里持口令的人能改，
+并把名字写进改判记录。页面默认只读，审核人点"审核人登录"输入口令（存在浏览器本地）。
+
+```bash
+R=/data/binghe/secrets/workbench_reviewers.txt
+clip-prompts workbench-token --reviewers $R --name binghe      # 打印 binghe 的口令；--rotate 换新
+clip-prompts workbench --clips "$CLIPS_DIR" --port 8765 --reviewers $R
+```
+
+名单文件改了不用重启，下次请求会重新读。
+
+### 11.3.1 放到内网给同事看
+
+pod 在 GCP，同事访问不到 pod IP，所以由一台常开的内网机器（云开发机 `21.130.243.218`）
+自己 `kubectl port-forward --address 0.0.0.0` 到 rank 0 的工作台，同事访问
+`http://21.130.243.218:8765/`。开发机上的 `clip-workbench-forward` systemd 服务每次重连都按
+名字重新找 `bingghhe*-node-0-0-*` pod，pod 重建或换 job 后自动跟上；但工作台本身在 pod 的
+`workbench` tmux 会话里，pod 重建后要重新启动它。开发机需要自己的 kubeconfig
+（`~/.kube/config`），由账号所有者放上去。
+
+内网是明文 HTTP：口令只挡误操作和记名，不防内网抓包。
 
 720p 语料前 148 片实测：接收 72%。拒绝几乎都来自 semantic：道路／停车场被标成
 infrastructure、狗被标成 vehicle、主角没被分出来（`hero_split` 未 resolve）；depth 很少触发。

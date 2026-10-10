@@ -513,21 +513,40 @@ def judge_clip(
     }
 
 
-def set_override(clip: Clip, verdict: str | None, note: str = "") -> dict | None:
-    """Record a human verdict, or clear it with None."""
-    path = override_path(clip)
-    if verdict is None:
-        path.unlink(missing_ok=True)
-        return None
-    if verdict not in VERDICTS:
+HISTORY_LIMIT = 50
+
+
+def set_override(
+    clip: Clip, verdict: str | None, note: str = "", reviewer: str | None = None
+) -> dict | None:
+    """Record a human verdict, or clear it with None; earlier ones are kept as history.
+
+    Clearing writes a null verdict rather than deleting the file, so who cleared
+    it and what it was before survive.
+    """
+    if verdict is not None and verdict not in VERDICTS:
         raise ValueError(f"verdict must be one of {VERDICTS}, got {verdict!r}")
+    path = override_path(clip)
+    previous = read_json(path)
+    if verdict is None and previous is None:
+        return None
+    history = list((previous or {}).get("history") or [])
+    if previous:
+        history.append({k: previous.get(k) for k in ("verdict", "note", "reviewer", "written")})
     payload = {
         "verdict": verdict,
         "note": note.strip(),
+        "reviewer": reviewer,
         "written": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "history": history[-HISTORY_LIMIT:],
     }
     write_json(path, payload)
-    return payload
+    return payload if verdict else None
+
+
+def active_override(clip: Clip) -> dict | None:
+    override = read_json(override_path(clip))
+    return override if override and override.get("verdict") in VERDICTS else None
 
 
 # ------------------------------------------------------------------- summary
@@ -539,7 +558,9 @@ def summarize(root: Path) -> dict:
     """One clip's row for the audit and the workbench, from files alone."""
     clip = Clip(Path(root))
     quality = read_json(quality_path(clip))
-    override = read_json(override_path(clip))
+    override = active_override(clip)
+    if override:
+        override = {k: override.get(k) for k in ("verdict", "note", "reviewer", "written")}
     row: dict = {
         "clip": clip.name,
         "complete": clip.report_path.is_file(),
