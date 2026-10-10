@@ -5,6 +5,7 @@
 #   DATA_DIR=... CLIPS_DIR=... scripts/run_clip_episodes.sh
 #   LIMIT=4 scripts/run_clip_episodes.sh          # prove a node on 4 episodes
 #   NODE_COUNT=2 NODE_RANK=0 scripts/run_clip_episodes.sh   # and =1 on the other
+#   LOG_DIR=$CLIPS_DIR/logs/recut scripts/run_clip_episodes.sh   # keep the first run's shard logs
 #
 # The one-pass route. run_scenes.sh delivers whole episodes and run_clips.sh
 # then slices them, which predicts depth and semantics for every frame and
@@ -193,7 +194,8 @@ print(f"  ok: torch sees {torch.cuda.device_count()} GPU(s), CUDA {torch.version
 ' || die "torch cannot use this node's GPUs; fix that before launching $n_workers workers"
 fi
 
-mkdir -p "$CLIPS_DIR/logs"
+LOG_DIR="${LOG_DIR:-$CLIPS_DIR/logs}"
+mkdir -p "$LOG_DIR"
 mib_per_clip="$MIB_PER_CLIP"
 depth_frame_bytes=258048
 if [[ "$DUV_SIZE" == "native" ]]; then
@@ -311,14 +313,14 @@ for ((i = 0; i < n_workers; i++)); do
     --shard "$shard/$n_shards" \
     --resume \
     --keep-going \
-    >"$CLIPS_DIR/logs/shard-$shard.log" 2>&1 &
+    >"$LOG_DIR/shard-$shard.log" 2>&1 &
   pid=$!
   pids+=("$pid")
   echo "launched shard $shard/$n_shards on GPU $gpu (pid $pid)"
 done
 
 echo
-echo "follow one:   tail -f $CLIPS_DIR/logs/shard-$shard_base.log"
+echo "follow one:   tail -f $LOG_DIR/shard-$shard_base.log"
 echo "check totals: $PYTHON -m proxy_extract clips-audit --clips-out $CLIPS_DIR --frames $FRAMES"
 if [[ "$PROXY_DUV" == "1" ]]; then
   echo "spec checks:  $PYTHON -m proxy_extract proxy-duv-audit --root $CLIPS_DIR"
@@ -372,7 +374,7 @@ failed=0
 for ((i = 0; i < n_workers; i++)); do
   if ! wait "${pids[$i]}"; then
     shard=$((shard_base + i))
-    echo "shard $shard FAILED -- see $CLIPS_DIR/logs/shard-$shard.log" >&2
+    echo "shard $shard FAILED -- see $LOG_DIR/shard-$shard.log" >&2
     failed=1
   fi
 done
