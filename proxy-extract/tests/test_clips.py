@@ -503,6 +503,16 @@ def test_the_source_route_writes_the_same_shape_as_the_delivered_one(delivered, 
         assert (clip / clips.TARGET_DIRNAME / clips.ANCHOR_NAME).is_file()
 
 
+def test_the_source_route_reports_the_rate_it_dropped_frames_from(delivered, tmp_path):
+    """30 fps in, 24 out: the report must say 30, or the ordinals look like a speed-up."""
+    reports = _direct(delivered.parent / "video.mp4", tmp_path / "direct")
+    for item in reports:
+        assert item["source_fps"] == pytest.approx(30.0)
+        assert item["fps"] == 24.0
+        steps = {b - a for a, b in zip(item["source_ordinals"], item["source_ordinals"][1:])}
+        assert steps <= {1, 2}
+
+
 def test_the_native_route_keeps_depth_and_semantics_on_the_targets_grid(delivered, tmp_path):
     """`duv_native` is what a cropping consumer needs: one DUV pixel per target pixel."""
     from proxy_extract import contract, proxy_duv

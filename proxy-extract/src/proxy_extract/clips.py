@@ -846,6 +846,7 @@ def cut_episode(
                 offset=offset,
                 length=length,
                 fps=fps,
+                source_fps=source_fps,
                 annotations=annotations,
                 color_crf=config.color_crf,
                 proxy_duv_frames=proxy_duv_frames,
@@ -868,6 +869,7 @@ def _assemble_clip(
     offset: int,
     length: int,
     fps: float,
+    source_fps: float,
     annotations: Path | None,
     color_crf: int,
     proxy_duv_frames: bool = False,
@@ -935,7 +937,9 @@ def _assemble_clip(
         "source_video": scene_report.get("source_video"),
         "window": window.index,
         "source_ordinals": list(window.ordinals),
-        "source_fps": scene_report.get("config", {}).get("fps"),
+        # The rate the stride was computed from. The scene report's `config.fps`
+        # is the clip's own rate, which is what this once recorded by mistake.
+        "source_fps": source_fps,
         "frames": length,
         "fps": fps,
         "target_size": [width, height],
